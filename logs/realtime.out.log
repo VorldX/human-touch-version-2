@@ -1,0 +1,5 @@
+
+> vorldx-command-os@0.1.0 realtime
+> node realtime/server.js
+
+[realtime] socket server listening on :4001

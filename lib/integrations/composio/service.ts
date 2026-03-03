@@ -1,0 +1,329 @@
+import "server-only";
+
+import { Composio } from "@composio/core";
+import type { Prisma } from "@prisma/client";
+
+import { featureFlags } from "@/lib/config/feature-flags";
+import { prisma } from "@/lib/db/prisma";
+import {
+  ComposioServiceCore,
+  ComposioServiceError,
+  inferRequestedToolkits as inferRequestedToolkitsCore,
+  type ConnectionSummary,
+  type CustomToolkitAuthConfig,
+  type UserIntegrationStore
+} from "@/lib/integrations/composio/service-core";
+import { createComposioOAuthState, verifyComposioOAuthState } from "@/lib/integrations/composio/oauth-state";
+
+const DEFAULT_ALLOWLIST = ["gmail", "slack", "notion"] as const;
+type UserIntegrationRow = NonNullable<
+  Awaited<ReturnType<typeof prisma.userIntegration.findFirst>>
+>;
+
+function asJson(value: Record<string, unknown> | undefined): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value ?? {})) as Prisma.InputJsonValue;
+}
+
+function toConnectionSummary(row: UserIntegrationRow): ConnectionSummary {
+  return {
+    id: row.id,
+    userId: row.userId,
+    orgId: row.orgId ?? null,
+    provider: row.provider,
+    toolkit: row.toolkit,
+    connectionId: row.connectionId,
+    status: row.status,
+    metadata:
+      row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+        ? (row.metadata as Record<string, unknown>)
+        : {},
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
+}
+
+function parseAllowlistedToolkits() {
+  const raw = process.env.COMPOSIO_ALLOWED_TOOLKITS?.trim();
+  if (!raw) {
+    return [...DEFAULT_ALLOWLIST];
+  }
+  const parsed = raw
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return parsed.length > 0 ? [...new Set(parsed)] : [...DEFAULT_ALLOWLIST];
+}
+
+function envPrefixForToolkit(toolkit: string) {
+  return `COMPOSIO_${toolkit.replace(/[^a-z0-9]/gi, "_").toUpperCase()}_`;
+}
+
+function parseCustomToolkitAuthConfigs(allowlistedToolkits: string[]) {
+  const configs: Record<string, CustomToolkitAuthConfig> = {};
+
+  for (const toolkit of allowlistedToolkits) {
+    const envPrefix = envPrefixForToolkit(toolkit);
+    const clientId = process.env[`${envPrefix}OAUTH_CLIENT_ID`]?.trim();
+    const clientSecret = process.env[`${envPrefix}OAUTH_CLIENT_SECRET`]?.trim();
+    if (!clientId || !clientSecret) {
+      continue;
+    }
+
+    const name = process.env[`${envPrefix}AUTH_CONFIG_NAME`]?.trim();
+    configs[toolkit] = {
+      authScheme: "OAUTH2",
+      credentials: {
+        client_id: clientId,
+        client_secret: clientSecret
+      },
+      ...(name ? { name } : {})
+    };
+  }
+
+  return configs;
+}
+
+function enabled() {
+  return featureFlags.composioIntegrations && Boolean(process.env.COMPOSIO_API_KEY?.trim());
+}
+
+export function composioIntegrationEnabled() {
+  return enabled();
+}
+
+export function composioAllowlistedToolkits() {
+  return parseAllowlistedToolkits();
+}
+
+export function defaultIntegrationsReturnPath() {
+  return "/app?tab=settings&settingsLane=integrations";
+}
+
+export function buildIntegrationConnectPath(toolkit?: string) {
+  const url = new URL("http://localhost");
+  url.pathname = "/app";
+  url.searchParams.set("tab", "settings");
+  url.searchParams.set("settingsLane", "integrations");
+  if (toolkit) {
+    url.searchParams.set("toolkit", toolkit);
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+function callbackUrl() {
+  return (
+    process.env.COMPOSIO_OAUTH_CALLBACK_URL?.trim() ||
+    "http://localhost:3000/api/integrations/composio/oauth/callback"
+  );
+}
+
+const store: UserIntegrationStore = {
+  async listByUser(input) {
+    const rows = await prisma.userIntegration.findMany({
+      where: {
+        userId: input.userId,
+        provider: input.provider,
+        ...(input.orgId ? { orgId: input.orgId } : {})
+      },
+      orderBy: {
+        updatedAt: "desc"
+      }
+    });
+
+    return rows.map((row) => toConnectionSummary(row));
+  },
+
+  async findByConnection(input) {
+    const row = await prisma.userIntegration.findFirst({
+      where: {
+        userId: input.userId,
+        provider: input.provider,
+        connectionId: input.connectionId,
+        ...(input.orgId ? { orgId: input.orgId } : {})
+      }
+    });
+    return row ? toConnectionSummary(row) : null;
+  },
+
+  async findByNonce(input) {
+    const row = await prisma.userIntegration.findFirst({
+      where: {
+        userId: input.userId,
+        provider: input.provider,
+        toolkit: input.toolkit,
+        ...(input.orgId ? { orgId: input.orgId } : {}),
+        metadata: {
+          path: ["oauthStateNonce"],
+          equals: input.nonce
+        }
+      },
+      orderBy: {
+        updatedAt: "desc"
+      }
+    });
+    return row ? toConnectionSummary(row) : null;
+  },
+
+  async upsertByConnection(input) {
+    const row = await prisma.userIntegration.upsert({
+      where: {
+        provider_connectionId: {
+          provider: input.provider,
+          connectionId: input.connectionId
+        }
+      },
+      update: {
+        userId: input.userId,
+        orgId: input.orgId ?? null,
+        toolkit: input.toolkit,
+        status: input.status,
+        metadata: asJson(input.metadata)
+      },
+      create: {
+        userId: input.userId,
+        orgId: input.orgId ?? null,
+        provider: input.provider,
+        toolkit: input.toolkit,
+        connectionId: input.connectionId,
+        status: input.status,
+        metadata: asJson(input.metadata)
+      }
+    });
+
+    return toConnectionSummary(row);
+  }
+};
+
+export function initComposioClient() {
+  if (!enabled()) {
+    return null;
+  }
+  const apiKey = process.env.COMPOSIO_API_KEY?.trim();
+  if (!apiKey) {
+    return null;
+  }
+  const baseURL = process.env.COMPOSIO_BASE_URL?.trim();
+
+  return new Composio({
+    apiKey,
+    ...(baseURL ? { baseURL } : {})
+  });
+}
+
+function createCore() {
+  const allowlistedToolkits = parseAllowlistedToolkits();
+  return new ComposioServiceCore({
+    enabled: enabled(),
+    provider: "composio",
+    allowlistedToolkits,
+    callbackUrl: callbackUrl(),
+    createClient: () => {
+      const client = initComposioClient();
+      if (!client) {
+        throw new ComposioServiceError(
+          "Composio is disabled or COMPOSIO_API_KEY is missing.",
+          { code: "COMPOSIO_DISABLED", status: 503 }
+        );
+      }
+      return client;
+    },
+    store,
+    createStateToken: createComposioOAuthState,
+    verifyStateToken: verifyComposioOAuthState,
+    connectUrlForToolkit: buildIntegrationConnectPath,
+    customAuthConfigs: parseCustomToolkitAuthConfigs(allowlistedToolkits)
+  });
+}
+
+export async function listAvailableToolkits(input: { userId: string }) {
+  const core = createCore();
+  return core.listAvailableToolkits(input.userId);
+}
+
+export async function createConnection(input: {
+  userId: string;
+  orgId: string;
+  toolkit: string;
+  returnTo?: string;
+}) {
+  const core = createCore();
+  return core.createConnection({
+    userId: input.userId,
+    orgId: input.orgId,
+    toolkit: input.toolkit,
+    returnTo: input.returnTo ?? defaultIntegrationsReturnPath()
+  });
+}
+
+export async function getConnections(input: { userId: string; orgId: string }) {
+  const core = createCore();
+  return core.getConnections(input);
+}
+
+export async function disconnectConnection(input: {
+  userId: string;
+  orgId: string;
+  connectionId: string;
+}) {
+  const core = createCore();
+  return core.disconnectConnection(input);
+}
+
+export async function handleOAuthCallback(request: Request) {
+  const core = createCore();
+  const url = new URL(request.url);
+  const params = new URLSearchParams(url.searchParams);
+
+  if (request.method.toUpperCase() === "POST") {
+    const contentType = request.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+      if (body) {
+        for (const [key, value] of Object.entries(body)) {
+          if (typeof value === "string" && value.trim().length > 0) {
+            params.set(key, value.trim());
+          }
+        }
+      }
+    } else if (contentType.includes("application/x-www-form-urlencoded")) {
+      const form = await request.formData().catch(() => null);
+      if (form) {
+        for (const [key, value] of form.entries()) {
+          if (typeof value === "string" && value.trim().length > 0) {
+            params.set(key, value.trim());
+          }
+        }
+      }
+    }
+  }
+
+  return core.handleOAuthCallback({ params });
+}
+
+export async function getToolsForAgent(input: {
+  userId: string;
+  orgId: string;
+  requestedToolkits: string[];
+  action: string;
+}) {
+  const core = createCore();
+  return core.getToolsForAgent(input);
+}
+
+export async function executeToolAction(input: {
+  userId: string;
+  orgId: string;
+  toolkit: string;
+  toolSlug: string;
+  action: string;
+  arguments?: Record<string, unknown>;
+}) {
+  const core = createCore();
+  return core.executeToolAction(input);
+}
+
+export function inferRequestedToolkits(prompt: string) {
+  return inferRequestedToolkitsCore(prompt, parseAllowlistedToolkits());
+}
+
+export { ComposioServiceError };

@@ -1,0 +1,14 @@
+
+> vorldx-command-os@0.1.0 dev
+> node scripts/clean-next.mjs && next dev
+
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3000
+  - Environments: .env
+
+ ✓ Starting...
+ ✓ Ready in 5.9s
+ ○ Compiling / ...
+ ✓ Compiled / in 14.8s (568 modules)
+ GET / 200 in 15802ms
+[?25h
