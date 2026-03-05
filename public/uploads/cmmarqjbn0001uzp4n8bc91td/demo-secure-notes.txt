@@ -1,0 +1,3 @@
+Secure Notes
+Contains protected M&A hypotheses and confidential partner data.
+Read path must use amnesia protocol.

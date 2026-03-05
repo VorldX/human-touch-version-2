@@ -10,11 +10,13 @@ import {
   Prisma,
   PricingModel
 } from "@prisma/client";
+import { cookies } from "next/headers";
 
 import { prisma } from "@/lib/db/prisma";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
 import { hashSovereignIdentity } from "@/lib/security/identity";
 import { encryptAccessToken, encryptBrainKey } from "@/lib/security/crypto";
+import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/security/session";
 import {
   defaultServiceMarkupForPlan,
   upsertOrgLlmSettings,
@@ -112,8 +114,16 @@ export async function completeOnboardingAction(
     validatePayload(payload);
 
     const username = clean(payload.identity.username);
-    const email = clean(payload.identity.email).toLowerCase();
     const sovereignIdentityHash = hashSovereignIdentity(payload.identity.aadhaarId);
+    const sessionToken = (await cookies()).get(SESSION_COOKIE_NAME)?.value ?? "";
+    const session = sessionToken ? await verifySessionToken(sessionToken) : null;
+    if (!session?.userId || !session.email) {
+      return {
+        ok: false,
+        message: "Authentication required. Sign in again and retry setup."
+      };
+    }
+    const email = session.email.trim().toLowerCase();
 
     const orgTheme = parseTheme(payload.organization.theme);
     const credentialMode = parseCredentialMode(payload.orchestration.credentialMode);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import {
   BadgeCheck,
   Brain,
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { completeOnboardingAction } from "@/app/actions/onboarding";
+import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
 import type { AppTheme } from "@/lib/store/vorldx-store";
 import type {
   LlmCredentialModeInput,
@@ -55,6 +56,7 @@ const COMPUTE_TYPES = ["Cloud", "Local", "Container"] as const;
 const SERVICE_PLANS: ServicePlanInput[] = ["STARTER", "GROWTH", "ENTERPRISE"];
 
 export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizardProps) {
+  const { user } = useFirebaseAuth();
   const [step, setStep] = useState<OnboardingStep>(1);
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
@@ -101,6 +103,30 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
   });
 
   const progress = useMemo(() => (step / 4) * 100, [step]);
+
+  useEffect(() => {
+    const signedInEmail = user?.email?.trim().toLowerCase();
+    if (!signedInEmail) {
+      return;
+    }
+    setIdentity((prev) =>
+      prev.email.trim().toLowerCase() === signedInEmail
+        ? prev
+        : {
+            ...prev,
+            email: signedInEmail
+          }
+    );
+  }, [user?.email]);
+
+  const updateCredentialMode = (nextMode: LlmCredentialModeInput) => {
+    setCredentialMode(nextMode);
+    if (nextMode === "PLATFORM_MANAGED") {
+      setOrganizationApiKey("");
+      setPrimaryBrain((prev) => ({ ...prev, apiKey: "" }));
+      setFallbackBrain((prev) => ({ ...prev, apiKey: "" }));
+    }
+  };
 
   function validateCurrentStep() {
     if (step === 1) {
@@ -191,8 +217,22 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
         ...(organizationApiKey.trim()
           ? { organizationApiKey: organizationApiKey.trim() }
           : {}),
-        primary: { ...primaryBrain, apiKey: primaryBrain.apiKey.trim() },
-        fallback: { ...fallbackBrain, apiKey: fallbackBrain.apiKey.trim() }
+        primary: {
+          provider: primaryBrain.provider,
+          model: primaryBrain.model,
+          computeType: primaryBrain.computeType,
+          ...(credentialMode === "BYOK" && primaryBrain.apiKey.trim()
+            ? { apiKey: primaryBrain.apiKey.trim() }
+            : {})
+        },
+        fallback: {
+          provider: fallbackBrain.provider,
+          model: fallbackBrain.model,
+          computeType: fallbackBrain.computeType,
+          ...(credentialMode === "BYOK" && fallbackBrain.apiKey.trim()
+            ? { apiKey: fallbackBrain.apiKey.trim() }
+            : {})
+        }
       },
       financial
     };
@@ -260,6 +300,7 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
                   onChange={(value) => setIdentity((prev) => ({ ...prev, email: value }))}
                   placeholder="name@company.com"
                   icon={BadgeCheck}
+                  readOnly={Boolean(user?.email)}
                 />
                 <Field
                   label="Sovereign Identity"
@@ -400,7 +441,7 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
                     <button
                       key={mode}
                       type="button"
-                      onClick={() => setCredentialMode(mode)}
+                      onClick={() => updateCredentialMode(mode)}
                       className={`rounded-xl border px-4 py-2 text-xs uppercase tracking-[0.2em] transition ${
                         credentialMode === mode
                           ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
@@ -473,12 +514,14 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
                   brain={primaryBrain}
                   onChange={setPrimaryBrain}
                   accent="emerald"
+                  showApiKey={credentialMode === "BYOK"}
                 />
                 <BrainCard
                   title="Fallback Brain"
                   brain={fallbackBrain}
                   onChange={setFallbackBrain}
                   accent="amber"
+                  showApiKey={credentialMode === "BYOK"}
                 />
               </div>
             </section>
@@ -605,13 +648,15 @@ function Field({
   value,
   onChange,
   placeholder,
-  icon: Icon
+  icon: Icon,
+  readOnly = false
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
   icon: typeof Shield;
+  readOnly?: boolean;
 }) {
   return (
     <label className="block">
@@ -622,7 +667,10 @@ function Field({
           value={value}
           onChange={(event) => onChange(event.target.value)}
           placeholder={placeholder}
-          className="w-full bg-transparent text-sm outline-none placeholder:text-slate-600"
+          readOnly={readOnly}
+          className={`w-full bg-transparent text-sm outline-none placeholder:text-slate-600 ${
+            readOnly ? "cursor-not-allowed text-slate-400" : ""
+          }`}
         />
       </div>
     </label>
@@ -633,7 +681,8 @@ function BrainCard({
   title,
   brain,
   onChange,
-  accent
+  accent,
+  showApiKey
 }: {
   title: string;
   brain: {
@@ -649,6 +698,7 @@ function BrainCard({
     computeType: "Cloud" | "Local" | "Container";
   }) => void;
   accent: "emerald" | "amber";
+  showApiKey: boolean;
 }) {
   const accentClass =
     accent === "emerald"
@@ -677,13 +727,15 @@ function BrainCard({
           placeholder="gpt-4o / claude / gemini"
           icon={Brain}
         />
-        <Field
-          label="API Key (Encrypted)"
-          value={brain.apiKey}
-          onChange={(value) => onChange({ ...brain, apiKey: value })}
-          placeholder="sk-..."
-          icon={KeyRound}
-        />
+        {showApiKey ? (
+          <Field
+            label="API Key (Encrypted)"
+            value={brain.apiKey}
+            onChange={(value) => onChange({ ...brain, apiKey: value })}
+            placeholder="sk-..."
+            icon={KeyRound}
+          />
+        ) : null}
 
         <div>
           <p className="mb-2 text-[11px] uppercase tracking-[0.22em] text-slate-400">Compute</p>

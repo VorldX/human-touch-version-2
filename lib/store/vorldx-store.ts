@@ -33,7 +33,7 @@ interface VorldXState {
   activeUsers: ActiveUser[];
   setOrgs: (orgs: OrgContext[]) => void;
   addOrg: (org: OrgContext) => void;
-  setCurrentOrg: (org: OrgContext) => void;
+  setCurrentOrg: (org: OrgContext | null) => void;
   setTheme: (theme: AppTheme) => void;
   toggleGhostMode: () => void;
   pushNotification: (payload: Omit<NotificationItem, "id" | "createdAt">) => void;
@@ -70,7 +70,7 @@ export const useVorldXStore = create<VorldXState>()(
       setCurrentOrg: (org) =>
         set(() => ({
           currentOrg: org,
-          theme: org.theme
+          theme: org?.theme ?? "NEXUS"
         })),
 
       setTheme: (theme) =>

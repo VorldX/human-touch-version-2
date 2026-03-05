@@ -16,6 +16,7 @@ import { useVorldXStore } from "@/lib/store/vorldx-store";
 type PersonnelType = "HUMAN" | "AI";
 type PersonnelStatus = "IDLE" | "ACTIVE" | "PAUSED" | "DISABLED" | "RENTED";
 type PricingModel = "TOKEN" | "SUBSCRIPTION" | "OUTCOME";
+type JoinRequestRole = "EMPLOYEE" | "ADMIN";
 
 interface PersonnelItem {
   id: string;
@@ -51,6 +52,23 @@ interface CapabilityGrantItem {
   linkedAccountId: string;
   scopes: Record<string, unknown>;
   createdAt: string;
+}
+
+interface JoinRequestItem {
+  id: string;
+  orgId: string;
+  requesterUserId: string;
+  requesterEmail: string;
+  requesterName: string | null;
+  requestedRole: JoinRequestRole;
+  message: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  decidedByEmail: string | null;
+  decisionNote: string | null;
 }
 
 interface SquadConsoleProps {
@@ -152,6 +170,14 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
   const [linkedAccounts, setLinkedAccounts] = useState<LinkedAccountItem[]>([]);
   const [capabilityGrants, setCapabilityGrants] = useState<CapabilityGrantItem[]>([]);
   const [capabilityVaultEnabled, setCapabilityVaultEnabled] = useState(false);
+  const [canReviewJoinRequests, setCanReviewJoinRequests] = useState(false);
+  const [joinRequests, setJoinRequests] = useState<JoinRequestItem[]>([]);
+  const [joinRequestsError, setJoinRequestsError] = useState<string | null>(null);
+  const [requestRoleDrafts, setRequestRoleDrafts] = useState<
+    Record<string, JoinRequestRole>
+  >({});
+  const [requestNoteDrafts, setRequestNoteDrafts] = useState<Record<string, string>>({});
+  const [actingRequestId, setActingRequestId] = useState<string | null>(null);
   const [showRecruitModal, setShowRecruitModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [selectedOAuthIds, setSelectedOAuthIds] = useState<string[]>([]);
@@ -167,10 +193,17 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
       }
 
       try {
-        const response = await fetch(`/api/squad/personnel?orgId=${encodeURIComponent(orgId)}`, {
-          cache: "no-store"
-        });
-        const payload = (await response.json()) as {
+        const [personnelResponse, joinRequestsResponse] = await Promise.all([
+          fetch(`/api/squad/personnel?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store"
+          }),
+          fetch(
+            `/api/squad/join-requests?orgId=${encodeURIComponent(orgId)}&status=PENDING`,
+            { cache: "no-store" }
+          )
+        ]);
+
+        const payload = (await personnelResponse.json()) as {
           ok?: boolean;
           message?: string;
           personnel?: PersonnelItem[];
@@ -178,8 +211,13 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
           capabilityGrants?: CapabilityGrantItem[];
           capabilityVaultEnabled?: boolean;
         };
+        const joinRequestsPayload = (await joinRequestsResponse.json()) as {
+          ok?: boolean;
+          message?: string;
+          requests?: JoinRequestItem[];
+        };
 
-        if (!response.ok || !payload.ok) {
+        if (!personnelResponse.ok || !payload.ok) {
           setError(payload.message ?? "Failed to load squad.");
           return;
         }
@@ -189,6 +227,35 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
         setLinkedAccounts(payload.linkedAccounts ?? []);
         setCapabilityGrants(payload.capabilityGrants ?? []);
         setCapabilityVaultEnabled(Boolean(payload.capabilityVaultEnabled));
+
+        if (joinRequestsResponse.status === 403) {
+          setCanReviewJoinRequests(false);
+          setJoinRequests([]);
+          setJoinRequestsError(null);
+        } else if (!joinRequestsResponse.ok || !joinRequestsPayload.ok) {
+          setCanReviewJoinRequests(false);
+          setJoinRequests([]);
+          setJoinRequestsError(
+            joinRequestsPayload.message ?? "Failed to load join requests."
+          );
+        } else {
+          const items = joinRequestsPayload.requests ?? [];
+          setCanReviewJoinRequests(true);
+          setJoinRequests(items);
+          setJoinRequestsError(null);
+          setRequestRoleDrafts(
+            Object.fromEntries(items.map((item) => [item.id, item.requestedRole]))
+          );
+          setRequestNoteDrafts((prev) => {
+            const next: Record<string, string> = {};
+            for (const item of items) {
+              if (typeof prev[item.id] === "string") {
+                next[item.id] = prev[item.id];
+              }
+            }
+            return next;
+          });
+        }
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : "Failed to load squad.");
       } finally {
@@ -367,6 +434,57 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
     ]
   );
 
+  const handleJoinRequestDecision = useCallback(
+    async (request: JoinRequestItem, decision: "APPROVE" | "REJECT") => {
+      setActingRequestId(request.id);
+      try {
+        const response = await fetch(`/api/squad/join-requests/${request.id}`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId,
+            decision,
+            role: requestRoleDrafts[request.id] ?? request.requestedRole,
+            note: requestNoteDrafts[request.id] ?? ""
+          })
+        });
+
+        const payload = (await response.json()) as { ok?: boolean; message?: string };
+        if (!response.ok || !payload.ok) {
+          notify({
+            title: "Join Request",
+            message:
+              payload.message ??
+              `Failed to ${decision === "APPROVE" ? "approve" : "reject"} request.`,
+            type: "error"
+          });
+          return;
+        }
+
+        notify({
+          title: "Join Request",
+          message: `Request ${decision === "APPROVE" ? "approved" : "rejected"}.`,
+          type: "success"
+        });
+        await loadSquad(true);
+      } catch (requestError) {
+        notify({
+          title: "Join Request",
+          message:
+            requestError instanceof Error
+              ? requestError.message
+              : "Failed to process request.",
+          type: "error"
+        });
+      } finally {
+        setActingRequestId(null);
+      }
+    },
+    [loadSquad, notify, orgId, requestNoteDrafts, requestRoleDrafts]
+  );
+
   return (
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
@@ -397,6 +515,103 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
       {error && (
         <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
           {error}
+        </div>
+      )}
+
+      {canReviewJoinRequests && (
+        <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+              Organization Join Requests
+            </p>
+            <span
+              className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}
+            >
+              {joinRequests.length} Pending
+            </span>
+          </div>
+
+          {joinRequestsError && (
+            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              {joinRequestsError}
+            </div>
+          )}
+
+          {joinRequests.length === 0 ? (
+            <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-500">
+              No pending requests right now.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {joinRequests.map((item) => (
+                <div
+                  key={item.id}
+                  className="rounded-2xl border border-white/10 bg-black/25 p-3"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-100">
+                        {item.requesterName || item.requesterEmail}
+                      </p>
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                        {item.requesterEmail} | Requested {item.requestedRole} |{" "}
+                        {new Date(item.createdAt).toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={requestRoleDrafts[item.id] ?? item.requestedRole}
+                        onChange={(event) =>
+                          setRequestRoleDrafts((prev) => ({
+                            ...prev,
+                            [item.id]: event.target.value as JoinRequestRole
+                          }))
+                        }
+                        className="rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-xs text-slate-100 outline-none"
+                      >
+                        <option value="EMPLOYEE">EMPLOYEE</option>
+                        <option value="ADMIN">ADMIN</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {item.message ? (
+                    <p className="mt-2 text-xs text-slate-300">{item.message}</p>
+                  ) : (
+                    <p className="mt-2 text-xs text-slate-500">No message provided.</p>
+                  )}
+
+                  <div className="mt-2 grid gap-2 md:grid-cols-[1fr_auto_auto]">
+                    <input
+                      value={requestNoteDrafts[item.id] ?? ""}
+                      onChange={(event) =>
+                        setRequestNoteDrafts((prev) => ({
+                          ...prev,
+                          [item.id]: event.target.value
+                        }))
+                      }
+                      placeholder="Optional decision note"
+                      className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-100 outline-none"
+                    />
+                    <button
+                      onClick={() => void handleJoinRequestDecision(item, "APPROVE")}
+                      disabled={actingRequestId === item.id}
+                      className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                    >
+                      {actingRequestId === item.id ? "Working..." : "Approve"}
+                    </button>
+                    <button
+                      onClick={() => void handleJoinRequestDecision(item, "REJECT")}
+                      disabled={actingRequestId === item.id}
+                      className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
