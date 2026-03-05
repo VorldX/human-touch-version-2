@@ -46,7 +46,7 @@ import { SquadConsole } from "@/components/squad/squad-console";
 import { NotificationStack } from "@/components/system/notification-stack";
 import { WorkflowConsole } from "@/components/workflow/workflow-console";
 import { getRealtimeClient } from "@/lib/realtime/client";
-import type { AppTheme } from "@/lib/store/vorldx-store";
+import type { AppTheme, OrgContext } from "@/lib/store/vorldx-store";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 const NAV_ITEMS = [
@@ -256,6 +256,7 @@ export function VorldXShell() {
   const searchParams = useSearchParams();
   const { user, signOutCurrentUser } = useFirebaseAuth();
   const orgs = useVorldXStore((state) => state.orgs);
+  const setOrgs = useVorldXStore((state) => state.setOrgs);
   const addOrg = useVorldXStore((state) => state.addOrg);
   const currentOrg = useVorldXStore((state) => state.currentOrg);
   const setCurrentOrg = useVorldXStore((state) => state.setCurrentOrg);
@@ -268,6 +269,7 @@ export function VorldXShell() {
   const [activeTab, setActiveTab] =
     useState<(typeof NAV_ITEMS)[number]["id"]>("control");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [orgBootstrapLoading, setOrgBootstrapLoading] = useState(true);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -323,16 +325,84 @@ export function VorldXShell() {
   }, []);
 
   useEffect(() => {
+    let mounted = true;
+
+    async function bootstrapOrganizations() {
+      setOrgBootstrapLoading(true);
+
+      try {
+        const response = await fetch("/api/orgs", {
+          method: "GET",
+          cache: "no-store"
+        });
+
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              ok?: boolean;
+              activeOrgId?: string | null;
+              orgs?: OrgContext[];
+            }
+          | null;
+
+        if (!mounted) {
+          return;
+        }
+
+        if (!response.ok || !payload?.ok) {
+          throw new Error("Failed to load organizations.");
+        }
+
+        const serverOrgs = Array.isArray(payload.orgs) ? payload.orgs : [];
+        setOrgs(serverOrgs);
+
+        if (serverOrgs.length === 0) {
+          setCurrentOrg(null);
+          return;
+        }
+
+        const preferredCurrentId = useVorldXStore.getState().currentOrg?.id;
+        const nextCurrent =
+          (preferredCurrentId
+            ? serverOrgs.find((org) => org.id === preferredCurrentId)
+            : undefined) ??
+          (payload.activeOrgId
+            ? serverOrgs.find((org) => org.id === payload.activeOrgId)
+            : undefined) ??
+          serverOrgs[0];
+
+        if (nextCurrent) {
+          setCurrentOrg(nextCurrent);
+        }
+      } catch {
+        // Preserve local org cache as best-effort fallback.
+      } finally {
+        if (mounted) {
+          setOrgBootstrapLoading(false);
+        }
+      }
+    }
+
+    void bootstrapOrganizations();
+
+    return () => {
+      mounted = false;
+    };
+  }, [setCurrentOrg, setOrgs, user?.uid]);
+
+  useEffect(() => {
+    if (orgBootstrapLoading) {
+      return;
+    }
     if (!currentOrg && orgs.length > 0) {
       setCurrentOrg(orgs[0]);
     }
-  }, [currentOrg, orgs, setCurrentOrg]);
+  }, [currentOrg, orgBootstrapLoading, orgs, setCurrentOrg]);
 
   useEffect(() => {
     document.documentElement.dataset.ghost = isGhostModeActive ? "true" : "false";
   }, [isGhostModeActive]);
 
-  const resolvedOrg = currentOrg ?? orgs[0] ?? null;
+  const resolvedOrg = orgBootstrapLoading ? null : currentOrg ?? orgs[0] ?? null;
   const isOnboarding = onboardingMode === "add-org" || !resolvedOrg;
   const themeStyle = THEME_STYLES[theme];
   const requestedSettingsLane = searchParams.get("settingsLane");
@@ -1207,6 +1277,17 @@ export function VorldXShell() {
           ? agentRunResult.error?.details?.connectUrl
           : "") || "/app?tab=settings&settingsLane=integrations&toolkit=gmail"
       : "";
+
+  if (orgBootstrapLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#05070a] text-slate-300">
+        <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-4 py-2 text-xs uppercase tracking-[0.16em]">
+          <Loader2 size={14} className="animate-spin" />
+          Loading Organizations
+        </div>
+      </main>
+    );
+  }
 
   if (isOnboarding) {
     return (
