@@ -1,0 +1,3 @@
+Employee SOP
+Every outbound campaign must include UTM mapping and owner assignment.
+Any pricing change above 12% needs finance + founder approval.

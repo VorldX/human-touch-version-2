@@ -1,19 +1,25 @@
+import { OrgRole, OrganizationTheme } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
 import { prisma } from "@/lib/db/prisma";
 
-function toRoleLabel(role: string) {
-  if (role === "FOUNDER") return "Founder";
-  if (role === "ADMIN") return "Admin";
-  if (role === "EMPLOYEE") return "Employee";
-  return role;
+function toRoleLabel(role: OrgRole) {
+  if (role === OrgRole.FOUNDER) return "Founder";
+  if (role === OrgRole.ADMIN) return "Admin";
+  return "Employee";
+}
+
+function toTheme(value: OrganizationTheme): "APEX" | "VEDA" | "NEXUS" {
+  if (value === OrganizationTheme.APEX) return "APEX";
+  if (value === OrganizationTheme.VEDA) return "VEDA";
+  return "NEXUS";
 }
 
 export async function GET(request: NextRequest) {
-  const userEmail = request.headers.get("x-user-email")?.trim().toLowerCase() ?? "";
   const sessionUserId = request.headers.get("x-user-id")?.trim() ?? "";
+  const email = request.headers.get("x-user-email")?.trim().toLowerCase() ?? "";
 
-  if (!userEmail || !sessionUserId) {
+  if (!sessionUserId || !email) {
     return NextResponse.json(
       {
         ok: false,
@@ -26,9 +32,10 @@ export async function GET(request: NextRequest) {
   const user = await prisma.user.findFirst({
     where: {
       id: sessionUserId,
-      email: userEmail
+      email
     },
     select: {
+      id: true,
       activeOrgId: true,
       orgMemberships: {
         select: {
@@ -62,12 +69,26 @@ export async function GET(request: NextRequest) {
     id: membership.org.id,
     name: membership.org.name,
     role: toRoleLabel(membership.role),
-    theme: membership.org.theme
+    theme: toTheme(membership.org.theme)
   }));
+
+  const activeOrgId =
+    user.activeOrgId && orgs.some((item) => item.id === user.activeOrgId)
+      ? user.activeOrgId
+      : orgs[0]?.id ?? null;
+
+  if (activeOrgId !== user.activeOrgId) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        activeOrgId
+      }
+    });
+  }
 
   return NextResponse.json({
     ok: true,
-    activeOrgId: user.activeOrgId,
-    orgs
+    orgs,
+    activeOrgId
   });
 }

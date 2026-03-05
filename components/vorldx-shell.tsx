@@ -4,9 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
+  Bell,
   Bot,
   Building2,
   ChevronDown,
+  ClipboardList,
   Command,
   Database,
   FileText,
@@ -41,17 +43,19 @@ import { CollaborationConsole } from "@/components/collab/collab-console";
 import { DirectionConsole } from "@/components/direction/direction-console";
 import { HubConsole } from "@/components/hub/hub-console";
 import { MemoryConsole } from "@/components/memory/memory-console";
+import { PlanConsole } from "@/components/plan/plan-console";
 import { SettingsConsole } from "@/components/settings/settings-console";
 import { SquadConsole } from "@/components/squad/squad-console";
 import { NotificationStack } from "@/components/system/notification-stack";
 import { WorkflowConsole } from "@/components/workflow/workflow-console";
 import { getRealtimeClient } from "@/lib/realtime/client";
-import type { AppTheme, OrgContext } from "@/lib/store/vorldx-store";
+import type { AppTheme } from "@/lib/store/vorldx-store";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 const NAV_ITEMS = [
   { id: "control", label: "Control Deck", icon: LayoutDashboard },
   { id: "direction", label: "Direction", icon: Target },
+  { id: "plan", label: "Plan", icon: ClipboardList },
   { id: "flow", label: "Work Flow", icon: Workflow },
   { id: "hub", label: "Hub", icon: FolderOpen },
   { id: "squad", label: "Squad", icon: Users },
@@ -176,6 +180,74 @@ interface MissionScheduleDraft {
   nextRunAt: string;
 }
 
+type SetupPanel = "closed" | "chooser" | "onboarding" | "request-access";
+
+interface UserJoinRequest {
+  id: string;
+  orgId: string;
+  organizationName?: string | null;
+  requestedRole: "EMPLOYEE" | "ADMIN";
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  message: string;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+  decisionNote: string | null;
+}
+
+type ControlMode = "MINDSTORM" | "DIRECTION";
+type ControlConversationDetail = "REASONING_MIN" | "DIRECTION_GIVEN";
+
+interface DirectionPlanTask {
+  title: string;
+  ownerRole: string;
+  subtasks: string[];
+  tools: string[];
+  requiresApproval: boolean;
+  approvalRole: string;
+  approvalReason: string;
+}
+
+interface DirectionPlanWorkflow {
+  title: string;
+  goal: string;
+  tasks: DirectionPlanTask[];
+}
+
+interface DirectionExecutionPlan {
+  summary: string;
+  workflows: DirectionPlanWorkflow[];
+  risks: string[];
+  successMetrics: string[];
+}
+
+interface PermissionRequestItem {
+  id: string;
+  orgId: string;
+  direction: string;
+  requestedByUserId: string;
+  requestedByEmail: string;
+  targetRole: "FOUNDER" | "ADMIN" | "EMPLOYEE";
+  area: string;
+  reason: string;
+  workflowTitle: string;
+  taskTitle: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+  decidedByUserId: string | null;
+  decidedByEmail: string | null;
+  decisionNote: string | null;
+}
+
+interface DirectionPlanningResult {
+  analysis: string;
+  directionGiven: string;
+  primaryPlan: DirectionExecutionPlan;
+  fallbackPlan: DirectionExecutionPlan;
+}
+
 function toDatetimeLocalValue(iso: string) {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) {
@@ -254,7 +326,7 @@ async function parseJsonBody<T>(response: Response): Promise<{
 export function VorldXShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, signOutCurrentUser } = useFirebaseAuth();
+  const { user, loading: authLoading, signOutCurrentUser } = useFirebaseAuth();
   const orgs = useVorldXStore((state) => state.orgs);
   const setOrgs = useVorldXStore((state) => state.setOrgs);
   const addOrg = useVorldXStore((state) => state.addOrg);
@@ -269,7 +341,6 @@ export function VorldXShell() {
   const [activeTab, setActiveTab] =
     useState<(typeof NAV_ITEMS)[number]["id"]>("control");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [orgBootstrapLoading, setOrgBootstrapLoading] = useState(true);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -291,7 +362,31 @@ export function VorldXShell() {
     nextRunAt: toDatetimeLocalValue(new Date().toISOString())
   }));
   const [swarmDensity, setSwarmDensity] = useState(24);
-  const [onboardingMode, setOnboardingMode] = useState<"initial" | "add-org">("initial");
+  const [setupPanel, setSetupPanel] = useState<SetupPanel>("closed");
+  const [joinOrgIdentifier, setJoinOrgIdentifier] = useState("");
+  const [joinRequestRole, setJoinRequestRole] = useState<"EMPLOYEE" | "ADMIN">("EMPLOYEE");
+  const [joinRequestMessage, setJoinRequestMessage] = useState("");
+  const [joinRequestInFlight, setJoinRequestInFlight] = useState(false);
+  const [joinRequestError, setJoinRequestError] = useState<string | null>(null);
+  const [userJoinRequests, setUserJoinRequests] = useState<UserJoinRequest[]>([]);
+  const [loadingUserJoinRequests, setLoadingUserJoinRequests] = useState(false);
+  const [orgBootstrapStatus, setOrgBootstrapStatus] =
+    useState<"loading" | "ready" | "failed">("loading");
+  const [orgBootstrapError, setOrgBootstrapError] = useState<string | null>(null);
+  const [orgBootstrapAttempt, setOrgBootstrapAttempt] = useState(0);
+  const [controlMode, setControlMode] = useState<ControlMode>("MINDSTORM");
+  const [controlConversationDetail, setControlConversationDetail] =
+    useState<ControlConversationDetail>("REASONING_MIN");
+  const [controlEngaged, setControlEngaged] = useState(false);
+  const [humanPlanDraft, setHumanPlanDraft] = useState("");
+  const [directionPlanningInFlight, setDirectionPlanningInFlight] = useState(false);
+  const [directionPlanningResult, setDirectionPlanningResult] =
+    useState<DirectionPlanningResult | null>(null);
+  const [showRequestCenter, setShowRequestCenter] = useState(false);
+  const [permissionRequests, setPermissionRequests] = useState<PermissionRequestItem[]>([]);
+  const [permissionRequestsLoading, setPermissionRequestsLoading] = useState(false);
+  const [permissionRequestActionId, setPermissionRequestActionId] = useState<string | null>(null);
+  const [canReviewPermissionRequests, setCanReviewPermissionRequests] = useState(false);
   const [signatureApprovals, setSignatureApprovals] = useState(1);
   const [isRecordingIntent, setIsRecordingIntent] = useState(false);
   const [launchInFlight, setLaunchInFlight] = useState(false);
@@ -321,38 +416,171 @@ export function VorldXShell() {
 
   const openAddOrganization = useCallback(() => {
     setShowOrgSwitcher(false);
-    setOnboardingMode("add-org");
+    setSetupPanel("onboarding");
   }, []);
 
+  const loadUserJoinRequests = useCallback(async () => {
+    setLoadingUserJoinRequests(true);
+    try {
+      const response = await fetch("/api/squad/join-requests", {
+        cache: "no-store"
+      });
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        message?: string;
+        requests?: UserJoinRequest[];
+      };
+
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message ?? "Failed loading join requests.");
+      }
+
+      setJoinRequestError(null);
+      setUserJoinRequests(payload.requests ?? []);
+    } catch (error) {
+      setJoinRequestError(
+        error instanceof Error ? error.message : "Failed loading join requests."
+      );
+    } finally {
+      setLoadingUserJoinRequests(false);
+    }
+  }, []);
+
+  const loadPermissionRequests = useCallback(async () => {
+    const orgId = currentOrg?.id ?? orgs[0]?.id ?? "";
+    if (!orgId) {
+      setPermissionRequests([]);
+      setCanReviewPermissionRequests(false);
+      return;
+    }
+
+    setPermissionRequestsLoading(true);
+    try {
+      const response = await fetch(
+        `/api/requests?orgId=${encodeURIComponent(orgId)}`,
+        {
+          cache: "no-store"
+        }
+      );
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        message?: string;
+        canReview?: boolean;
+        requests?: PermissionRequestItem[];
+      };
+
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message ?? "Failed loading permission requests.");
+      }
+
+      setPermissionRequests(payload.requests ?? []);
+      setCanReviewPermissionRequests(Boolean(payload.canReview));
+    } catch (error) {
+      setControlMessage({
+        tone: "error",
+        text:
+          error instanceof Error ? error.message : "Failed loading permission requests."
+      });
+    } finally {
+      setPermissionRequestsLoading(false);
+    }
+  }, [currentOrg?.id, orgs]);
+
+  const handleSubmitJoinRequest = useCallback(async () => {
+    const identifier = joinOrgIdentifier.trim();
+    if (!identifier) {
+      setJoinRequestError("Enter organization id or name.");
+      return;
+    }
+
+    setJoinRequestInFlight(true);
+    try {
+      const response = await fetch("/api/squad/join-requests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          organizationIdentifier: identifier,
+          requestedRole: joinRequestRole,
+          message: joinRequestMessage.trim()
+        })
+      });
+
+      const payload = (await response.json()) as {
+        ok?: boolean;
+        message?: string;
+      };
+
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message ?? "Failed to submit request.");
+      }
+
+      setJoinRequestError(null);
+      setJoinOrgIdentifier("");
+      setJoinRequestMessage("");
+      setSetupPanel("chooser");
+      await loadUserJoinRequests();
+    } catch (error) {
+      setJoinRequestError(
+        error instanceof Error ? error.message : "Failed to submit request."
+      );
+    } finally {
+      setJoinRequestInFlight(false);
+    }
+  }, [
+    joinOrgIdentifier,
+    joinRequestMessage,
+    joinRequestRole,
+    loadUserJoinRequests
+  ]);
+
   useEffect(() => {
-    let mounted = true;
+    if (authLoading) {
+      return;
+    }
 
-    async function bootstrapOrganizations() {
-      setOrgBootstrapLoading(true);
+    if (!user?.uid || !user.email) {
+      setOrgs([]);
+      setCurrentOrg(null);
+      setOrgBootstrapError(null);
+      setOrgBootstrapStatus("ready");
+      return;
+    }
 
+    let cancelled = false;
+    setOrgBootstrapError(null);
+    setOrgBootstrapStatus("loading");
+
+    const bootstrapOrgs = async () => {
       try {
         const response = await fetch("/api/orgs", {
-          method: "GET",
-          cache: "no-store"
+          cache: "no-store",
+          credentials: "include"
         });
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          message?: string;
+          activeOrgId?: string | null;
+          orgs?: Array<{
+            id: string;
+            name: string;
+            role: string;
+            theme: AppTheme;
+          }>;
+        };
 
-        const payload = (await response.json().catch(() => null)) as
-          | {
-              ok?: boolean;
-              activeOrgId?: string | null;
-              orgs?: OrgContext[];
-            }
-          | null;
+        if (!response.ok || !payload.ok) {
+          throw new Error(
+            payload.message ?? `Unable to load organizations (${response.status}).`
+          );
+        }
 
-        if (!mounted) {
+        if (cancelled) {
           return;
         }
 
-        if (!response.ok || !payload?.ok) {
-          throw new Error("Failed to load organizations.");
-        }
-
-        const serverOrgs = Array.isArray(payload.orgs) ? payload.orgs : [];
+        const serverOrgs = payload.orgs ?? [];
         setOrgs(serverOrgs);
 
         if (serverOrgs.length === 0) {
@@ -360,52 +588,59 @@ export function VorldXShell() {
           return;
         }
 
-        const preferredCurrentId = useVorldXStore.getState().currentOrg?.id;
-        const nextCurrent =
-          (preferredCurrentId
-            ? serverOrgs.find((org) => org.id === preferredCurrentId)
-            : undefined) ??
-          (payload.activeOrgId
-            ? serverOrgs.find((org) => org.id === payload.activeOrgId)
-            : undefined) ??
-          serverOrgs[0];
-
-        if (nextCurrent) {
-          setCurrentOrg(nextCurrent);
+        const preferredOrg =
+          serverOrgs.find((item) => item.id === payload.activeOrgId) ?? serverOrgs[0];
+        setCurrentOrg(preferredOrg ?? null);
+        setOrgBootstrapStatus("ready");
+      } catch (error) {
+        // Keep persisted store data when org bootstrap fails.
+        if (cancelled) {
+          return;
         }
-      } catch {
-        // Preserve local org cache as best-effort fallback.
-      } finally {
-        if (mounted) {
-          setOrgBootstrapLoading(false);
-        }
+        setOrgBootstrapError(
+          error instanceof Error ? error.message : "Unable to load organizations."
+        );
+        setOrgBootstrapStatus("failed");
       }
-    }
+    };
 
-    void bootstrapOrganizations();
+    void bootstrapOrgs();
+    void loadUserJoinRequests();
 
     return () => {
-      mounted = false;
+      cancelled = true;
     };
-  }, [setCurrentOrg, setOrgs, user?.uid]);
-
-  useEffect(() => {
-    if (orgBootstrapLoading) {
-      return;
-    }
-    if (!currentOrg && orgs.length > 0) {
-      setCurrentOrg(orgs[0]);
-    }
-  }, [currentOrg, orgBootstrapLoading, orgs, setCurrentOrg]);
+  }, [
+    authLoading,
+    loadUserJoinRequests,
+    setCurrentOrg,
+    setOrgs,
+    user?.email,
+    user?.uid,
+    orgBootstrapAttempt
+  ]);
 
   useEffect(() => {
     document.documentElement.dataset.ghost = isGhostModeActive ? "true" : "false";
   }, [isGhostModeActive]);
 
-  const resolvedOrg = orgBootstrapLoading ? null : currentOrg ?? orgs[0] ?? null;
-  const isOnboarding = onboardingMode === "add-org" || !resolvedOrg;
+  const resolvedOrg = currentOrg ?? orgs[0] ?? null;
+  const hasOrganization = Boolean(resolvedOrg);
   const themeStyle = THEME_STYLES[theme];
   const requestedSettingsLane = searchParams.get("settingsLane");
+
+  useEffect(() => {
+    if (!resolvedOrg?.id) {
+      setPermissionRequests([]);
+      setCanReviewPermissionRequests(false);
+      return;
+    }
+    void loadPermissionRequests();
+    const interval = setInterval(() => {
+      void loadPermissionRequests();
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [loadPermissionRequests, resolvedOrg?.id]);
 
   useEffect(() => {
     const requestedTab = searchParams.get("tab");
@@ -418,6 +653,12 @@ export function VorldXShell() {
     setDirectionTurns([]);
     setDirectionPrompt("");
     setIntent("");
+    setHumanPlanDraft("");
+    setDirectionPlanningResult(null);
+    setControlEngaged(false);
+    setControlMode("MINDSTORM");
+    setControlConversationDetail("REASONING_MIN");
+    setShowRequestCenter(false);
     setMissionSchedules([]);
     setScheduleDraft({
       title: "",
@@ -504,6 +745,10 @@ export function VorldXShell() {
     }
     return 1;
   }, [predictedBurn]);
+  const pendingPermissionRequestCount = useMemo(
+    () => permissionRequests.filter((item) => item.status === "PENDING").length,
+    [permissionRequests]
+  );
 
   useEffect(() => {
     if (signatureApprovals > requiredSignatures) {
@@ -696,8 +941,8 @@ export function VorldXShell() {
     recognition.start();
   }, []);
 
-  const handleDirectionChat = useCallback(async () => {
-    const message = directionPrompt.trim();
+  const handleDirectionChat = useCallback(async (rawMessage?: string) => {
+    const message = (rawMessage ?? directionPrompt).trim();
     if (!resolvedOrg?.id) {
       return;
     }
@@ -716,7 +961,9 @@ export function VorldXShell() {
       content: message
     };
     setDirectionTurns((prev) => [...prev, ownerTurn]);
-    setDirectionPrompt("");
+    if (!rawMessage) {
+      setDirectionPrompt("");
+    }
     setDirectionChatInFlight(true);
     setControlMessage(null);
 
@@ -769,6 +1016,7 @@ export function VorldXShell() {
 
       if (payload.directionCandidate) {
         setIntent(payload.directionCandidate);
+        setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
           text: "Direction candidate updated from organization response."
@@ -783,6 +1031,162 @@ export function VorldXShell() {
       setDirectionChatInFlight(false);
     }
   }, [directionModelId, directionPrompt, directionTurns, resolvedOrg?.id]);
+
+  const handleGenerateDirectionPlans = useCallback(
+    async (rawDirection?: string) => {
+      const direction = (rawDirection ?? intent).trim();
+      if (!resolvedOrg?.id) {
+        return;
+      }
+      if (!direction) {
+        setControlMessage({
+          tone: "warning",
+          text: "Write a direction paragraph first."
+        });
+        return;
+      }
+
+      if (rawDirection?.trim()) {
+        setDirectionTurns((prev) => [
+          ...prev,
+          {
+            id: `owner-direction-${Date.now()}`,
+            role: "owner",
+            content: rawDirection.trim()
+          }
+        ]);
+      }
+
+      setDirectionPlanningInFlight(true);
+      setControlMessage(null);
+      try {
+        const [provider, model] = directionModelId.split(":");
+        const response = await fetch("/api/control/direction-plan", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId: resolvedOrg.id,
+            direction,
+            history: directionTurns.slice(-10).map((turn) => ({
+              role: turn.role,
+              content: turn.content
+            })),
+            humanPlan: humanPlanDraft.trim(),
+            provider,
+            model
+          })
+        });
+
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          message?: string;
+          analysis?: string;
+          directionGiven?: string;
+          primaryPlan?: DirectionExecutionPlan;
+          fallbackPlan?: DirectionExecutionPlan;
+          requestCount?: number;
+          model?: { provider?: string | null; name?: string | null };
+        };
+
+        if (
+          !response.ok ||
+          !payload.ok ||
+          !payload.primaryPlan ||
+          !payload.fallbackPlan
+        ) {
+          throw new Error(payload.message ?? "Failed generating plans.");
+        }
+
+        const refinedDirection = payload.directionGiven?.trim() || direction;
+        const analysis = payload.analysis?.trim() ?? "";
+        setIntent(refinedDirection);
+        setDirectionPlanningResult({
+          analysis,
+          directionGiven: refinedDirection,
+          primaryPlan: payload.primaryPlan,
+          fallbackPlan: payload.fallbackPlan
+        });
+        setControlConversationDetail("DIRECTION_GIVEN");
+
+        const modelLabel = [payload.model?.provider, payload.model?.name]
+          .filter((value): value is string => Boolean(value))
+          .join(" / ");
+        if (analysis) {
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `plan-${Date.now()}`,
+              role: "organization",
+              content: analysis,
+              ...(modelLabel ? { modelLabel } : {})
+            }
+          ]);
+        }
+
+        await loadPermissionRequests();
+        setControlMessage({
+          tone: "success",
+          text: `Primary and fallback plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}`
+        });
+      } catch (error) {
+        setControlMessage({
+          tone: "error",
+          text: error instanceof Error ? error.message : "Plan generation failed."
+        });
+      } finally {
+        setDirectionPlanningInFlight(false);
+      }
+    },
+    [
+      directionModelId,
+      directionTurns,
+      humanPlanDraft,
+      intent,
+      loadPermissionRequests,
+      resolvedOrg?.id
+    ]
+  );
+
+  const handlePermissionRequestDecision = useCallback(
+    async (requestId: string, decision: "APPROVE" | "REJECT") => {
+      if (!resolvedOrg?.id) {
+        return;
+      }
+      setPermissionRequestActionId(requestId);
+      try {
+        const response = await fetch(`/api/requests/${requestId}`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId: resolvedOrg.id,
+            decision
+          })
+        });
+
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          message?: string;
+        };
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.message ?? "Failed updating request.");
+        }
+
+        await loadPermissionRequests();
+      } catch (error) {
+        setControlMessage({
+          tone: "error",
+          text: error instanceof Error ? error.message : "Request update failed."
+        });
+      } finally {
+        setPermissionRequestActionId(null);
+      }
+    },
+    [loadPermissionRequests, resolvedOrg?.id]
+  );
 
   const handleCreateSchedule = useCallback(async () => {
     if (!resolvedOrg?.id) {
@@ -1278,41 +1682,6 @@ export function VorldXShell() {
           : "") || "/app?tab=settings&settingsLane=integrations&toolkit=gmail"
       : "";
 
-  if (orgBootstrapLoading) {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-[#05070a] text-slate-300">
-        <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-4 py-2 text-xs uppercase tracking-[0.16em]">
-          <Loader2 size={14} className="animate-spin" />
-          Loading Organizations
-        </div>
-      </main>
-    );
-  }
-
-  if (isOnboarding) {
-    return (
-      <OnboardingWizard
-        mode={resolvedOrg ? onboardingMode : "initial"}
-        onCancel={
-          onboardingMode === "add-org"
-            ? () => {
-                setOnboardingMode("initial");
-              }
-            : undefined
-        }
-        onComplete={(org) => {
-          addOrg(org);
-          setCurrentOrg(org);
-          setOnboardingMode("initial");
-        }}
-      />
-    );
-  }
-
-  if (!resolvedOrg) {
-    return null;
-  }
-
   return (
     <div className="vx-shell relative min-h-screen bg-vx-bg text-slate-100 transition-all duration-500">
       <div className="flex h-screen overflow-hidden">
@@ -1328,7 +1697,7 @@ export function VorldXShell() {
             {!isSidebarCollapsed && (
               <div className="min-w-0">
                 <p className="truncate font-display text-lg font-black uppercase tracking-tight">
-                  {resolvedOrg.name}
+                  {resolvedOrg?.name ?? "Workspace Explorer"}
                 </p>
                 <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
                   Command OS
@@ -1423,11 +1792,11 @@ export function VorldXShell() {
               <Shield size={20} className={themeStyle.accent} />
               <div>
                 <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-white">
-                  {resolvedOrg.name}
+                  {resolvedOrg?.name ?? "No Organization"}
                   <ChevronDown size={14} className="text-slate-400 group-hover:text-white" />
                 </p>
                 <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                  {resolvedOrg.role} Context
+                  {(resolvedOrg?.role ?? "Explore")} Context
                 </p>
               </div>
             </div>
@@ -1507,6 +1876,38 @@ export function VorldXShell() {
             </div>
 
             <div className="flex items-center gap-3">
+              {orgBootstrapStatus === "ready" && !resolvedOrg ? (
+                <button
+                  onClick={() => {
+                    setJoinRequestError(null);
+                    setSetupPanel("chooser");
+                    void loadUserJoinRequests();
+                  }}
+                  className="inline-flex items-center gap-2 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-300 transition hover:bg-cyan-500/20"
+                >
+                  <Building2 size={14} />
+                  Setup
+                </button>
+              ) : null}
+
+              {resolvedOrg ? (
+                <button
+                  onClick={() => {
+                    setShowRequestCenter((prev) => !prev);
+                    void loadPermissionRequests();
+                  }}
+                  className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10"
+                >
+                  <Bell size={14} />
+                  Requests
+                  {pendingPermissionRequestCount > 0 ? (
+                    <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">
+                      {pendingPermissionRequestCount}
+                    </span>
+                  ) : null}
+                </button>
+              ) : null}
+
               <button
                 onClick={toggleGhostMode}
                 className={`flex items-center gap-2 rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${
@@ -1566,7 +1967,7 @@ export function VorldXShell() {
                         setShowOrgSwitcher(false);
                       }}
                       className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition ${
-                        resolvedOrg.id === org.id
+                        resolvedOrg?.id === org.id
                           ? `vx-panel ${themeStyle.border}`
                           : "hover:bg-white/5"
                       }`}
@@ -1595,493 +1996,177 @@ export function VorldXShell() {
                 </button>
               </div>
             )}
+
+            {showRequestCenter && resolvedOrg && (
+              <div className="absolute right-6 top-20 z-50 w-[420px] rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10">
+                <div className="mb-2 flex items-center justify-between px-2 py-1">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
+                      Request Center
+                    </p>
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-slate-600">
+                      Pending {pendingPermissionRequestCount}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setShowRequestCenter(false)}
+                    className="rounded-md p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+
+                {permissionRequestsLoading ? (
+                  <div className="inline-flex items-center gap-2 px-2 py-3 text-xs text-slate-400">
+                    <Loader2 size={13} className="animate-spin" />
+                    Loading requests...
+                  </div>
+                ) : permissionRequests.length === 0 ? (
+                  <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-4 text-xs text-slate-500">
+                    No permission requests right now.
+                  </p>
+                ) : (
+                  <div className="vx-scrollbar max-h-[55vh] space-y-2 overflow-y-auto pr-1">
+                    {permissionRequests.map((item) => (
+                      <div
+                        key={item.id}
+                        className="rounded-2xl border border-white/10 bg-black/25 p-3"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="truncate text-xs font-semibold uppercase tracking-[0.14em] text-white">
+                              {item.area}
+                            </p>
+                            <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                              {item.status} | Target {item.targetRole}
+                            </p>
+                          </div>
+                          {item.status === "PENDING" ? (
+                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-amber-300">
+                              Pending
+                            </span>
+                          ) : (
+                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-emerald-300">
+                              {item.status}
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                          Workflow: {item.workflowTitle || "N/A"} | Task:{" "}
+                          {item.taskTitle || "N/A"}
+                        </p>
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                          Requested by {item.requestedByEmail}
+                        </p>
+
+                        {canReviewPermissionRequests && item.status === "PENDING" ? (
+                          <div className="mt-2 flex items-center gap-2">
+                            <button
+                              onClick={() =>
+                                void handlePermissionRequestDecision(item.id, "APPROVE")
+                              }
+                              disabled={permissionRequestActionId === item.id}
+                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                            >
+                              {permissionRequestActionId === item.id
+                                ? "Working..."
+                                : "Approve"}
+                            </button>
+                            <button
+                              onClick={() =>
+                                void handlePermissionRequestDecision(item.id, "REJECT")
+                              }
+                              disabled={permissionRequestActionId === item.id}
+                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </header>
 
-          <section className="vx-scrollbar relative flex-1 overflow-y-auto px-5 py-8 md:px-10 md:py-10">
-            {activeTab === "control" ? (
-              <div className="mx-auto max-w-5xl space-y-10">
-                <div className="space-y-2">
-                  <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-[28px] bg-white/5">
-                    <Target size={34} className={themeStyle.accent} />
-                  </div>
-                  <h1 className="font-display text-5xl font-black uppercase tracking-tight md:text-6xl">
-                    Talk To Organization
-                  </h1>
-                  <p className="text-xs uppercase tracking-[0.4em] text-slate-500">
-                    Main Agent Context For {resolvedOrg.name}
-                  </p>
-                </div>
-
-                <div className="vx-panel space-y-8 rounded-[42px] p-8 md:p-12">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-[10px] uppercase tracking-[0.35em] text-slate-500">
-                      Direction Interaction
-                    </p>
-                    <button
-                      onClick={handleVoiceIntent}
-                      disabled={isRecordingIntent}
-                      className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${
-                        isRecordingIntent
-                          ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
-                          : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
-                      } disabled:cursor-not-allowed`}
-                    >
-                      {isRecordingIntent ? <MicOff size={14} /> : <Mic size={14} />}
-                      {isRecordingIntent ? "Listening..." : "Voice Input"}
-                    </button>
-                  </div>
-
-                  <div className="grid gap-4 md:grid-cols-[1fr_auto]">
-                    <select
-                      value={directionModelId}
-                      onChange={(event) =>
-                        setDirectionModelId(
-                          event.target.value as (typeof DIRECTION_MODELS)[number]["id"]
-                        )
-                      }
-                      className="rounded-2xl border border-white/10 bg-black/40 px-4 py-3 text-sm text-slate-100 outline-none"
-                    >
-                      {DIRECTION_MODELS.map((option) => (
-                        <option key={option.id} value={option.id}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      onClick={handleDirectionChat}
-                      disabled={directionChatInFlight || !directionPrompt.trim()}
-                      className="rounded-2xl border border-white/20 bg-white/5 px-5 py-3 text-xs font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {directionChatInFlight ? "Thinking..." : "Talk"}
-                    </button>
-                  </div>
-
-                  <div className="vx-scrollbar max-h-64 space-y-3 overflow-y-auto rounded-3xl border border-white/10 bg-black/35 p-4">
-                    {directionTurns.length === 0 ? (
-                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
-                        Start a conversation to shape the company direction.
-                      </p>
-                    ) : (
-                      directionTurns.map((turn) => (
-                        <div
-                          key={turn.id}
-                          className={`rounded-2xl border p-3 ${
-                            turn.role === "owner"
-                              ? "border-cyan-500/30 bg-cyan-500/10"
-                              : "border-emerald-500/30 bg-emerald-500/10"
-                          }`}
-                        >
-                          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-400">
-                            {turn.role === "owner" ? "Owner" : "Organization"}{" "}
-                            {turn.modelLabel ? `| ${turn.modelLabel}` : ""}
-                          </p>
-                          <p className="mt-1 whitespace-pre-wrap text-sm text-slate-100">
-                            {turn.content}
-                          </p>
-                        </div>
-                      ))
-                    )}
-                  </div>
-
-                  <textarea
-                    value={directionPrompt}
-                    onChange={(event) => setDirectionPrompt(event.target.value)}
-                    placeholder="Ask your organization for analysis, strategy, or planning..."
-                    className="min-h-24 w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-4 text-sm text-slate-100 outline-none placeholder:text-slate-600"
-                  />
-
-                  <div>
-                    <p className="mb-2 text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                      Direction To Execute
-                    </p>
-                    <textarea
-                      value={intent}
-                      onChange={(event) => {
-                        setIntent(event.target.value);
-                        if (
-                          agentRunPromptSnapshot &&
-                          event.target.value.trim() !== agentRunPromptSnapshot
-                        ) {
-                          setAgentRunResult(null);
-                          setAgentRunInputValues({});
-                        }
-                      }}
-                      placeholder="Final direction that will be sent to the Main Agent for task decomposition..."
-                      className="min-h-36 w-full resize-y rounded-2xl border border-white/10 bg-black/45 p-4 text-base text-slate-100 outline-none placeholder:text-slate-600"
-                    />
-                  </div>
-
-                  <div className="grid gap-6 md:grid-cols-3">
-                    <div className="rounded-3xl border border-white/10 bg-black/40 p-5">
-                      <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                        Swarm Density
-                      </p>
-                      <div className="mt-3 flex items-end justify-between">
-                        <p className="text-3xl font-bold text-white">{swarmDensity}</p>
-                        <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                          Nodes
-                        </p>
-                      </div>
-                      <input
-                        type="range"
-                        min={1}
-                        max={100}
-                        step={1}
-                        value={swarmDensity}
-                        onChange={(event) => setSwarmDensity(Number(event.target.value))}
-                        className="mt-4 w-full accent-blue-500"
-                      />
-                    </div>
-
-                    <div className="rounded-3xl border border-white/10 bg-black/40 p-5">
-                      <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                        Predicted Burn
-                      </p>
-                      <p className="mt-4 font-display text-4xl font-black text-white">
-                        {predictedBurn.toLocaleString()} BTU
-                      </p>
-                      <p className="mt-4 text-xs text-slate-500">
-                        Multi-sig gates and Human Touch checkpoints will be enforced before run start.
-                      </p>
-                    </div>
-
-                    <div className="rounded-3xl border border-white/10 bg-black/40 p-5">
-                      <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                        Multi-Sig Gate
-                      </p>
-                      <p className="mt-4 font-display text-4xl font-black text-white">
-                        {signatureApprovals}/{requiredSignatures}
-                      </p>
-                      <p className="mt-4 text-xs text-slate-500">
-                        {requiredSignatures > 1
-                          ? `${requiredSignatures} human approvals required for this mission burn.`
-                          : "Single principal authorization is sufficient for this burn."}
-                      </p>
-                      {requiredSignatures > 1 && (
-                        <button
-                          onClick={() => {
-                            const nextApprovals = Math.min(
-                              requiredSignatures,
-                              signatureApprovals + 1
-                            );
-                            setSignatureApprovals(nextApprovals);
-                            const socket = getRealtimeClient();
-                            socket?.emit("signature:capture", {
-                              orgId: resolvedOrg.id,
-                              senderId: realtimeSessionId,
-                              approvalsProvided: nextApprovals,
-                              requiredSignatures
-                            });
-                          }}
-                          disabled={signatureApprovals >= requiredSignatures}
-                          className="mt-4 rounded-full border border-white/20 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          Capture Signature
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="space-y-4 rounded-3xl border border-white/10 bg-black/35 p-5">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                        Direction Schedules
-                      </p>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={handleRunDueSchedules}
-                          disabled={scheduleTickInFlight}
-                          className="inline-flex items-center gap-2 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.2em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                          {scheduleTickInFlight ? (
-                            <Loader2 size={12} className="animate-spin" />
-                          ) : null}
-                          Run Due
-                        </button>
-                        <button
-                          onClick={() => void loadMissionSchedules(true)}
-                          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-300 transition hover:bg-white/10"
-                        >
-                          {schedulesRefreshing ? (
-                            <Loader2 size={12} className="animate-spin" />
-                          ) : (
-                            <RefreshCw size={12} />
-                          )}
-                          Refresh
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="grid gap-3 md:grid-cols-[1fr_auto_auto_auto]">
-                      <input
-                        value={scheduleDraft.title}
-                        onChange={(event) =>
-                          setScheduleDraft((prev) => ({
-                            ...prev,
-                            title: event.target.value
-                          }))
-                        }
-                        placeholder="Schedule title"
-                        className="rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600"
-                      />
-                      <select
-                        value={scheduleDraft.cadence}
-                        onChange={(event) =>
-                          setScheduleDraft((prev) => ({
-                            ...prev,
-                            cadence: event.target.value as MissionCadence
-                          }))
-                        }
-                        className="rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none"
-                      >
-                        <option value="DAILY">DAILY</option>
-                        <option value="WEEKLY">WEEKLY</option>
-                        <option value="MONTHLY">MONTHLY</option>
-                        <option value="CUSTOM">CUSTOM</option>
-                      </select>
-                      <input
-                        type="datetime-local"
-                        value={scheduleDraft.nextRunAt}
-                        onChange={(event) =>
-                          setScheduleDraft((prev) => ({
-                            ...prev,
-                            nextRunAt: event.target.value
-                          }))
-                        }
-                        className="rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none"
-                      />
-                      <button
-                        onClick={handleCreateSchedule}
-                        disabled={scheduleActionInFlight || !intent.trim()}
-                        className="rounded-xl border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {scheduleActionInFlight ? "Saving..." : "Create"}
-                      </button>
-                    </div>
-
-                    {schedulesLoading ? (
-                      <div className="inline-flex items-center gap-2 text-xs text-slate-400">
-                        <Loader2 size={13} className="animate-spin" />
-                        Loading schedules...
-                      </div>
-                    ) : missionSchedules.length === 0 ? (
-                      <p className="text-xs text-slate-500">
-                        No schedules yet. Create one from the current direction.
-                      </p>
-                    ) : (
-                      <div className="space-y-2">
-                        {missionSchedules.map((schedule) => (
-                          <div
-                            key={schedule.id}
-                            className="rounded-2xl border border-white/10 bg-black/35 p-3"
-                          >
-                            <div className="flex items-center justify-between gap-3">
-                              <div className="min-w-0">
-                                <p className="truncate text-xs font-semibold uppercase tracking-[0.16em] text-white">
-                                  {schedule.title}
-                                </p>
-                                <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
-                                  {schedule.cadence} | Next:{" "}
-                                  {new Date(schedule.nextRunAt).toLocaleString()} | Burn:{" "}
-                                  {schedule.predictedBurn.toLocaleString()} BTU
-                                </p>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <button
-                                  onClick={() => void handleRunSchedule(schedule.id)}
-                                  disabled={Boolean(scheduleRunInFlightId) || !schedule.enabled}
-                                  className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                                >
-                                  {scheduleRunInFlightId === schedule.id ? "Running..." : "Run"}
-                                </button>
-                                <button
-                                  onClick={() => void handleToggleSchedule(schedule)}
-                                  disabled={scheduleActionInFlight}
-                                  className="rounded-lg border border-white/20 bg-white/5 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-                                >
-                                  {schedule.enabled ? "Disable" : "Enable"}
-                                </button>
-                                <button
-                                  onClick={() => void handleDeleteSchedule(schedule.id)}
-                                  disabled={scheduleActionInFlight}
-                                  className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                            <p className="mt-2 line-clamp-2 text-xs text-slate-400">
-                              {schedule.direction}
-                            </p>
-                            {schedule.lastRunAt ? (
-                              <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                                Last run: {new Date(schedule.lastRunAt).toLocaleString()}
-                              </p>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {agentRunResult ? (
-                    <div className="space-y-4 rounded-3xl border border-white/10 bg-black/35 p-5">
-                      <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                        Main Agent Gmail Action
-                      </p>
-                      <div
-                        className={`rounded-2xl border px-4 py-3 text-xs uppercase tracking-[0.16em] ${
-                          agentRunResult.status === "completed"
-                            ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                            : agentRunResult.status === "needs_confirmation" ||
-                                agentRunResult.status === "needs_input"
-                              ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
-                              : "border-red-500/40 bg-red-500/10 text-red-300"
-                        }`}
-                      >
-                        {agentRunResult.assistant_message}
-                      </div>
-
-                      {agentRunResult.required_inputs &&
-                      agentRunResult.required_inputs.length > 0 ? (
-                        <div className="grid gap-3 md:grid-cols-2">
-                          {agentRunResult.required_inputs.map((field) => (
-                            <label key={field.key} className="space-y-1">
-                              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-500">
-                                {field.label}
-                              </span>
-                              <input
-                                type={field.type}
-                                value={agentRunInputValues[field.key] ?? ""}
-                                onChange={(event) =>
-                                  setAgentRunInputValues((previous) => ({
-                                    ...previous,
-                                    [field.key]: event.target.value
-                                  }))
-                                }
-                                placeholder={field.placeholder}
-                                className="w-full rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600"
-                              />
-                            </label>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      {agentRunResult.draft ? (
-                        <div className="space-y-2 rounded-2xl border border-white/10 bg-black/30 p-3">
-                          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
-                            Draft Preview
-                          </p>
-                          <label className="space-y-1">
-                            <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                              To
-                            </span>
-                            <input
-                              type="email"
-                              value={
-                                agentRunInputValues.recipient_email ??
-                                agentRunResult.draft.to
-                              }
-                              onChange={(event) =>
-                                setAgentRunInputValues((previous) => ({
-                                  ...previous,
-                                  recipient_email: event.target.value
-                                }))
-                              }
-                              className="w-full rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none"
-                            />
-                          </label>
-                          <label className="space-y-1">
-                            <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                              Subject
-                            </span>
-                            <input
-                              value={agentRunInputValues.subject ?? agentRunResult.draft.subject}
-                              onChange={(event) =>
-                                setAgentRunInputValues((previous) => ({
-                                  ...previous,
-                                  subject: event.target.value
-                                }))
-                              }
-                              className="w-full rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none"
-                            />
-                          </label>
-                          <label className="space-y-1">
-                            <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                              Body
-                            </span>
-                            <textarea
-                              value={agentRunInputValues.body ?? agentRunResult.draft.body}
-                              onChange={(event) =>
-                                setAgentRunInputValues((previous) => ({
-                                  ...previous,
-                                  body: event.target.value
-                                }))
-                              }
-                              className="min-h-28 w-full resize-y rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none"
-                            />
-                          </label>
-                        </div>
-                      ) : null}
-
-                      {agentRunConnectUrl ? (
-                        <button
-                          onClick={() => {
-                            const popup = openCenteredPopup(
-                              agentRunConnectUrl,
-                              "integrations-gmail"
-                            );
-                            if (!popup) {
-                              window.location.assign(agentRunConnectUrl);
-                            }
-                          }}
-                          className="inline-flex items-center gap-2 rounded-full border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-amber-200 transition hover:bg-amber-500/20"
-                        >
-                          Connect Gmail
-                        </button>
-                      ) : null}
-                    </div>
-                  ) : null}
-
-                  {controlMessage && (
-                    <div
-                      className={`rounded-2xl border px-4 py-3 text-xs uppercase tracking-[0.16em] ${
-                        controlMessage.tone === "success"
-                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                          : controlMessage.tone === "warning"
-                            ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
-                            : "border-red-500/40 bg-red-500/10 text-red-300"
-                      }`}
-                    >
-                      {controlMessage.text}
-                    </div>
-                  )}
-
-                  <div className="flex gap-4">
-                    <button
-                      onClick={handleGlobalKillSwitch}
-                      disabled={killSwitchInFlight}
-                      className="inline-flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-7 py-3 text-xs font-bold uppercase tracking-[0.2em] text-red-400 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {killSwitchInFlight && <Loader2 size={14} className="animate-spin" />}
-                      Global Kill Switch
-                    </button>
-                    <button
-                      onClick={handleLaunchMainAgent}
-                      disabled={
-                        launchInFlight || !intent.trim() || signatureApprovals < requiredSignatures
-                      }
-                      className="inline-flex items-center gap-2 rounded-full bg-white px-7 py-3 text-xs font-bold uppercase tracking-[0.2em] text-black transition hover:bg-emerald-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {launchInFlight && <Loader2 size={14} className="animate-spin" />}
-                      {agentRunResult?.status === "needs_confirmation" &&
-                      agentRunPromptSnapshot === intent.trim()
-                        ? "Confirm Send Direction To Main Agent"
-                        : "Send Direction To Main Agent"}
-                    </button>
-                  </div>
-                </div>
-              </div>
+          <section
+            className={`vx-scrollbar relative flex-1 px-5 py-8 md:px-10 md:py-10 ${
+              resolvedOrg && activeTab === "control"
+                ? "min-h-0 overflow-hidden py-4 md:py-6"
+                : "overflow-y-auto"
+            }`}
+          >
+            {orgBootstrapStatus === "loading" ? (
+              <WorkspaceBootstrapState themeStyle={themeStyle} />
+            ) : orgBootstrapStatus === "failed" && !resolvedOrg ? (
+              <WorkspaceBootstrapError
+                themeStyle={themeStyle}
+                message={orgBootstrapError}
+                onRetry={() => setOrgBootstrapAttempt((value) => value + 1)}
+              />
+            ) : !resolvedOrg ? (
+              <NoOrganizationExplore
+                activeTab={activeTab}
+                themeStyle={themeStyle}
+                userJoinRequests={userJoinRequests}
+                loadingUserJoinRequests={loadingUserJoinRequests}
+                onOpenSetup={() => {
+                  setJoinRequestError(null);
+                  setSetupPanel("chooser");
+                  void loadUserJoinRequests();
+                }}
+              />
+            ) : activeTab === "control" ? (
+              <ControlDeckSurface
+                themeStyle={themeStyle}
+                mode={controlMode}
+                conversationDetail={controlConversationDetail}
+                engaged={controlEngaged}
+                directionGiven={intent}
+                turns={directionTurns}
+                directionModelId={directionModelId}
+                directionModels={DIRECTION_MODELS}
+                directionChatInFlight={directionChatInFlight}
+                directionPlanningInFlight={directionPlanningInFlight}
+                message={controlMessage}
+                onModeChange={setControlMode}
+                onConversationDetailChange={setControlConversationDetail}
+                onDirectionGivenChange={(value) => {
+                  setIntent(value);
+                  if (
+                    agentRunPromptSnapshot &&
+                    value.trim() !== agentRunPromptSnapshot
+                  ) {
+                    setAgentRunResult(null);
+                    setAgentRunInputValues({});
+                  }
+                }}
+                onDirectionModelChange={setDirectionModelId}
+                onEngageWithMode={(nextMode) => {
+                  setControlMode(nextMode);
+                  setControlEngaged(true);
+                  if (nextMode === "DIRECTION") {
+                    setControlConversationDetail("DIRECTION_GIVEN");
+                  } else {
+                    setControlConversationDetail("REASONING_MIN");
+                  }
+                }}
+                onSendMessage={async (message, modeForMessage) => {
+                  if (modeForMessage === "MINDSTORM") {
+                    setDirectionPrompt(message);
+                    await handleDirectionChat(message);
+                    return;
+                  }
+                  setIntent(message);
+                  await handleGenerateDirectionPlans(message);
+                }}
+                onVoiceIntent={handleVoiceIntent}
+                isRecordingIntent={isRecordingIntent}
+                planningResult={directionPlanningResult}
+              />
             ) : activeTab === "flow" ? (
               <WorkflowConsole
                 orgId={resolvedOrg.id}
@@ -2093,6 +2178,15 @@ export function VorldXShell() {
               />
             ) : activeTab === "direction" ? (
               <DirectionConsole
+                orgId={resolvedOrg.id}
+                themeStyle={{
+                  accent: themeStyle.accent,
+                  accentSoft: themeStyle.accentSoft,
+                  border: themeStyle.border
+                }}
+              />
+            ) : activeTab === "plan" ? (
+              <PlanConsole
                 orgId={resolvedOrg.id}
                 themeStyle={{
                   accent: themeStyle.accent,
@@ -2171,7 +2265,574 @@ export function VorldXShell() {
           <div className="vx-ghost-vignette pointer-events-none fixed inset-0 z-50" />
         </>
       )}
+
+      {setupPanel === "chooser" && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-xl rounded-[30px] border border-white/15 bg-[#0d1117] p-6">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                  Organization Setup
+                </p>
+                <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                  Choose how to continue
+                </p>
+              </div>
+              <button
+                onClick={() => setSetupPanel("closed")}
+                className="rounded-full border border-white/20 p-2 text-slate-300 transition hover:bg-white/10"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <button
+                onClick={() => setSetupPanel("onboarding")}
+                className="rounded-2xl border border-emerald-500/40 bg-emerald-500/10 p-4 text-left transition hover:bg-emerald-500/20"
+              >
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-emerald-200">
+                  Set Up New Organization
+                </p>
+                <p className="mt-2 text-xs text-slate-300">
+                  Create organization, assign founder access, and configure runtime.
+                </p>
+              </button>
+              <button
+                onClick={() => {
+                  setJoinRequestError(null);
+                  setSetupPanel("request-access");
+                  void loadUserJoinRequests();
+                }}
+                className="rounded-2xl border border-cyan-500/40 bg-cyan-500/10 p-4 text-left transition hover:bg-cyan-500/20"
+              >
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-cyan-200">
+                  Request Existing Access
+                </p>
+                <p className="mt-2 text-xs text-slate-300">
+                  Request membership in an existing organization for squad approval.
+                </p>
+              </button>
+            </div>
+
+            {!hasOrganization && (
+              <p className="mt-4 text-xs text-slate-400">
+                You can keep exploring the platform without an organization and complete setup later.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {setupPanel === "request-access" && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
+          <div className="vx-scrollbar max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-[30px] border border-white/15 bg-[#0d1117] p-6">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                  Request Organization Access
+                </p>
+                <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                  Send request for admin review
+                </p>
+              </div>
+              <button
+                onClick={() => setSetupPanel("chooser")}
+                className="rounded-full border border-white/20 p-2 text-slate-300 transition hover:bg-white/10"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="space-y-3 rounded-2xl border border-white/10 bg-black/20 p-3">
+              <label className="block text-xs text-slate-300">
+                Organization Id or Name
+                <input
+                  value={joinOrgIdentifier}
+                  onChange={(event) => setJoinOrgIdentifier(event.target.value)}
+                  placeholder="org id or company name"
+                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </label>
+              <div className="grid gap-2 md:grid-cols-2">
+                <label className="text-xs text-slate-300">
+                  Requested Role
+                  <select
+                    value={joinRequestRole}
+                    onChange={(event) =>
+                      setJoinRequestRole(event.target.value as "EMPLOYEE" | "ADMIN")
+                    }
+                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                  >
+                    <option value="EMPLOYEE">EMPLOYEE</option>
+                    <option value="ADMIN">ADMIN</option>
+                  </select>
+                </label>
+                <label className="text-xs text-slate-300">
+                  Optional Message
+                  <input
+                    value={joinRequestMessage}
+                    onChange={(event) => setJoinRequestMessage(event.target.value)}
+                    placeholder="why you need access"
+                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                </label>
+              </div>
+
+              {joinRequestError && (
+                <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  {joinRequestError}
+                </div>
+              )}
+
+              <button
+                onClick={() => void handleSubmitJoinRequest()}
+                disabled={joinRequestInFlight}
+                className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                {joinRequestInFlight ? <Loader2 size={13} className="animate-spin" /> : null}
+                Send Request
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2">
+              <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                Your Requests
+              </p>
+              {loadingUserJoinRequests ? (
+                <div className="inline-flex items-center gap-2 text-xs text-slate-400">
+                  <Loader2 size={13} className="animate-spin" />
+                  Loading requests...
+                </div>
+              ) : userJoinRequests.length === 0 ? (
+                <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-500">
+                  No requests yet.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {userJoinRequests.map((item) => (
+                    <div
+                      key={item.id}
+                      className="rounded-2xl border border-white/10 bg-black/25 p-3"
+                    >
+                      <p className="text-xs font-semibold text-slate-100">
+                        {item.organizationName || item.orgId}
+                      </p>
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                        {item.status} | Requested {item.requestedRole} |{" "}
+                        {new Date(item.createdAt).toLocaleString()}
+                      </p>
+                      {item.message ? (
+                        <p className="mt-1 text-xs text-slate-300">{item.message}</p>
+                      ) : null}
+                      {item.decisionNote ? (
+                        <p className="mt-1 text-xs text-slate-400">
+                          Decision Note: {item.decisionNote}
+                        </p>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {setupPanel === "onboarding" && (
+        <div className="fixed inset-0 z-[80] overflow-y-auto">
+          <OnboardingWizard
+            mode={hasOrganization ? "add-org" : "initial"}
+            onCancel={() => setSetupPanel("chooser")}
+            onComplete={(org) => {
+              addOrg(org);
+              setCurrentOrg(org);
+              setSetupPanel("closed");
+            }}
+          />
+        </div>
+      )}
+
       <NotificationStack />
+    </div>
+  );
+}
+
+function ControlDeckSurface({
+  themeStyle,
+  mode,
+  conversationDetail,
+  engaged,
+  directionGiven,
+  turns,
+  directionModelId,
+  directionModels,
+  directionChatInFlight,
+  directionPlanningInFlight,
+  planningResult,
+  message,
+  onModeChange,
+  onConversationDetailChange,
+  onDirectionGivenChange,
+  onDirectionModelChange,
+  onEngageWithMode,
+  onSendMessage,
+  onVoiceIntent,
+  isRecordingIntent
+}: {
+  themeStyle: { accent: string; accentSoft: string; border: string };
+  mode: ControlMode;
+  conversationDetail: ControlConversationDetail;
+  engaged: boolean;
+  directionGiven: string;
+  turns: DirectionTurn[];
+  directionModelId: (typeof DIRECTION_MODELS)[number]["id"];
+  directionModels: readonly { id: string; label: string }[];
+  directionChatInFlight: boolean;
+  directionPlanningInFlight: boolean;
+  planningResult: DirectionPlanningResult | null;
+  message: ControlMessage | null;
+  onModeChange: (value: ControlMode) => void;
+  onConversationDetailChange: (value: ControlConversationDetail) => void;
+  onDirectionGivenChange: (value: string) => void;
+  onDirectionModelChange: (value: (typeof DIRECTION_MODELS)[number]["id"]) => void;
+  onEngageWithMode: (value: ControlMode) => void;
+  onSendMessage: (message: string, mode: ControlMode) => Promise<void>;
+  onVoiceIntent: () => void;
+  isRecordingIntent: boolean;
+}) {
+  const [composer, setComposer] = useState("");
+  const [sending, setSending] = useState(false);
+  const hasConversation = turns.length > 0;
+  const hasDirectionDraft = directionGiven.trim().length > 0;
+  const isBusy = directionChatInFlight || directionPlanningInFlight || sending;
+  const showLanding = !hasConversation && !hasDirectionDraft;
+  const placeholder =
+    mode === "MINDSTORM"
+      ? "Ask anything about ideas, planning, or execution..."
+      : "Give the direction the organization should shift toward...";
+  const heroTitle =
+    mode === "MINDSTORM"
+      ? "What's on your mind today?"
+      : "Where should organization move next?";
+
+  const handleSend = useCallback(async () => {
+    const text = composer.trim();
+    if (!text || isBusy) {
+      return;
+    }
+
+    setSending(true);
+    try {
+      if (!engaged) {
+        onEngageWithMode(mode);
+      }
+      await onSendMessage(text, mode);
+      if (mode === "DIRECTION") {
+        onDirectionGivenChange(text);
+      }
+      setComposer("");
+    } finally {
+      setSending(false);
+    }
+  }, [composer, engaged, isBusy, mode, onDirectionGivenChange, onEngageWithMode, onSendMessage]);
+
+  const composerBar = (
+    <div className="rounded-[30px] border border-white/10 bg-white/[0.04] p-2 backdrop-blur-xl">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200"
+          title="Tools"
+        >
+          <PlusCircle size={18} />
+        </button>
+
+        <textarea
+          value={composer}
+          onChange={(event) => setComposer(event.target.value)}
+          placeholder={placeholder}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              void handleSend();
+            }
+          }}
+          className="h-10 flex-1 resize-none bg-transparent px-2 py-2 text-base text-slate-100 outline-none placeholder:text-slate-500"
+        />
+
+        <button
+          onClick={onVoiceIntent}
+          disabled={isRecordingIntent || mode !== "MINDSTORM"}
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 disabled:opacity-50"
+          title={isRecordingIntent ? "Listening..." : "Voice Input"}
+        >
+          {isRecordingIntent ? <MicOff size={18} /> : <Mic size={18} />}
+        </button>
+
+        <button
+          onClick={() => void handleSend()}
+          disabled={isBusy || !composer.trim()}
+          className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-white text-black transition hover:bg-slate-200 disabled:opacity-60"
+          title={mode === "MINDSTORM" ? "Send Message" : "Generate Plan"}
+        >
+          {isBusy ? <Loader2 size={18} className="animate-spin" /> : <ArrowUpRight size={18} />}
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm text-slate-300">Talk to your organization</p>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-full border border-white/10 bg-black/25 p-1">
+            <button
+              onClick={() => onModeChange("MINDSTORM")}
+              className={`rounded-full px-5 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                mode === "MINDSTORM"
+                  ? "bg-white text-black"
+                  : "text-slate-300 hover:bg-white/10"
+              }`}
+            >
+              Mindstorming
+            </button>
+            <button
+              onClick={() => onModeChange("DIRECTION")}
+              className={`rounded-full px-5 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                mode === "DIRECTION"
+                  ? "bg-white text-black"
+                  : "text-slate-300 hover:bg-white/10"
+              }`}
+            >
+              Direction
+            </button>
+          </div>
+
+          <select
+            value={directionModelId}
+            onChange={(event) =>
+              onDirectionModelChange(event.target.value as (typeof DIRECTION_MODELS)[number]["id"])
+            }
+            className="rounded-full border border-white/10 bg-black/35 px-4 py-2 text-sm text-slate-100 outline-none"
+          >
+            {directionModels.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <div className={`vx-panel flex min-h-0 flex-1 flex-col rounded-[28px] p-4 ${themeStyle.border}`}>
+        {showLanding ? (
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-3">
+            <h2 className="text-center text-3xl font-medium text-slate-100 md:text-5xl">
+              {heroTitle}
+            </h2>
+
+            {planningResult?.analysis ? (
+              <div className="mt-4 w-full max-w-4xl rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm text-blue-200">
+                {planningResult.analysis}
+              </div>
+            ) : null}
+
+            <div className="mt-8 w-full max-w-4xl">{composerBar}</div>
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col gap-3">
+            <div className="inline-flex w-fit rounded-full border border-white/10 bg-black/25 p-1">
+              <button
+                onClick={() => onConversationDetailChange("REASONING_MIN")}
+                className={`rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+                  conversationDetail === "REASONING_MIN"
+                    ? "bg-white text-black"
+                    : "text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                Reasoning Minimized
+              </button>
+              <button
+                onClick={() => onConversationDetailChange("DIRECTION_GIVEN")}
+                className={`rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
+                  conversationDetail === "DIRECTION_GIVEN"
+                    ? "bg-white text-black"
+                    : "text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                Direction Given
+              </button>
+            </div>
+
+            {conversationDetail === "DIRECTION_GIVEN" && hasDirectionDraft ? (
+              <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                  Final Direction
+                </p>
+                <textarea
+                  value={directionGiven}
+                  onChange={(event) => onDirectionGivenChange(event.target.value)}
+                  className="mt-2 h-16 w-full resize-none rounded-lg border border-white/10 bg-black/35 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </div>
+            ) : null}
+
+            {planningResult?.analysis ? (
+              <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm text-blue-200">
+                {planningResult.analysis}
+              </div>
+            ) : null}
+
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+              {turns.map((turn) => (
+                <div
+                  key={turn.id}
+                  className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
+                    turn.role === "owner"
+                      ? "ml-auto bg-white/[0.08] text-slate-100"
+                      : "mr-auto bg-white/[0.04] text-slate-200"
+                  }`}
+                >
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                    {turn.role === "owner" ? "You" : "Organization"}
+                    {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap">{turn.content}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className="mx-auto w-full max-w-4xl">{composerBar}</div>
+          </div>
+        )}
+
+        {message ? (
+          <div
+            className={`mt-3 rounded-xl border px-3 py-2 text-xs ${
+              message.tone === "success"
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : message.tone === "warning"
+                  ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                  : "border-red-500/40 bg-red-500/10 text-red-300"
+            }`}
+          >
+            {message.text}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceBootstrapState({
+  themeStyle
+}: {
+  themeStyle: { accent: string; accentSoft: string; border: string };
+}) {
+  return (
+    <div className="mx-auto max-w-4xl">
+      <div className={`vx-panel rounded-[34px] p-6 ${themeStyle.border}`}>
+        <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-slate-300">
+          <Loader2 size={14} className="animate-spin" />
+          Loading Organization Context
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceBootstrapError({
+  themeStyle,
+  message,
+  onRetry
+}: {
+  themeStyle: { accent: string; accentSoft: string; border: string };
+  message: string | null;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="mx-auto max-w-4xl">
+      <div className={`vx-panel space-y-3 rounded-[34px] p-6 ${themeStyle.border}`}>
+        <p className="text-xs font-bold uppercase tracking-[0.2em] text-rose-300">
+          Unable To Load Organization Context
+        </p>
+        <p className="text-sm text-slate-300">
+          {message ?? "Please retry. Setup is hidden until organization data loads correctly."}
+        </p>
+        <button
+          onClick={onRetry}
+          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10"
+        >
+          <RefreshCw size={12} />
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NoOrganizationExplore({
+  activeTab,
+  themeStyle,
+  onOpenSetup,
+  userJoinRequests,
+  loadingUserJoinRequests
+}: {
+  activeTab: (typeof NAV_ITEMS)[number]["id"];
+  themeStyle: { accent: string; accentSoft: string; border: string };
+  onOpenSetup: () => void;
+  userJoinRequests: UserJoinRequest[];
+  loadingUserJoinRequests: boolean;
+}) {
+  const tabLabel = NAV_ITEMS.find((item) => item.id === activeTab)?.label ?? "Workspace";
+  const pendingCount = userJoinRequests.filter((item) => item.status === "PENDING").length;
+
+  return (
+    <div className="mx-auto max-w-4xl space-y-6">
+      <div className={`vx-panel space-y-4 rounded-[34px] p-6 ${themeStyle.border}`}>
+        <h2 className="font-display text-4xl font-black uppercase tracking-tight">
+          Explore {tabLabel}
+        </h2>
+        <p className="text-sm text-slate-300">
+          Platform preview is active. Connect to an organization when you are ready to run live
+          squads, memory, workflows, and settings.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={onOpenSetup}
+            className="rounded-full bg-white px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-black transition hover:bg-emerald-500 hover:text-white"
+          >
+            Open Setup
+          </button>
+          <span className="rounded-full border border-white/20 bg-white/5 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-slate-300">
+            Pending Requests: {loadingUserJoinRequests ? "..." : pendingCount}
+          </span>
+        </div>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Direction</p>
+          <p className="mt-2 text-xs text-slate-300">
+            Talk-to-organization mode, mission scheduling, and multi-signature execution gates.
+          </p>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Squad</p>
+          <p className="mt-2 text-xs text-slate-300">
+            Human and AI roster management, OAuth delegation, and join-request approvals.
+          </p>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Settings</p>
+          <p className="mt-2 text-xs text-slate-300">
+            Orchestration mode (BYOK/platform-managed), model preferences, and credit wallet.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

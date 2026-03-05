@@ -1,0 +1,4 @@
+Enterprise GTM Notes
+Target segment: Series B SaaS buyers in North America.
+Need stronger inbound pipeline, high-intent keyword capture, and SDR handoff quality.
+North-star metric: SQL to Opportunity conversion above 32%.
