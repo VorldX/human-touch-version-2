@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { HubFileType, LogType, SpendEventType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 import { posix } from "node:path";

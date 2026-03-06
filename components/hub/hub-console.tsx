@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   Loader2,
@@ -14,6 +14,7 @@ import { DnaMemoryPanel } from "@/components/hub/dna-memory-panel";
 import { DirectionalHub } from "@/components/hub/directional-hub";
 import { StorageHub } from "@/components/hub/storage-hub";
 import { ToolsHub } from "@/components/hub/tools-hub";
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type HubScope = "ORGANIZATIONAL" | "DIRECTIONAL" | "WORKFLOW" | "DNA" | "STORAGE" | "TOOLS";
@@ -45,6 +46,55 @@ interface OrganizationalOutput {
   outputPreview: string | null;
   sourceFlowId: string | null;
   sourceTaskId: string | null;
+}
+
+interface OrganizationalDocument {
+  id: string;
+  name: string;
+  size: string;
+  url: string;
+  updatedAt: string;
+  contentType: string | null;
+}
+
+type ExecutionModeValue = "ECO" | "BALANCED" | "TURBO";
+
+interface CompanyDataEditorState {
+  name: string;
+  description: string;
+  productsAndServices: string;
+  goalsText: string;
+  prioritiesText: string;
+  operatingRulesText: string;
+  toolsAndSystemsText: string;
+  notes: string;
+  founderName: string;
+  founderEmail: string;
+  executionMode: ExecutionModeValue;
+  monthlyBudgetUsd: string;
+  monthlyBtuCap: string;
+  documents: OrganizationalDocument[];
+  baseData: Record<string, unknown> | null;
+}
+
+function emptyCompanyDataEditorState(): CompanyDataEditorState {
+  return {
+    name: "",
+    description: "",
+    productsAndServices: "",
+    goalsText: "",
+    prioritiesText: "",
+    operatingRulesText: "",
+    toolsAndSystemsText: "",
+    notes: "",
+    founderName: "",
+    founderEmail: "",
+    executionMode: "BALANCED",
+    monthlyBudgetUsd: "",
+    monthlyBtuCap: "",
+    documents: [],
+    baseData: null
+  };
 }
 
 interface WorkflowHubItem {
@@ -88,6 +138,163 @@ function formatFileSize(raw: string) {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function asRecord(value: unknown) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+function asString(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function asStringList(value: unknown) {
+  if (!Array.isArray(value)) return [] as string[];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+}
+
+function linesFromList(value: unknown) {
+  return asStringList(value).join("\n");
+}
+
+function listFromLines(value: string) {
+  return value
+    .split("\n")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function parseCompanyDataEditor(content: string): CompanyDataEditorState {
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const candidate = JSON.parse(content);
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      parsed = candidate as Record<string, unknown>;
+    }
+  } catch {
+    parsed = null;
+  }
+
+  const company = asRecord(parsed?.company);
+  const financials = asRecord(parsed?.financials);
+  const founder = asRecord(parsed?.founder);
+  const businessContext = asRecord(parsed?.businessContext);
+  const documents = Array.isArray(parsed?.companyDocuments)
+    ? parsed?.companyDocuments
+        .map((item) => {
+          const doc = asRecord(item);
+          const id = asString(doc.id).trim();
+          const name = asString(doc.name).trim();
+          const url = asString(doc.url).trim();
+          if (!name || !url) return null;
+          return {
+            id,
+            name,
+            url,
+            size: asString(doc.size).trim() || "0",
+            updatedAt: asString(doc.updatedAt).trim() || new Date().toISOString(),
+            contentType: asString(doc.contentType).trim() || null
+          } satisfies OrganizationalDocument;
+        })
+        .filter((item): item is OrganizationalDocument => Boolean(item))
+    : [];
+
+  const executionModeRaw = asString(company.executionMode).trim().toUpperCase();
+  const executionMode: ExecutionModeValue =
+    executionModeRaw === "ECO" || executionModeRaw === "TURBO" ? executionModeRaw : "BALANCED";
+
+  return {
+    name: asString(company.name).trim(),
+    description: asString(company.description).trim() || content,
+    productsAndServices: asString(businessContext.productsAndServices).trim(),
+    goalsText: linesFromList(businessContext.goals),
+    prioritiesText: linesFromList(businessContext.currentPriorities),
+    operatingRulesText: linesFromList(businessContext.operatingRules),
+    toolsAndSystemsText: linesFromList(businessContext.toolsAndSystems),
+    notes: asString(businessContext.notes).trim(),
+    founderName: asString(founder.username).trim(),
+    founderEmail: asString(founder.email).trim(),
+    executionMode,
+    monthlyBudgetUsd: asString(financials.monthlyBudgetUsd).trim(),
+    monthlyBtuCap: asString(financials.monthlyBtuCap).trim(),
+    documents,
+    baseData: parsed
+  };
+}
+
+function mergeCompanyDocuments(
+  editorDocuments: OrganizationalDocument[],
+  storedDocuments: OrganizationalDocument[]
+) {
+  const byUrl = new Map<string, OrganizationalDocument>();
+  for (const doc of [...storedDocuments, ...editorDocuments]) {
+    if (!doc.url) continue;
+    byUrl.set(doc.url, doc);
+  }
+  return [...byUrl.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function buildCompanyDataJsonText(
+  editor: CompanyDataEditorState,
+  orgId: string,
+  previousContent: string
+) {
+  const base = asRecord(editor.baseData ?? {});
+  const existingCompany = asRecord(base.company);
+  const existingFinancials = asRecord(base.financials);
+  const existingFounder = asRecord(base.founder);
+  const existingBusiness = asRecord(base.businessContext);
+
+  const next = {
+    ...base,
+    company: {
+      ...existingCompany,
+      orgId,
+      name: editor.name || asString(existingCompany.name) || "Organization",
+      description: editor.description || previousContent,
+      executionMode: editor.executionMode
+    },
+    financials: {
+      ...existingFinancials,
+      monthlyBudgetUsd:
+        editor.monthlyBudgetUsd || asString(existingFinancials.monthlyBudgetUsd) || "0",
+      monthlyBtuCap: editor.monthlyBtuCap || asString(existingFinancials.monthlyBtuCap) || "0"
+    },
+    founder: editor.founderEmail
+      ? {
+          ...existingFounder,
+          username: editor.founderName || asString(existingFounder.username) || "Founder",
+          email: editor.founderEmail
+        }
+      : Object.keys(existingFounder).length > 0
+        ? existingFounder
+        : null,
+    businessContext: {
+      ...existingBusiness,
+      productsAndServices: editor.productsAndServices,
+      goals: listFromLines(editor.goalsText),
+      currentPriorities: listFromLines(editor.prioritiesText),
+      operatingRules: listFromLines(editor.operatingRulesText),
+      toolsAndSystems: listFromLines(editor.toolsAndSystemsText),
+      notes: editor.notes
+    },
+    companyDocuments: editor.documents.map((doc) => ({
+      id: doc.id,
+      name: doc.name,
+      size: doc.size,
+      url: doc.url,
+      updatedAt: doc.updatedAt,
+      contentType: doc.contentType
+    })),
+    lastUpdatedAt: new Date().toISOString()
+  };
+
+  return JSON.stringify(next, null, 2);
+}
+
 function StatChip({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-xl border border-white/10 bg-black/40 px-2 py-2 text-center">
@@ -109,6 +316,15 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
   const [orgLoading, setOrgLoading] = useState(true);
   const [orgSaving, setOrgSaving] = useState(false);
   const [orgError, setOrgError] = useState<string | null>(null);
+  const [showRawCompanyJson, setShowRawCompanyJson] = useState(false);
+  const [companyEditor, setCompanyEditor] = useState<CompanyDataEditorState>(
+    () => emptyCompanyDataEditorState()
+  );
+  const [companyDocUploading, setCompanyDocUploading] = useState(false);
+  const [companyDocFile, setCompanyDocFile] = useState<File | null>(null);
+  const [companyDocSourceUrl, setCompanyDocSourceUrl] = useState("");
+  const [companyDocName, setCompanyDocName] = useState("");
+  const [orgEditorDirty, setOrgEditorDirty] = useState(false);
 
   const [workflowLane, setWorkflowLane] = useState<WorkflowLane>("QUEUED");
   const [workflowItems, setWorkflowItems] = useState<WorkflowHubItem[]>([]);
@@ -137,6 +353,17 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
     amnesiaWiped: boolean;
     proof?: string;
   } | null>(null);
+  const orgEditorDirtyRef = useRef(false);
+  const orgEditorHydratedRef = useRef(false);
+
+  const updateCompanyEditor = useCallback(
+    (updater: (current: CompanyDataEditorState) => CompanyDataEditorState) => {
+      setCompanyEditor((current) => updater(current));
+      setOrgEditorDirty(true);
+      orgEditorDirtyRef.current = true;
+    },
+    []
+  );
 
   const loadOrganizational = useCallback(
     async (silent?: boolean) => {
@@ -145,22 +372,53 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
         const response = await fetch(`/api/hub/organization?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           input?: OrganizationalInput;
+          documents?: OrganizationalDocument[];
           output?: OrganizationalOutput[];
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.input) {
-          setOrgError(payload.message ?? "Failed to load Organizational Hub.");
+        if (!response.ok || !payload?.ok || !payload?.input) {
+          setOrgError(
+            payload?.message ??
+              (rawText
+                ? `Failed to load Organizational Hub (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to load Organizational Hub.")
+          );
           return;
         }
 
+        const input = payload?.input;
+        if (!input) {
+          setOrgError("Failed to load Organizational Hub.");
+          return;
+        }
         setOrgError(null);
-        setOrgInput(payload.input);
-        setOrgDraft(payload.input.content);
-        setOrgOutput(payload.output ?? []);
+        setOrgInput(input);
+        setOrgOutput(payload?.output ?? []);
+        const parsedEditor = parseCompanyDataEditor(input.content);
+        const mergedDocuments = mergeCompanyDocuments(
+          parsedEditor.documents,
+          payload?.documents ?? []
+        );
+
+        if (!orgEditorDirtyRef.current || !orgEditorHydratedRef.current) {
+          setOrgDraft(input.content);
+          setCompanyEditor({
+            ...parsedEditor,
+            documents: mergedDocuments
+          });
+          setOrgEditorDirty(false);
+          orgEditorDirtyRef.current = false;
+          orgEditorHydratedRef.current = true;
+        } else {
+          setCompanyEditor((current) => ({
+            ...current,
+            documents: mergeCompanyDocuments(current.documents, mergedDocuments)
+          }));
+        }
       } catch (error) {
         setOrgError(error instanceof Error ? error.message : "Failed to load Organizational Hub.");
       } finally {
@@ -177,21 +435,26 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
         const response = await fetch(`/api/hub/workflow?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           lanes?: Record<WorkflowLane, number>;
           items?: WorkflowHubItem[];
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.items || !payload.lanes) {
-          setWorkflowError(payload.message ?? "Failed to load Workflow Hub.");
+        if (!response.ok || !payload?.ok || !payload?.items || !payload?.lanes) {
+          setWorkflowError(
+            payload?.message ??
+              (rawText
+                ? `Failed to load Workflow Hub (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to load Workflow Hub.")
+          );
           return;
         }
 
         setWorkflowError(null);
-        setWorkflowItems(payload.items);
-        setWorkflowCounts(payload.lanes);
+        setWorkflowItems(payload?.items ?? []);
+        setWorkflowCounts(payload?.lanes ?? { QUEUED: 0, INPUT: 0, INPROCESS: 0, OUTPUT: 0 });
       } catch (error) {
         setWorkflowError(error instanceof Error ? error.message : "Failed to load Workflow Hub.");
       } finally {
@@ -208,19 +471,24 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
         const response = await fetch(`/api/hub/files?orgId=${encodeURIComponent(orgId)}&tab=DNA`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           files?: DnaFileItem[];
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.files) {
-          setDnaError(payload.message ?? "Failed to load DNA files.");
+        if (!response.ok || !payload?.ok || !payload?.files) {
+          setDnaError(
+            payload?.message ??
+              (rawText
+                ? `Failed to load DNA files (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to load DNA files.")
+          );
           return;
         }
 
         setDnaError(null);
-        setDnaFiles(payload.files);
+        setDnaFiles(payload?.files ?? []);
       } catch (error) {
         setDnaError(error instanceof Error ? error.message : "Failed to load DNA files.");
       } finally {
@@ -249,6 +517,20 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
   }, [initialScope]);
 
   useEffect(() => {
+    setOrgEditorDirty(false);
+    orgEditorDirtyRef.current = false;
+    orgEditorHydratedRef.current = false;
+    setShowRawCompanyJson(false);
+    setOrgInput(null);
+    setOrgOutput([]);
+    setOrgDraft("");
+    setCompanyEditor(emptyCompanyDataEditorState());
+    setCompanyDocFile(null);
+    setCompanyDocSourceUrl("");
+    setCompanyDocName("");
+  }, [orgId]);
+
+  useEffect(() => {
     if (scope === "ORGANIZATIONAL") {
       void loadOrganizational();
       const timer = setInterval(() => void loadOrganizational(true), 8000);
@@ -270,31 +552,192 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
     return undefined;
   }, [loadDna, loadOrganizational, loadWorkflowHub, scope]);
 
-  const saveCompanyData = useCallback(async () => {
-    setOrgSaving(true);
-    try {
-      const response = await fetch("/api/hub/organization", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orgId, content: orgDraft })
-      });
-      const payload = (await response.json()) as { ok?: boolean; message?: string };
-
-      if (!response.ok || !payload.ok) {
+  const saveCompanyData = useCallback(
+    async (contentOverride?: string, options?: { silentSuccess?: boolean }) => {
+      const content = contentOverride ?? orgDraft;
+      if (!content.trim()) {
         notify({
           title: "Company Data",
-          message: payload.message ?? "Failed to save Company Data.",
-          type: "error"
+          message: "Company data content is empty.",
+          type: "warning"
         });
         return;
       }
 
-      notify({ title: "Company Data", message: "Company Data updated.", type: "success" });
-      await loadOrganizational(true);
-    } finally {
-      setOrgSaving(false);
+      setOrgSaving(true);
+      try {
+        const response = await fetch("/api/hub/organization", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orgId, content })
+        });
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+
+        if (!response.ok || !payload?.ok) {
+          notify({
+            title: "Company Data",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Failed to save Company Data (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to save Company Data."),
+            type: "error"
+          });
+          return;
+        }
+
+        if (!options?.silentSuccess) {
+          notify({ title: "Company Data", message: "Company Data updated.", type: "success" });
+        }
+        setOrgDraft(content);
+        setOrgEditorDirty(false);
+        orgEditorDirtyRef.current = false;
+        orgEditorHydratedRef.current = true;
+        await loadOrganizational(true);
+      } finally {
+        setOrgSaving(false);
+      }
+    },
+    [loadOrganizational, notify, orgDraft, orgId]
+  );
+
+  const handleSaveCompanyEditor = useCallback(async () => {
+    const nextContent = buildCompanyDataJsonText(companyEditor, orgId, orgDraft);
+    setOrgDraft(nextContent);
+    await saveCompanyData(nextContent);
+  }, [companyEditor, orgDraft, orgId, saveCompanyData]);
+
+  const handleSaveCompanyData = useCallback(async () => {
+    if (showRawCompanyJson) {
+      await saveCompanyData(orgDraft);
+      const parsedEditor = parseCompanyDataEditor(orgDraft);
+      setCompanyEditor((current) => ({
+        ...parsedEditor,
+        documents: mergeCompanyDocuments(parsedEditor.documents, current.documents)
+      }));
+      return;
     }
-  }, [loadOrganizational, notify, orgDraft, orgId]);
+    await handleSaveCompanyEditor();
+  }, [handleSaveCompanyEditor, orgDraft, saveCompanyData, showRawCompanyJson]);
+
+  const handleCompanyDocumentUpload = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!companyDocFile && !companyDocSourceUrl.trim()) {
+        notify({
+          title: "Company Document",
+          message: "Choose a file or source URL first.",
+          type: "warning"
+        });
+        return;
+      }
+
+      setCompanyDocUploading(true);
+      try {
+        const formData = new FormData();
+        formData.set("orgId", orgId);
+        formData.set("type", "INPUT");
+        if (companyDocName.trim()) {
+          formData.set("name", companyDocName.trim());
+        }
+        if (companyDocFile) {
+          formData.set("file", companyDocFile);
+          if (!companyDocName.trim()) {
+            formData.set("name", companyDocFile.name);
+          }
+        }
+        if (companyDocSourceUrl.trim()) {
+          formData.set("sourceUrl", companyDocSourceUrl.trim());
+          if (!companyDocName.trim()) {
+            formData.set("name", "company-reference");
+          }
+        }
+
+        const response = await fetch("/api/hub/files", {
+          method: "POST",
+          body: formData
+        });
+        const { payload, rawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          file?: {
+            id?: string;
+            name?: string;
+            size?: string;
+            url?: string;
+            updatedAt?: string;
+            metadata?: Record<string, unknown> | null;
+          };
+        }>(response);
+
+        if (!response.ok || !payload?.ok || !payload?.file?.url || !payload?.file?.name) {
+          notify({
+            title: "Company Document",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Failed to upload company document (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to upload company document."),
+            type: "error"
+          });
+          return;
+        }
+
+        const uploadedDoc: OrganizationalDocument = {
+          id: payload.file.id ?? "",
+          name: payload.file.name,
+          size: payload.file.size ?? "0",
+          url: payload.file.url,
+          updatedAt: payload.file.updatedAt ?? new Date().toISOString(),
+          contentType:
+            payload.file.metadata && typeof payload.file.metadata.contentType === "string"
+              ? payload.file.metadata.contentType
+              : null
+        };
+
+        const nextEditor = {
+          ...companyEditor,
+          documents: mergeCompanyDocuments(companyEditor.documents, [uploadedDoc])
+        };
+        setCompanyEditor(nextEditor);
+
+        const nextContent = buildCompanyDataJsonText(nextEditor, orgId, orgDraft);
+        setOrgDraft(nextContent);
+        await saveCompanyData(nextContent, { silentSuccess: true });
+
+        notify({
+          title: "Company Document",
+          message: "Document uploaded and linked to company data.",
+          type: "success"
+        });
+        setCompanyDocName("");
+        setCompanyDocFile(null);
+        setCompanyDocSourceUrl("");
+      } finally {
+        setCompanyDocUploading(false);
+      }
+    },
+    [
+      companyDocFile,
+      companyDocName,
+      companyDocSourceUrl,
+      companyEditor,
+      notify,
+      orgDraft,
+      orgId,
+      saveCompanyData
+    ]
+  );
+
+  const handleRemoveCompanyDocument = useCallback(
+    (url: string) => {
+      updateCompanyEditor((current) => ({
+        ...current,
+        documents: current.documents.filter((doc) => doc.url !== url)
+      }));
+    },
+    [updateCompanyEditor]
+  );
 
   const handleDnaUpload = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -310,12 +753,20 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
         if (dnaSourceUrl.trim()) formData.set("sourceUrl", dnaSourceUrl.trim());
 
         const response = await fetch("/api/hub/files", { method: "POST", body: formData });
-        const payload = (await response.json()) as { ok?: boolean; message?: string; warning?: string };
+        const { payload, rawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          warning?: string;
+        }>(response);
 
-        if (!response.ok || !payload.ok) {
+        if (!response.ok || !payload?.ok) {
           notify({
             title: "DNA Upload Failed",
-            message: payload.message ?? "Unable to upload DNA file.",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Unable to upload DNA file (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to upload DNA file."),
             type: "error"
           });
           return;
@@ -323,8 +774,8 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
 
         notify({
           title: "DNA Upload",
-          message: payload.warning ?? "DNA file uploaded.",
-          type: payload.warning ? "warning" : "success"
+          message: payload?.warning ?? "DNA file uploaded.",
+          type: payload?.warning ? "warning" : "success"
         });
         setDnaName("");
         setDnaSourceUrl("");
@@ -346,18 +797,22 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
           `/api/hub/files/${file.id}/read?orgId=${encodeURIComponent(orgId)}`,
           { cache: "no-store" }
         );
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           contentPreview?: string | null;
           amnesiaWiped?: boolean;
           proof?: string;
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok) {
+        if (!response.ok || !payload?.ok) {
           notify({
             title: "DNA Read Failed",
-            message: payload.message ?? "Unable to read DNA file.",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Unable to read DNA file (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to read DNA file."),
             type: "error"
           });
           return;
@@ -365,9 +820,9 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
 
         setDnaPreview({
           fileName: file.name,
-          contentPreview: payload.contentPreview ?? null,
-          amnesiaWiped: Boolean(payload.amnesiaWiped),
-          proof: payload.proof
+          contentPreview: payload?.contentPreview ?? null,
+          amnesiaWiped: Boolean(payload?.amnesiaWiped),
+          proof: payload?.proof
         });
       } finally {
         setReadingFileId(null);
@@ -385,12 +840,20 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ orgId })
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string; warning?: string };
+        const { payload, rawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          warning?: string;
+        }>(response);
 
-        if (!response.ok || !payload.ok) {
+        if (!response.ok || !payload?.ok) {
           notify({
             title: "DNA Ingest Failed",
-            message: payload.message ?? "Unable to queue DNA ingest.",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Unable to queue DNA ingest (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to queue DNA ingest."),
             type: "error"
           });
           return;
@@ -398,8 +861,8 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
 
         notify({
           title: "DNA Ingest",
-          message: payload.warning ?? payload.message ?? "DNA ingest queued.",
-          type: payload.warning ? "warning" : "success"
+          message: payload?.warning ?? payload?.message ?? "DNA ingest queued.",
+          type: payload?.warning ? "warning" : "success"
         });
         await loadDna(true);
       } finally {
@@ -487,18 +950,270 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
               </div>
             ) : (
               <>
-                <textarea
-                  value={orgDraft}
-                  onChange={(event) => setOrgDraft(event.target.value)}
-                  className="min-h-[380px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 font-mono text-xs text-slate-200 outline-none"
-                />
-                <div className="flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
-                    {orgInput ? `Updated: ${new Date(orgInput.updatedAt).toLocaleString()}` : "No file loaded"}
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Organization Name</span>
+                    <input
+                      value={companyEditor.name}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, name: event.target.value }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Execution Mode</span>
+                    <select
+                      value={companyEditor.executionMode}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({
+                          ...current,
+                          executionMode: event.target.value as ExecutionModeValue
+                        }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    >
+                      <option value="ECO">ECO</option>
+                      <option value="BALANCED">BALANCED</option>
+                      <option value="TURBO">TURBO</option>
+                    </select>
+                  </label>
+                </div>
+
+                <label className="space-y-1">
+                  <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Company Description</span>
+                  <textarea
+                    value={companyEditor.description}
+                    onChange={(event) =>
+                      updateCompanyEditor((current) => ({
+                        ...current,
+                        description: event.target.value
+                      }))
+                    }
+                    className="min-h-[120px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                  />
+                </label>
+
+                <label className="space-y-1">
+                  <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Products and Services</span>
+                  <textarea
+                    value={companyEditor.productsAndServices}
+                    onChange={(event) =>
+                      updateCompanyEditor((current) => ({
+                        ...current,
+                        productsAndServices: event.target.value
+                      }))
+                    }
+                    className="min-h-[90px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                  />
+                </label>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Business Goals (one per line)</span>
+                    <textarea
+                      value={companyEditor.goalsText}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, goalsText: event.target.value }))
+                      }
+                      className="min-h-[110px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Current Priorities (one per line)</span>
+                    <textarea
+                      value={companyEditor.prioritiesText}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, prioritiesText: event.target.value }))
+                      }
+                      className="min-h-[110px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Operating Rules (one per line)</span>
+                    <textarea
+                      value={companyEditor.operatingRulesText}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, operatingRulesText: event.target.value }))
+                      }
+                      className="min-h-[110px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Tools and Systems (one per line)</span>
+                    <textarea
+                      value={companyEditor.toolsAndSystemsText}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, toolsAndSystemsText: event.target.value }))
+                      }
+                      className="min-h-[110px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Founder Name</span>
+                    <input
+                      value={companyEditor.founderName}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, founderName: event.target.value }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Founder Email</span>
+                    <input
+                      value={companyEditor.founderEmail}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, founderEmail: event.target.value }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Monthly Budget (USD)</span>
+                    <input
+                      value={companyEditor.monthlyBudgetUsd}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, monthlyBudgetUsd: event.target.value }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Monthly BTU Cap</span>
+                    <input
+                      value={companyEditor.monthlyBtuCap}
+                      onChange={(event) =>
+                        updateCompanyEditor((current) => ({ ...current, monthlyBtuCap: event.target.value }))
+                      }
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                </div>
+
+                <label className="space-y-1">
+                  <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Additional Notes</span>
+                  <textarea
+                    value={companyEditor.notes}
+                    onChange={(event) =>
+                      updateCompanyEditor((current) => ({ ...current, notes: event.target.value }))
+                    }
+                    className="min-h-[90px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 text-sm text-slate-200 outline-none"
+                  />
+                </label>
+
+                <form onSubmit={handleCompanyDocumentUpload} className="space-y-2 rounded-2xl border border-white/10 bg-black/20 p-3">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">
+                    Company Documents (linked to company data)
                   </p>
+                  <input
+                    value={companyDocName}
+                    onChange={(event) => setCompanyDocName(event.target.value)}
+                    placeholder="Document name (optional)"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
+                  <input
+                    type="file"
+                    onChange={(event) => setCompanyDocFile(event.target.files?.[0] ?? null)}
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none file:mr-3 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1 file:text-xs"
+                  />
+                  <input
+                    value={companyDocSourceUrl}
+                    onChange={(event) => setCompanyDocSourceUrl(event.target.value)}
+                    placeholder="Or source URL"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                  />
                   <button
-                    onClick={() => void saveCompanyData()}
-                    disabled={orgSaving || orgDraft.trim().length === 0}
+                    type="submit"
+                    disabled={companyDocUploading}
+                    className="inline-flex items-center gap-2 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-300 disabled:opacity-60"
+                  >
+                    {companyDocUploading ? <Loader2 size={12} className="animate-spin" /> : <UploadCloud size={12} />}
+                    Upload Document
+                  </button>
+                  {companyEditor.documents.length > 0 ? (
+                    <div className="space-y-2 pt-1">
+                      {companyEditor.documents.map((doc) => (
+                        <div key={doc.url} className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2">
+                          <div className="min-w-0">
+                            <p className="truncate text-xs text-slate-200">{doc.name}</p>
+                            <p className="truncate text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                              {formatFileSize(doc.size)} | {new Date(doc.updatedAt).toLocaleDateString()}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <a
+                              href={doc.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="rounded-full border border-white/20 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-slate-200"
+                            >
+                              Open
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveCompanyDocument(doc.url)}
+                              className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-500">No company documents linked yet.</p>
+                  )}
+                </form>
+
+                <button
+                  type="button"
+                  onClick={() => setShowRawCompanyJson((current) => !current)}
+                  className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300"
+                >
+                  {showRawCompanyJson ? "Hide Raw JSON" : "Show Raw JSON"}
+                </button>
+
+                {showRawCompanyJson ? (
+                  <textarea
+                    value={orgDraft}
+                    onChange={(event) => {
+                      setOrgDraft(event.target.value);
+                      setOrgEditorDirty(true);
+                      orgEditorDirtyRef.current = true;
+                    }}
+                    className="min-h-[220px] w-full resize-y rounded-2xl border border-white/10 bg-black/40 p-3 font-mono text-xs text-slate-200 outline-none"
+                  />
+                ) : null}
+
+                <div className="flex items-center justify-between">
+                  <div className="space-y-1">
+                    <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
+                      {orgInput ? `Updated: ${new Date(orgInput.updatedAt).toLocaleString()}` : "No file loaded"}
+                    </p>
+                    {orgEditorDirty ? (
+                      <p className="text-[10px] uppercase tracking-[0.16em] text-amber-300">
+                        Unsaved local changes
+                      </p>
+                    ) : null}
+                  </div>
+                  <button
+                    onClick={() => void handleSaveCompanyData()}
+                    disabled={
+                      orgSaving ||
+                      (showRawCompanyJson
+                        ? orgDraft.trim().length === 0
+                        : companyEditor.description.trim().length === 0)
+                    }
                     className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-emerald-300 disabled:opacity-60"
                   >
                     {orgSaving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}

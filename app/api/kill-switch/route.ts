@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { FlowStatus, LogType, TaskStatus } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 

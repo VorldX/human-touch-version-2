@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { randomUUID } from "node:crypto";
 
 import { LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
@@ -491,6 +493,10 @@ export async function POST(request: NextRequest) {
       ? `Available Personnel (role map): ${personnelSummary}`
       : "Available Personnel: unknown",
     "",
+    companyContext
+      ? ["Company Data Context (authoritative):", companyContext.slice(0, 7000)].join("\n")
+      : "Company Data Context: unavailable.",
+    "",
     "Return STRICT JSON with this schema:",
     "{",
     '  "analysis": "short reasoning summary",',
@@ -581,6 +587,9 @@ export async function POST(request: NextRequest) {
       `You are the Main Agent planner for organization ${org.name}.`,
       "Produce complete, auditable implementation plans with realistic dependency and approval mapping.",
       "Do not fabricate capabilities, tool availability, approvals, or execution outcomes.",
+      companyContext
+        ? "Company Data Context is provided in the user prompt; do not claim company data is inaccessible."
+        : "If Company Data Context is unavailable, mark assumptions explicitly.",
       "When required information is missing, mark explicit assumptions and risk notes."
     ].join("\n"),
     userPromptOverride: modelPrompt

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
@@ -20,6 +22,7 @@ interface DirectionIntentRouting {
   reason: string;
   toolkitHints: string[];
   squadRoleHints: string[];
+  cadenceHint?: "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
 }
 
 function cleanText(value: unknown) {
@@ -72,6 +75,7 @@ function inferToolkitHints(text: string) {
     slack: ["slack", "channel", "workspace", "direct message", "dm"],
     notion: ["notion", "wiki", "knowledge base", "docs", "documentation"],
     github: ["github", "repository", "repo", "pull request", "commit", "issue"],
+    googlemeet: ["googlemeet", "google meet", "gmeet", "meet.google.com"],
     googlecalendar: ["googlecalendar", "google calendar", "calendar", "schedule", "availability"],
     googledrive: ["googledrive", "google drive", "drive"],
     googledocs: ["googledocs", "google docs", "document"],
@@ -155,6 +159,44 @@ function inferSquadRoleHints(message: string) {
   return ["Manager Agent", "Execution Worker Agent"];
 }
 
+function inferRecurringCadence(ownerMessage: string) {
+  const lower = ownerMessage.toLowerCase();
+  const hasRecurringSignal =
+    /\b(recurring|repeat|repeating|recur|cadence|cron)\b/.test(lower) ||
+    /\b(daily|weekly|monthly|quarterly|yearly|annually)\b/.test(lower) ||
+    /\b(every|each)\s+(day|week|month|quarter|year|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(
+      lower
+    );
+
+  if (!hasRecurringSignal) {
+    return null;
+  }
+
+  const hasActionIntent =
+    /\b(schedule|create|send|email|mail|meeting|report|run|execute|trigger|sync|notify|remind|generate|post|update|check|monitor)\b/.test(
+      lower
+    );
+  if (!hasActionIntent) {
+    return null;
+  }
+
+  if (
+    /\b(daily|every day|each day|weekday|weekend|every monday|every tuesday|every wednesday|every thursday|every friday|every saturday|every sunday)\b/.test(
+      lower
+    )
+  ) {
+    return "DAILY" as const;
+  }
+  if (/\b(weekly|every week|each week)\b/.test(lower)) {
+    return "WEEKLY" as const;
+  }
+  if (/\b(monthly|every month|each month)\b/.test(lower)) {
+    return "MONTHLY" as const;
+  }
+
+  return "CUSTOM" as const;
+}
+
 function inferIntentRouting(input: {
   ownerMessage: string;
   modelReply: string;
@@ -162,6 +204,7 @@ function inferIntentRouting(input: {
 }): DirectionIntentRouting {
   const ownerLower = input.ownerMessage.toLowerCase();
   const ownerTrimmed = ownerLower.trim();
+  const recurringCadence = inferRecurringCadence(input.ownerMessage);
 
   const explicitActionIntent = /\b(create|build|launch|implement|execute|automate|orchestrate|run|set up|setup|deploy|delegate)\b/.test(
     ownerLower
@@ -178,6 +221,17 @@ function inferIntentRouting(input: {
     directQuestionIntent &&
     !explicitExecutionIntent &&
     !/\b(do this|perform this|execute this|run this|launch this|set this up)\b/.test(ownerLower);
+
+  if (recurringCadence) {
+    return {
+      route: "PLAN_REQUIRED",
+      reason:
+        "Recurring execution intent detected. Route through Direction planning and approvals before workflow launch.",
+      toolkitHints: inferToolkitHints(input.ownerMessage),
+      squadRoleHints: inferSquadRoleHints(input.ownerMessage),
+      cadenceHint: recurringCadence
+    };
+  }
 
   // Model output can contain planning terms by default, so owner message intent is primary.
   if (chatOnlyIntent) {
@@ -327,13 +381,25 @@ export async function POST(request: NextRequest) {
       companyContext = "";
     }
 
+    const preIntentRouting = inferIntentRouting({
+      ownerMessage: message,
+      modelReply: "",
+      directionCandidate: ""
+    });
+
     const userPrompt = [
       "Owner-to-organization conversation transcript:",
       ...history.map((entry) => `${entry.role === "owner" ? "Owner" : "Organization"}: ${entry.content}`),
       `Owner: ${message}`,
       "",
+      companyContext
+        ? ["Company Data Context (authoritative):", companyContext.slice(0, 6000)].join("\n")
+        : "Company Data Context: unavailable.",
+      "",
       "Respond as the Main Agent representing the organization.",
-      "Give a concise answer and end with a concrete section titled 'Direction:' that can be executed by agents."
+      preIntentRouting.route === "PLAN_REQUIRED"
+        ? "Give a concise answer and end with a concrete section titled 'Direction:' that can be executed by agents."
+        : "Give a concise direct chat answer. Do not append a synthetic 'Direction:' section unless the user explicitly asks for planning/execution."
     ].join("\n");
 
     const organizationRuntime = await getOrgLlmRuntime(orgId);
@@ -382,8 +448,13 @@ export async function POST(request: NextRequest) {
         "Speak clearly, avoid hype, and produce execution-ready guidance.",
         "Do not fabricate facts, metrics, IDs, links, or completion claims.",
         "Ground responses only in conversation + provided company context.",
+        companyContext
+          ? "Company Data Context is provided in the user prompt; do not claim you cannot access company data."
+          : "If Company Data Context is unavailable, ask for missing details instead of guessing.",
         "If information is missing, explicitly say what is unknown and ask for clarification.",
-        "Always end with a 'Direction:' section."
+        preIntentRouting.route === "PLAN_REQUIRED"
+          ? "End with a 'Direction:' section."
+          : "Keep this as a normal conversational response unless planning/execution intent is explicit."
       ].join("\n"),
       userPromptOverride: userPrompt
     });

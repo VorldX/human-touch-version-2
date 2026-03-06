@@ -341,3 +341,12 @@ test("inferRequestedToolkits detects compact/spaced toolkit names and intent ali
     ["googlecalendar", "hubspot", "quickbooks", "salesforce", "zoom"].sort()
   );
 });
+
+test("inferRequestedToolkits maps Google Meet signals without duplicate meet toolkits", () => {
+  const inferred = inferRequestedToolkits(
+    "Set up a Google Meet link and send the meeting details.",
+    ["gmeet", "googlemeet", "gmail"]
+  );
+
+  assert.deepEqual([...inferred].sort(), ["googlemeet"].sort());
+});

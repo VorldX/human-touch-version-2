@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw, Search, Trash2, UploadCloud } from "lucide-react";
 
 import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type OwnerType = "ORG" | "OWNER" | "EMPLOYEE" | "AGENT";
@@ -161,22 +162,32 @@ export function StorageHub({ orgId, themeStyle }: StorageHubProps) {
             cache: "no-store"
           })
         ]);
-        const assetPayload = (await assetResponse.json()) as {
+        const { payload: assetPayload, rawText: assetRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           assets?: StorageAsset[];
-        };
-        const personnelPayload = (await personnelResponse.json()) as {
+        }>(assetResponse);
+        const { payload: personnelPayload, rawText: personnelRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           personnel?: PersonnelItem[];
-        };
+        }>(personnelResponse);
 
-        if (!assetResponse.ok || !assetPayload.ok || !assetPayload.assets) {
-          throw new Error(assetPayload.message ?? "Failed to load storage assets.");
+        if (!assetResponse.ok || !assetPayload?.ok || !assetPayload.assets) {
+          throw new Error(
+            assetPayload?.message ??
+              (assetRawText
+                ? `Failed to load storage assets (${assetResponse.status}): ${assetRawText.slice(0, 180)}`
+                : "Failed to load storage assets.")
+          );
         }
-        if (!personnelResponse.ok || !personnelPayload.ok || !personnelPayload.personnel) {
-          throw new Error(personnelPayload.message ?? "Failed to load personnel roster.");
+        if (!personnelResponse.ok || !personnelPayload?.ok || !personnelPayload.personnel) {
+          throw new Error(
+            personnelPayload?.message ??
+              (personnelRawText
+                ? `Failed to load personnel roster (${personnelResponse.status}): ${personnelRawText.slice(0, 180)}`
+                : "Failed to load personnel roster.")
+          );
         }
         setAssets(assetPayload.assets);
         setPersonnel(personnelPayload.personnel);
@@ -219,9 +230,16 @@ export function StorageHub({ orgId, themeStyle }: StorageHubProps) {
           method: "POST",
           body: formData
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed to create storage asset.");
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed to create storage asset (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to create storage asset.")
+          );
         }
 
         notify({
@@ -262,9 +280,16 @@ export function StorageHub({ orgId, themeStyle }: StorageHubProps) {
           `/api/storage/assets/${assetId}?orgId=${encodeURIComponent(orgId)}`,
           { method: "DELETE" }
         );
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed deleting storage asset.");
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed deleting storage asset (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed deleting storage asset.")
+          );
         }
         await loadAssets(true);
       } catch (error) {
@@ -521,4 +546,3 @@ export function StorageHub({ orgId, themeStyle }: StorageHubProps) {
     </div>
   );
 }
-

@@ -8,6 +8,7 @@ const require = createRequire(import.meta.url);
 
 const lockPath = resolve(process.cwd(), ".next-dev.lock");
 const cleanScriptPath = resolve(process.cwd(), "scripts/clean-next.mjs");
+const prismaGenerateScriptPath = resolve(process.cwd(), "scripts/prisma-generate-safe.mjs");
 const nextBin = require.resolve("next/dist/bin/next");
 const isOneDriveWorkspace = /(^|[\\/])onedrive([\\/]|$)/i.test(process.cwd());
 
@@ -92,6 +93,14 @@ const cleanResult = spawnSync(process.execPath, [cleanScriptPath], {
 });
 if (typeof cleanResult.status === "number" && cleanResult.status !== 0) {
   process.exit(cleanResult.status);
+}
+
+const prismaGenerateResult = spawnSync(process.execPath, [prismaGenerateScriptPath], {
+  stdio: "inherit",
+  env: devEnv
+});
+if (typeof prismaGenerateResult.status === "number" && prismaGenerateResult.status !== 0) {
+  process.exit(prismaGenerateResult.status);
 }
 
 const child = spawn(process.execPath, [nextBin, "dev", ...process.argv.slice(2)], {

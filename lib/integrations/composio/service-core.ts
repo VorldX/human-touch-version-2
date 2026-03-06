@@ -211,6 +211,14 @@ function normalizeToolkit(value: string) {
   return value.trim().toLowerCase();
 }
 
+function canonicalToolkitForCompare(toolkit: string) {
+  const normalized = normalizeToolkit(toolkit);
+  if (normalized === "googlemeet" || normalized === "gmeet") {
+    return "gmeet";
+  }
+  return normalized;
+}
+
 function normalizeStatus(value: unknown) {
   const status = asString(value).toUpperCase();
   if (!status) return "UNKNOWN";
@@ -691,9 +699,13 @@ export class ComposioServiceCore {
       orgId: input.orgId
     });
     const activeToolkits = new Set(
-      connections.filter((item) => normalizeStatus(item.status) === "ACTIVE").map((item) => item.toolkit)
+      connections
+        .filter((item) => normalizeStatus(item.status) === "ACTIVE")
+        .map((item) => canonicalToolkitForCompare(item.toolkit))
     );
-    const missing = requested.filter((toolkit) => !activeToolkits.has(toolkit));
+    const missing = requested.filter(
+      (toolkit) => !activeToolkits.has(canonicalToolkitForCompare(toolkit))
+    );
 
     if (missing.length > 0) {
       return {
@@ -811,6 +823,11 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
   const compactPrompt = normalizedPrompt.replace(/[^a-z0-9]/g, "");
   const allowlist = allowlistedToolkits.map(normalizeToolkit);
   const requested = new Set<string>();
+  const preferredGoogleMeetToolkit = allowlist.includes("googlemeet")
+    ? "googlemeet"
+    : allowlist.includes("gmeet")
+      ? "gmeet"
+      : null;
 
   for (const toolkit of allowlist) {
     const compactToolkit = toolkit.replace(/[^a-z0-9]/g, "");
@@ -832,6 +849,13 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
     /\b(zoom|video call|video meeting|webinar|meeting link)\b/i.test(normalizedPrompt)
   ) {
     requested.add("zoom");
+  }
+
+  if (
+    preferredGoogleMeetToolkit &&
+    /\b(gmeet|google meet|googlemeet|meet\.google\.com)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add(preferredGoogleMeetToolkit);
   }
 
   if (
@@ -863,6 +887,14 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
       .filter((item) => allowlist.includes(item));
     for (const item of parsed) {
       requested.add(item);
+    }
+  }
+
+  if (requested.has("googlemeet") && requested.has("gmeet")) {
+    if (preferredGoogleMeetToolkit === "googlemeet") {
+      requested.delete("gmeet");
+    } else {
+      requested.delete("googlemeet");
     }
   }
 

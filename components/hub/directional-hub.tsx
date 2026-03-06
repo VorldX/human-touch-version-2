@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 interface DirectionRecord {
@@ -45,17 +46,23 @@ export function DirectionalHub({ orgId, themeStyle }: DirectionalHubProps) {
         const response = await fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           directions?: DirectionRecord[];
-        };
-        if (!response.ok || !payload.ok || !payload.directions) {
-          throw new Error(payload.message ?? "Failed loading directions.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload?.directions) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading directions (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading directions.")
+          );
         }
-        setDirections(payload.directions);
-        if (!selectedId && payload.directions[0]) {
-          setSelectedId(payload.directions[0].id);
+        const loadedDirections = payload.directions;
+        setDirections(loadedDirections);
+        if (!selectedId && loadedDirections[0]) {
+          setSelectedId(loadedDirections[0].id);
         }
       } catch (error) {
         notify({
@@ -77,13 +84,18 @@ export function DirectionalHub({ orgId, themeStyle }: DirectionalHubProps) {
         `/api/directions/${directionId}/workflows?orgId=${encodeURIComponent(orgId)}`,
         { cache: "no-store" }
       );
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonResponse<{
         ok?: boolean;
         message?: string;
         workflows?: DirectionWorkflow[];
-      };
-      if (!response.ok || !payload.ok || !payload.workflows) {
-        throw new Error(payload.message ?? "Failed loading direction workflows.");
+      }>(response);
+      if (!response.ok || !payload?.ok || !payload?.workflows) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed loading direction workflows (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed loading direction workflows.")
+        );
       }
       setWorkflows(payload.workflows);
     },

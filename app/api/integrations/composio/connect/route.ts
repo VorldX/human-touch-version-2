@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 
 import {
@@ -52,10 +54,12 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    const callbackUrlOverride = `${request.nextUrl.origin}/api/integrations/composio/oauth/callback`;
     const result = await createConnection({
       userId: actorResult.actor.userId,
       orgId: actorResult.actor.orgId,
       toolkit,
+      callbackUrlOverride,
       ...(body?.returnTo?.trim() ? { returnTo: body.returnTo.trim() } : {})
     });
 

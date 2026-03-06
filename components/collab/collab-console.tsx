@@ -3,6 +3,7 @@
 import { type ComponentType, useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowDownRight, ArrowUpRight, Coins, Loader2, RefreshCw, Workflow } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 interface MarketAsset {
@@ -63,16 +64,21 @@ export function CollaborationConsole({ orgId, themeStyle }: CollaborationConsole
         const response = await fetch(`/api/collab/marketplace?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           listedAssets?: MarketAsset[];
           rentedAssets?: MarketAsset[];
           metrics?: MarketMetrics;
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.metrics) {
-          setError(payload.message ?? "Failed to load marketplace.");
+        if (!response.ok || !payload?.ok || !payload.metrics) {
+          setError(
+            payload?.message ??
+              (rawText
+                ? `Failed to load marketplace (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed to load marketplace.")
+          );
           return;
         }
 

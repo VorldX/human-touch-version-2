@@ -11,6 +11,7 @@ import {
   X
 } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type PersonnelType = "HUMAN" | "AI";
@@ -203,22 +204,27 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
           )
         ]);
 
-        const payload = (await personnelResponse.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           personnel?: PersonnelItem[];
           linkedAccounts?: LinkedAccountItem[];
           capabilityGrants?: CapabilityGrantItem[];
           capabilityVaultEnabled?: boolean;
-        };
-        const joinRequestsPayload = (await joinRequestsResponse.json()) as {
+        }>(personnelResponse);
+        const { payload: joinRequestsPayload, rawText: joinRequestsRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           requests?: JoinRequestItem[];
-        };
+        }>(joinRequestsResponse);
 
-        if (!personnelResponse.ok || !payload.ok) {
-          setError(payload.message ?? "Failed to load squad.");
+        if (!personnelResponse.ok || !payload?.ok) {
+          setError(
+            payload?.message ??
+              (rawText
+                ? `Failed to load squad (${personnelResponse.status}): ${rawText.slice(0, 180)}`
+                : "Failed to load squad.")
+          );
           return;
         }
 
@@ -232,11 +238,14 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
           setCanReviewJoinRequests(false);
           setJoinRequests([]);
           setJoinRequestsError(null);
-        } else if (!joinRequestsResponse.ok || !joinRequestsPayload.ok) {
+        } else if (!joinRequestsResponse.ok || !joinRequestsPayload?.ok) {
           setCanReviewJoinRequests(false);
           setJoinRequests([]);
           setJoinRequestsError(
-            joinRequestsPayload.message ?? "Failed to load join requests."
+            joinRequestsPayload?.message ??
+              (joinRequestsRawText
+                ? `Failed to load join requests (${joinRequestsResponse.status}): ${joinRequestsRawText.slice(0, 180)}`
+                : "Failed to load join requests.")
           );
         } else {
           const items = joinRequestsPayload.requests ?? [];
@@ -395,16 +404,20 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
           body: JSON.stringify(payload)
         });
 
-        const result = (await response.json()) as {
+        const { payload: result, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           personnel?: { id: string; name: string; role: string };
-        };
+        }>(response);
 
-        if (!response.ok || !result.ok) {
+        if (!response.ok || !result?.ok) {
           notify({
             title: "Recruitment Failed",
-            message: result.message ?? "Unable to recruit personnel.",
+            message:
+              result?.message ??
+              (rawText
+                ? `Unable to recruit personnel (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to recruit personnel."),
             type: "error"
           });
           return;
@@ -451,13 +464,17 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
           })
         });
 
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
           notify({
             title: "Join Request",
             message:
-              payload.message ??
-              `Failed to ${decision === "APPROVE" ? "approve" : "reject"} request.`,
+              payload?.message ??
+              (rawText
+                ? `Failed to ${decision === "APPROVE" ? "approve" : "reject"} request (${response.status}): ${rawText.slice(0, 180)}`
+                : `Failed to ${decision === "APPROVE" ? "approve" : "reject"} request.`),
             type: "error"
           });
           return;

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { LogType, WebhookEventType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 
 import { deleteStorageConnector, getStorageConnector, updateStorageConnector, type ConnectorStatus } from "@/lib/storage/org-storage";

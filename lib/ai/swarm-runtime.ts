@@ -367,6 +367,30 @@ function buildUserPrompt(prompt: string, contextBlocks: AgentContextBlock[]) {
   return [`Mission Task:`, prompt, "", "Hub Context:", contextText].join("\n");
 }
 
+function buildTimeAwarenessContext(reference: Date) {
+  const utcIso = reference.toISOString();
+  const unixSeconds = Math.floor(reference.getTime() / 1000);
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const localDisplay = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(reference);
+
+  return [
+    "TIME AWARENESS:",
+    `Current UTC time: ${utcIso}`,
+    `Current server local time (${timezone}): ${localDisplay}`,
+    `Unix timestamp (seconds): ${unixSeconds}`,
+    "Resolve relative dates (today/tomorrow/yesterday/next week) against current UTC time above and respond with concrete dates when relevant."
+  ].join("\n");
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 45_000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -723,10 +747,12 @@ function resolveEmergencyFallbackSettings(
 
 export async function executeSwarmAgent(input: AgentExecutionInput): Promise<AgentExecutionResult> {
   const startedAt = Date.now();
-  const system =
+  const now = new Date();
+  const systemBase =
     typeof input.systemPromptOverride === "string" && input.systemPromptOverride.trim().length > 0
       ? input.systemPromptOverride.trim()
       : buildSystemPrompt(input.agent.name, input.agent.role);
+  const system = [systemBase, buildTimeAwarenessContext(now)].join("\n\n");
   const userPrompt =
     typeof input.userPromptOverride === "string" && input.userPromptOverride.trim().length > 0
       ? input.userPromptOverride.trim()
@@ -749,20 +775,95 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     .digest("hex");
 
   if (!primary.apiKey) {
-    return {
-      ok: false,
-      fallbackUsed: false,
-      error: "Primary brain key is missing or invalid for this agent.",
-      trace: {
-        taskId: input.taskId,
-        flowId: input.flowId,
-        agentId: input.agent.id,
-        provider: primary.provider,
-        model: primary.model,
-        apiSource: primary.apiSource,
-        contextDigest
-      }
-    };
+    let candidateFallback =
+      fallback ?? resolveEmergencyFallbackSettings(input, [primary.provider]);
+
+    // Respect pinned provider selection from UI/model preference.
+    if (pinnedProvider && candidateFallback && candidateFallback.provider !== pinnedProvider) {
+      candidateFallback = null;
+    }
+
+    if (!candidateFallback) {
+      return {
+        ok: false,
+        fallbackUsed: false,
+        error: "Primary brain key is missing or invalid for this agent.",
+        trace: {
+          taskId: input.taskId,
+          flowId: input.flowId,
+          agentId: input.agent.id,
+          provider: primary.provider,
+          model: primary.model,
+          apiSource: primary.apiSource,
+          contextDigest
+        }
+      };
+    }
+
+    try {
+      const providerResult = await invokeProvider(candidateFallback, system, userPrompt);
+      const outputText = providerResult.text;
+      const billing = computeBilling(
+        candidateFallback.provider,
+        candidateFallback.model,
+        providerResult.usage,
+        input.organizationRuntime
+      );
+
+      return {
+        ok: true,
+        outputText,
+        usedProvider: candidateFallback.provider,
+        usedModel: candidateFallback.model,
+        apiSource: candidateFallback.apiSource,
+        tokenUsage: providerResult.usage,
+        billing,
+        fallbackUsed: true,
+        trace: {
+          taskId: input.taskId,
+          flowId: input.flowId,
+          agentId: input.agent.id,
+          provider: candidateFallback.provider,
+          model: candidateFallback.model,
+          apiSource: candidateFallback.apiSource,
+          fallbackUsed: true,
+          fallbackSource: fallback ? "configured" : "emergency",
+          fallbackReason: "primary_api_key_missing",
+          contextCount: input.contextBlocks.length,
+          contextDigest,
+          tokenUsage: providerResult.usage,
+          billing,
+          outputPreview: outputText.slice(0, 1200),
+          durationMs: Date.now() - startedAt
+        }
+      };
+    } catch (fallbackError) {
+      return {
+        ok: false,
+        fallbackUsed: true,
+        error:
+          fallbackError instanceof Error
+            ? fallbackError.message
+            : "Fallback model call failed after primary key resolution failure.",
+        trace: {
+          taskId: input.taskId,
+          flowId: input.flowId,
+          agentId: input.agent.id,
+          provider: candidateFallback.provider,
+          model: candidateFallback.model,
+          apiSource: candidateFallback.apiSource,
+          fallbackUsed: true,
+          fallbackSource: fallback ? "configured" : "emergency",
+          fallbackReason: "primary_api_key_missing",
+          contextCount: input.contextBlocks.length,
+          contextDigest,
+          error:
+            fallbackError instanceof Error
+              ? fallbackError.message
+              : "Fallback model call failed after primary key resolution failure."
+        }
+      };
+    }
   }
 
   try {

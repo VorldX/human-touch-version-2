@@ -247,6 +247,7 @@ interface DirectionIntentRouting {
   reason: string;
   toolkitHints?: string[];
   squadRoleHints?: string[];
+  cadenceHint?: "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
 }
 
 function normalizeHumanInputReason(reason: string | null | undefined) {
@@ -468,10 +469,83 @@ function toIsoFromDatetimeLocal(value: string) {
 function isGmailDirectionPrompt(value: string) {
   const prompt = value.toLowerCase();
   const hasEmailDomain = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(prompt);
-  const hasMailContext = /\b(gmail|email|mail|inbox)\b/.test(prompt) || hasEmailDomain;
+  const hasExplicitMailContext =
+    /\b(gmail|email|inbox|mailbox|compose email|send email|draft email)\b/.test(prompt) ||
+    /\b(to:|subject:|cc:|bcc:|recipient)\b/.test(prompt);
   const hasMailAction =
     /\b(send|draft|reply|summarize|summary|find|search|read|list|compose)\b/.test(prompt);
-  return hasMailContext && hasMailAction;
+  const hasNonMailPrimaryAction =
+    /\b(schedule|meeting|calendar|google meet|gmeet|meet\.google\.com|zoom|workflow|task|plan)\b/.test(
+      prompt
+    );
+  return (hasExplicitMailContext || (hasEmailDomain && /\bemail\b/.test(prompt))) &&
+    hasMailAction &&
+    !hasNonMailPrimaryAction;
+}
+
+function isRecurringTaskPrompt(value: string) {
+  const prompt = value.trim().toLowerCase();
+  if (!prompt) return false;
+
+  const informationalQuestion =
+    /^(what|why|how|when|where|who|which)\b/.test(prompt) && !/\b(please|can you|could you)\b/.test(prompt);
+  if (informationalQuestion) {
+    return false;
+  }
+
+  const recurringSignal =
+    /\b(recurring|recur|repeat|repeating|cadence|cron)\b/.test(prompt) ||
+    /\b(daily|weekly|monthly|quarterly|yearly|annually)\b/.test(prompt) ||
+    /\b(every|each)\s+(day|week|month|quarter|year|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(
+      prompt
+    );
+
+  if (!recurringSignal) {
+    return false;
+  }
+
+  const hasActionIntent =
+    /\b(schedule|create|send|email|mail|meeting|report|run|execute|trigger|sync|notify|remind|generate|post|update|check|monitor)\b/.test(
+      prompt
+    );
+
+  return hasActionIntent;
+}
+
+function shouldDirectWorkflowLaunch(value: string) {
+  const prompt = value.trim().toLowerCase();
+  if (!prompt) return false;
+
+  if (isRecurringTaskPrompt(prompt)) {
+    return false;
+  }
+
+  const words = prompt.split(/\s+/g).filter(Boolean);
+  const wordCount = words.length;
+  const politeActionQuestion = /^(can you|could you|please|pls)\b/.test(prompt);
+  const informationalQuestion =
+    !politeActionQuestion &&
+    (/^(what|why|how|when|where|who|which)\b/.test(prompt) || /\?$/.test(prompt));
+  if (informationalQuestion) {
+    return false;
+  }
+
+  const hasPlanningSignals =
+    /\b(direction|strategy|roadmap|plan|planning|decompose|long-term|quarterly|yearly|vision|kpi|team design|org structure)\b/.test(
+      prompt
+    );
+  if (hasPlanningSignals) {
+    return false;
+  }
+
+  const hasQuickActionVerb =
+    /\b(schedule|book|create|send|draft|reply|summarize|search|read|fetch|sync|update|post|notify|remind|launch|run|execute|connect)\b/.test(
+      prompt
+    );
+  const hasToolSignal = inferToolkitsFromDirectionPrompt(prompt).length > 0;
+  const likelyShortTask = wordCount <= 90;
+
+  return hasQuickActionVerb && hasToolSignal && likelyShortTask;
 }
 
 function inferToolkitsFromDirectionPrompt(value: string) {
@@ -483,6 +557,7 @@ function inferToolkitsFromDirectionPrompt(value: string) {
     slack: ["slack", "channel", "workspace", "direct message", "dm"],
     notion: ["notion", "wiki", "knowledge base", "docs", "documentation"],
     github: ["github", "repository", "repo", "pull request", "commit", "issue"],
+    googlemeet: ["googlemeet", "google meet", "gmeet", "meet.google.com"],
     googlecalendar: ["googlecalendar", "google calendar", "calendar", "schedule", "availability"],
     googledrive: ["googledrive", "google drive", "drive"],
     googledocs: ["googledocs", "google docs", "document"],
@@ -531,6 +606,8 @@ function normalizeToolkitAlias(value: string) {
 
   const aliasMap: Record<string, string> = {
     crm: "hubspot",
+    gmeet: "googlemeet",
+    "google meet": "googlemeet",
     "google calendar": "googlecalendar",
     calendar: "googlecalendar",
     "google drive": "googledrive",
@@ -1051,6 +1128,32 @@ export function VorldXShell() {
       setIsMobileNavOpen(false);
     }
   }, [searchParams]);
+
+  useEffect(() => {
+    const composioStatus = searchParams.get("composio");
+    if (!composioStatus) {
+      return;
+    }
+
+    const toolkit = searchParams.get("toolkit")?.trim().toLowerCase();
+    const toolkitLabel = toolkit ? normalizeToolkitAlias(toolkit) : "tool";
+
+    if (composioStatus === "connected") {
+      setControlMessage({
+        tone: "success",
+        text: `Toolkit connected: ${toolkitLabel}.`
+      });
+    } else if (composioStatus === "failed" || composioStatus === "error") {
+      setControlMessage({
+        tone: "error",
+        text: `Toolkit connection failed: ${toolkitLabel}.`
+      });
+    }
+
+    setActiveTab("control");
+    setIsMobileNavOpen(false);
+    router.replace("/app");
+  }, [router, searchParams]);
 
   useEffect(() => {
     setDirectionTurns([]);
@@ -1605,7 +1708,7 @@ export function VorldXShell() {
     recognition.start();
   }, []);
 
-  const handleDirectionChat = useCallback(async (rawMessage?: string) => {
+  const handleDirectionChat = useCallback(async (rawMessage?: string, sourceMode?: ControlMode) => {
     const message = (rawMessage ?? directionPrompt).trim();
     if (!resolvedOrg?.id) {
       return;
@@ -1690,7 +1793,11 @@ export function VorldXShell() {
         }
       ]);
 
-      if (payload.directionCandidate) {
+      const shouldPromoteDirectionCandidate =
+        Boolean(payload.directionCandidate) &&
+        (payload.intentRouting?.route === "PLAN_REQUIRED" || sourceMode === "DIRECTION");
+
+      if (shouldPromoteDirectionCandidate && payload.directionCandidate) {
         setIntent(payload.directionCandidate);
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
@@ -1701,6 +1808,7 @@ export function VorldXShell() {
 
       if (payload.intentRouting?.route === "PLAN_REQUIRED") {
         const routedPrompt = payload.directionCandidate?.trim() || message;
+        const cadenceHint = payload.intentRouting.cadenceHint;
         setPendingChatPlanRoute({
           prompt: routedPrompt,
           reason:
@@ -1708,9 +1816,13 @@ export function VorldXShell() {
             "Intent requires planning before workflow launch.",
           toolkitHints: payload.intentRouting.toolkitHints ?? []
         });
+        setControlMode("DIRECTION");
+        setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
-          text: "Intent routed to planning pipeline."
+          text: cadenceHint
+            ? `Intent routed to planning pipeline (${cadenceHint.toLowerCase()} cadence).`
+            : "Intent routed to planning pipeline."
         });
       }
     } catch (error) {
@@ -1734,6 +1846,7 @@ export function VorldXShell() {
       rawDirection?: string,
       options?: {
         toolkitHints?: string[];
+        navigateToPlanTab?: boolean;
       }
     ) => {
       const direction = (rawDirection ?? intent).trim();
@@ -1906,7 +2019,9 @@ export function VorldXShell() {
           tone: "success",
           text: `Plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}${autoSquadCreatedCount > 0 ? ` Auto-squad created ${autoSquadCreatedCount} agents.` : autoSquad?.triggered ? " Auto-squad detected existing matching agents." : ""} Review in Plan section and approve launch.`
         });
-        handleTabChange("plan");
+        if (options?.navigateToPlanTab !== false) {
+          handleTabChange("plan");
+        }
       } catch (error) {
         setControlMessage({
           tone: "error",
@@ -2272,26 +2387,30 @@ export function VorldXShell() {
       }
     );
 
-    const payload = (await response.json().catch(() => null)) as
-      | {
-          ok?: boolean;
-          enabled?: boolean;
-          message?: string;
-          connections?: Array<{
-            toolkit?: string;
-            status?: string;
-          }>;
-        }
-      | null;
+    const { payload, rawText } = await parseJsonBody<{
+      ok?: boolean;
+      enabled?: boolean;
+      message?: string;
+      connections?: Array<{
+        toolkit?: string;
+        status?: string;
+      }>;
+    }>(response);
 
     if (!response.ok || !payload?.ok) {
-      throw new Error(payload?.message ?? "Failed to load integration connections.");
+      throw new Error(
+        payload?.message ??
+          (rawText
+            ? `Failed to load integration connections (${response.status}): ${rawText.slice(0, 180)}`
+            : "Failed to load integration connections.")
+      );
     }
 
     const active = new Set(
       (payload.connections ?? [])
         .map((item) => ({
-          toolkit: typeof item.toolkit === "string" ? item.toolkit.trim().toLowerCase() : "",
+          toolkit:
+            typeof item.toolkit === "string" ? normalizeToolkitAlias(item.toolkit) : "",
           status: typeof item.status === "string" ? item.status.trim().toUpperCase() : ""
         }))
         .filter((item) => item.toolkit && item.status === "ACTIVE")
@@ -2332,16 +2451,19 @@ export function VorldXShell() {
               returnTo: `${window.location.origin}/app?tab=control`
             })
           });
-          const payload = (await response.json().catch(() => null)) as
-            | {
-                ok?: boolean;
-                message?: string;
-                connectUrl?: string;
-              }
-            | null;
+          const { payload, rawText } = await parseJsonBody<{
+            ok?: boolean;
+            message?: string;
+            connectUrl?: string;
+          }>(response);
 
           if (!response.ok || !payload?.ok || !payload.connectUrl) {
-            throw new Error(payload?.message ?? `Unable to connect ${toolkit}.`);
+            throw new Error(
+              payload?.message ??
+                (rawText
+                  ? `Unable to connect ${toolkit} (${response.status}): ${rawText.slice(0, 180)}`
+                  : `Unable to connect ${toolkit}.`)
+            );
           }
 
           setControlMessage({
@@ -2398,7 +2520,9 @@ export function VorldXShell() {
         return true;
       }
 
-      const uniqueRequestedToolkits = [...new Set(requestedToolkits.map((item) => item.toLowerCase()))];
+      const uniqueRequestedToolkits = [
+        ...new Set(requestedToolkits.map((item) => normalizeToolkitAlias(item)).filter(Boolean))
+      ];
       const firstPass = await getConnectedToolkits();
       if (!firstPass.enabled) {
         setControlMessage({
@@ -2995,7 +3119,8 @@ export function VorldXShell() {
     const run = async () => {
       try {
         await handleGenerateDirectionPlans(pending.prompt, {
-          toolkitHints: pending.toolkitHints
+          toolkitHints: pending.toolkitHints,
+          navigateToPlanTab: false
         });
       } finally {
         if (!cancelled) {
@@ -3615,8 +3740,62 @@ export function VorldXShell() {
                 }}
                 onSendMessage={async (message, modeForMessage) => {
                   if (modeForMessage === "MINDSTORM") {
+                    const trimmed = message.trim();
+                    if (!trimmed) {
+                      return;
+                    }
+
+                    if (isRecurringTaskPrompt(trimmed)) {
+                      setPendingToolkitApproval(null);
+                      setApprovedToolkitRequestId(null);
+                      setPendingEmailApproval(null);
+                      setPendingPlanLaunchApproval(null);
+                      setAgentRunResult(null);
+                      setAgentRunInputValues({});
+                      setAgentRunInputSourceUrl("");
+                      setAgentRunInputFile(null);
+                      setControlMode("DIRECTION");
+                      setControlConversationDetail("DIRECTION_GIVEN");
+                      setIntent(trimmed);
+                      setDirectionPrompt(trimmed);
+                      setControlMessage({
+                        tone: "success",
+                        text: "Recurring task detected. Routed to Direction planning."
+                      });
+                      await handleDirectionChat(trimmed, "MINDSTORM");
+                      return;
+                    }
+
+                    if (shouldDirectWorkflowLaunch(trimmed)) {
+                      setPendingToolkitApproval(null);
+                      setApprovedToolkitRequestId(null);
+                      setPendingEmailApproval(null);
+                      setPendingPlanLaunchApproval(null);
+                      setPendingChatPlanRoute(null);
+                      setAgentRunResult(null);
+                      setAgentRunInputValues({});
+                      setAgentRunInputSourceUrl("");
+                      setAgentRunInputFile(null);
+                      setDirectionTurns((prev) => [
+                        ...prev,
+                        {
+                          id: `owner-direct-flow-${Date.now()}`,
+                          role: "owner",
+                          content: trimmed
+                        }
+                      ]);
+                      setIntent(trimmed);
+                      setControlConversationDetail("DIRECTION_GIVEN");
+                      setControlMessage({
+                        tone: "success",
+                        text: "Quick execution intent detected. Launching workflow directly."
+                      });
+                      await handleLaunchMainAgent(trimmed);
+                      return;
+                    }
+
                     setDirectionPrompt(message);
-                    await handleDirectionChat(message);
+                    await handleDirectionChat(message, "MINDSTORM");
                     return;
                   }
                   const trimmed = message.trim();
@@ -3722,20 +3901,6 @@ export function VorldXShell() {
                     return;
                   }
 
-                  if (isGmailDirectionPrompt(trimmed)) {
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `owner-email-${Date.now()}`,
-                        role: "owner",
-                        content: trimmed
-                      }
-                    ]);
-                    setIntent(trimmed);
-                    await handleLaunchMainAgent(trimmed);
-                    return;
-                  }
-
                   setPendingToolkitApproval(null);
                   setApprovedToolkitRequestId(null);
                   setPendingEmailApproval(null);
@@ -3744,7 +3909,7 @@ export function VorldXShell() {
                   setAgentRunInputSourceUrl("");
                   setAgentRunInputFile(null);
                   setIntent(trimmed);
-                  await handleDirectionChat(trimmed);
+                  await handleDirectionChat(trimmed, "DIRECTION");
                 }}
                 onVoiceIntent={handleVoiceIntent}
                 isRecordingIntent={isRecordingIntent}
@@ -4257,6 +4422,7 @@ function ControlDeckSurface({
     sending ||
     agentActionBusy ||
     agentInputSubmitting;
+  const isApprovalBusy = sending || agentActionBusy || agentInputSubmitting;
   const showLanding = !hasConversation && !hasDirectionDraft;
   const requiredInputs = agentRunResult?.status === "needs_input" ? agentRunResult.required_inputs ?? [] : [];
   const hasActionCards =
@@ -4448,10 +4614,12 @@ function ControlDeckSurface({
             ) : null}
 
             {hasActionCards ? (
-              <div className="vx-scrollbar max-h-[38vh] space-y-2 overflow-y-auto pr-0 sm:pr-1">
+              <div className="vx-scrollbar max-h-[28vh] space-y-2.5 overflow-y-auto pr-0 sm:pr-1">
                 {planningResult?.analysis ? (
-                  <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-xs leading-relaxed text-blue-200 sm:text-sm">
-                    {planningResult.analysis}
+                  <div className="max-h-40 overflow-y-auto rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm leading-6 text-blue-100">
+                    <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                      {planningResult.analysis}
+                    </p>
                   </div>
                 ) : null}
 
@@ -4460,22 +4628,34 @@ function ControlDeckSurface({
                     <p className="text-[10px] uppercase tracking-[0.14em] text-cyan-300">
                       Plan Approval Required
                     </p>
-                    <p className="mt-2 text-xs text-cyan-100 sm:text-sm">
+                    <p className="mt-2 text-sm text-cyan-100">
                       Review completed plan before workflow launch.
                     </p>
-                    <p className="mt-1 text-[11px] text-cyan-200/85 sm:text-xs">
+                    <p className="mt-1 text-xs text-cyan-100/90">
                       {pendingPlanLaunchApproval.reason}
                     </p>
                     {pendingPlanLaunchApproval.toolkits.length > 0 ? (
-                      <p className="mt-2 text-[11px] text-cyan-100/90">
-                        Required tools: {formatToolkitList(pendingPlanLaunchApproval.toolkits)}
-                      </p>
+                      <div className="mt-2 rounded-lg border border-cyan-500/25 bg-black/25 p-2">
+                        <p className="text-[10px] uppercase tracking-[0.12em] text-cyan-300">
+                          Required Tools
+                        </p>
+                        <div className="mt-1 flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                          {pendingPlanLaunchApproval.toolkits.map((toolkit, index) => (
+                            <span
+                              key={`${toolkit}-${index}`}
+                              className="rounded-full border border-cyan-500/35 bg-cyan-500/15 px-2 py-0.5 text-[11px] leading-5 text-cyan-100"
+                            >
+                              {toolkit}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
                     ) : null}
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={onApprovePlanLaunch}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve Launch
@@ -4483,7 +4663,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onRejectPlanLaunch}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
@@ -4497,17 +4677,29 @@ function ControlDeckSurface({
                     <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
                       Tool Access Approval
                     </p>
-                    <p className="mt-2 text-xs text-amber-100 sm:text-sm">
-                      Required tools: {formatToolkitList(pendingToolkitApproval.toolkits)}
-                    </p>
-                    <p className="mt-1 text-[11px] text-amber-200/85 sm:text-xs">
+                    <div className="mt-2 rounded-lg border border-amber-500/25 bg-black/25 p-2">
+                      <p className="text-[10px] uppercase tracking-[0.12em] text-amber-300">
+                        Required Tools
+                      </p>
+                      <div className="mt-1 flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                        {pendingToolkitApproval.toolkits.map((toolkit, index) => (
+                          <span
+                            key={`${toolkit}-${index}`}
+                            className="rounded-full border border-amber-500/35 bg-amber-500/15 px-2 py-0.5 text-[11px] leading-5 text-amber-100"
+                          >
+                            {toolkit}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <p className="mt-1 text-xs text-amber-100/90">
                       Approve to connect integrations and continue execution, or reject to keep it paused.
                     </p>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={onApproveToolkitAccess}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve
@@ -4515,7 +4707,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onRejectToolkitAccess}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
@@ -4529,12 +4721,14 @@ function ControlDeckSurface({
                     <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300">
                       Draft Approval Required
                     </p>
-                    <p className="mt-2 truncate text-xs text-slate-200">To: {pendingEmailApproval.draft.to}</p>
-                    <p className="truncate text-xs text-slate-300">
+                    <p className="mt-2 whitespace-pre-wrap break-words text-xs text-slate-100">
+                      To: {pendingEmailApproval.draft.to}
+                    </p>
+                    <p className="whitespace-pre-wrap break-words text-xs text-slate-200">
                       Subject: {pendingEmailApproval.draft.subject}
                     </p>
                     <div className="mt-2 max-h-32 overflow-y-auto rounded-lg border border-white/10 bg-black/30 px-2.5 py-2">
-                      <p className="whitespace-pre-wrap break-words text-xs text-slate-200">
+                      <p className="whitespace-pre-wrap break-words font-sans text-sm leading-6 tracking-normal text-slate-100">
                         {pendingEmailApproval.draft.body}
                       </p>
                     </div>
@@ -4545,7 +4739,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onApproveEmailDraft}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve
@@ -4553,7 +4747,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onRejectEmailDraft}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
@@ -4619,7 +4813,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onSubmitAgentInputs}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve & Continue
@@ -4627,7 +4821,7 @@ function ControlDeckSurface({
                       <button
                         type="button"
                         onClick={onRejectAgentInput}
-                        disabled={isBusy}
+                        disabled={isApprovalBusy}
                         className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
@@ -4638,21 +4832,23 @@ function ControlDeckSurface({
               </div>
             ) : null}
 
-            <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto pr-0 sm:pr-1">
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto pr-0 sm:pr-1">
               {turns.map((turn) => (
                 <div
                   key={turn.id}
-                  className={`max-w-full rounded-2xl px-3 py-2.5 text-sm sm:max-w-[85%] sm:px-4 sm:py-3 ${
+                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.25)] sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
                     turn.role === "owner"
-                      ? "ml-auto bg-white/[0.08] text-slate-100"
-                      : "mr-auto bg-white/[0.04] text-slate-200"
+                      ? "ml-auto border-cyan-400/40 bg-cyan-500/18 text-cyan-50"
+                      : "mr-auto border-slate-500/45 bg-slate-900/90 text-slate-100"
                   }`}
                 >
-                  <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-300/90">
                     {turn.role === "owner" ? "You" : "Organization"}
                     {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
                   </p>
-                  <p className="mt-1 whitespace-pre-wrap break-words">{turn.content}</p>
+                  <p className="mt-1.5 whitespace-pre-wrap break-words font-sans text-[15px] leading-6 tracking-normal text-slate-100 [overflow-wrap:anywhere]">
+                    {turn.content}
+                  </p>
                 </div>
               ))}
             </div>

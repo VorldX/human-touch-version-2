@@ -20,24 +20,41 @@ const DEFAULT_ALLOWLIST = [
   "slack",
   "notion",
   "github",
+  "googlemeet",
+  "gmeet",
   "googlecalendar",
   "googledrive",
   "googledocs",
   "googlesheets",
+  "googleads",
   "outlook",
+  "onedrive",
   "microsoftteams",
+  "airtable",
+  "clickup",
+  "discord",
+  "telegram",
   "jira",
   "trello",
   "asana",
   "monday",
   "linear",
+  "dropbox",
+  "box",
   "shopify",
   "stripe",
   "salesforce",
   "hubspot",
   "pipedrive",
+  "calendly",
+  "mailchimp",
   "quickbooks",
   "zendesk",
+  "wordpress",
+  "webflow",
+  "surveymonkey",
+  "facebook",
+  "instagram",
   "whatsapp",
   "twitter",
   "linkedin",
@@ -77,11 +94,20 @@ function parseAllowlistedToolkits() {
   if (!raw) {
     return [...DEFAULT_ALLOWLIST];
   }
+
+  const strictMode =
+    (process.env.COMPOSIO_ALLOWED_TOOLKITS_STRICT?.trim().toLowerCase() ?? "") === "true";
   const parsed = raw
     .split(",")
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean);
-  return parsed.length > 0 ? [...new Set(parsed)] : [...DEFAULT_ALLOWLIST];
+  if (parsed.length === 0) {
+    return [...DEFAULT_ALLOWLIST];
+  }
+  if (strictMode) {
+    return [...new Set(parsed)];
+  }
+  return [...new Set([...DEFAULT_ALLOWLIST, ...parsed])];
 }
 
 function envPrefixForToolkit(toolkit: string) {
@@ -140,11 +166,13 @@ export function buildIntegrationConnectPath(toolkit?: string) {
   return `${url.pathname}${url.search}`;
 }
 
-function callbackUrl() {
-  return (
-    process.env.COMPOSIO_OAUTH_CALLBACK_URL?.trim() ||
-    "http://localhost:3000/api/integrations/composio/oauth/callback"
-  );
+function callbackUrl(callbackUrlOverride?: string) {
+  const explicit = callbackUrlOverride?.trim() || process.env.COMPOSIO_OAUTH_CALLBACK_URL?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  return "http://localhost:3000/api/integrations/composio/oauth/callback";
 }
 
 const store: UserIntegrationStore = {
@@ -240,13 +268,13 @@ export function initComposioClient() {
   });
 }
 
-function createCore() {
+function createCore(options?: { callbackUrlOverride?: string }) {
   const allowlistedToolkits = parseAllowlistedToolkits();
   return new ComposioServiceCore({
     enabled: enabled(),
     provider: "composio",
     allowlistedToolkits,
-    callbackUrl: callbackUrl(),
+    callbackUrl: callbackUrl(options?.callbackUrlOverride),
     createClient: () => {
       const client = initComposioClient();
       if (!client) {
@@ -275,8 +303,11 @@ export async function createConnection(input: {
   orgId: string;
   toolkit: string;
   returnTo?: string;
+  callbackUrlOverride?: string;
 }) {
-  const core = createCore();
+  const core = createCore({
+    callbackUrlOverride: input.callbackUrlOverride
+  });
   return core.createConnection({
     userId: input.userId,
     orgId: input.orgId,

@@ -65,7 +65,6 @@ export async function buildAgentContextPack(input: {
         id: true,
         name: true,
         description: true,
-        executionMode: true,
         monthlyBudget: true,
         currentSpend: true
       }
@@ -156,7 +155,7 @@ export async function buildAgentContextPack(input: {
           {
             name: org.name,
             description: org.description ?? "",
-            executionMode: org.executionMode,
+            executionMode: input.mode,
             monthlyBudgetUsd: Number(org.monthlyBudget),
             currentSpendUsd: Number(org.currentSpend)
           },
@@ -326,7 +325,7 @@ export async function buildAgentContextPack(input: {
 
   const summary = compact(
     [
-      org ? `${org.name} (${org.executionMode})` : "Organization context",
+      org ? `${org.name} (${input.mode})` : "Organization context",
       direction ? `Direction: ${direction.title}` : "No linked direction",
       planForDirection ? `Plan: ${planForDirection.title}` : "No linked plan",
       `Task: ${input.taskId}`,

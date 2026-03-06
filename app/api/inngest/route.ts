@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { createHash } from "node:crypto";
 
 import {
@@ -6,6 +8,7 @@ import {
   FlowStatus,
   HubFileType,
   LogType,
+  MemoryTier,
   Personnel,
   PersonnelStatus,
   Prisma,
@@ -462,6 +465,85 @@ function parseRequestedToolkitsFromTrace(trace: unknown) {
     .filter(Boolean))];
 }
 
+function inferDelegationSpecialty(taskPrompt: string, requestedToolkits: string[]) {
+  const lower = taskPrompt.toLowerCase();
+  const toolkitLabel = requestedToolkits.length > 0 ? requestedToolkits.join(", ") : "none";
+
+  if (/\b(marketing|campaign|content|growth|seo|social)\b/.test(lower)) {
+    return `marketing-operations [toolkits=${toolkitLabel}]`;
+  }
+  if (/\b(sales|prospect|crm|pipeline|outreach)\b/.test(lower)) {
+    return `sales-operations [toolkits=${toolkitLabel}]`;
+  }
+  if (/\b(meeting|calendar|schedule|zoom|google meet|gmeet)\b/.test(lower)) {
+    return `meeting-and-scheduling [toolkits=${toolkitLabel}]`;
+  }
+  if (/\b(email|gmail|inbox|mailbox)\b/.test(lower)) {
+    return `email-operations [toolkits=${toolkitLabel}]`;
+  }
+
+  return `task-specialist [toolkits=${toolkitLabel}]`;
+}
+
+function buildChildAgentCriticalRules(taskPrompt: string, requestedToolkits: string[]) {
+  const toolkitLabel = requestedToolkits.length > 0 ? requestedToolkits.join(", ") : "approved organizational tools";
+  return [
+    `Execute only delegated scope: ${taskPrompt.slice(0, 260)}.`,
+    `Use only these approved toolkits: ${toolkitLabel}.`,
+    "Stop and request Human Touch for missing parameters, risky/destructive actions, or policy uncertainty.",
+    "Never claim external action completed unless tool output confirms success."
+  ];
+}
+
+function shouldSendMeetingDetailsEmail(prompt: string) {
+  const normalized = prompt.toLowerCase();
+  const mentionsMeeting = /\b(meet|meeting)\b/.test(normalized);
+  const asksToSend = /\b(send|mail|email|share)\b/.test(normalized);
+  const asksForDetails = /\b(details?|invite|invitation|link)\b/.test(normalized);
+  return mentionsMeeting && asksToSend && asksForDetails;
+}
+
+function extractMeetingUriFromToolData(data: Record<string, unknown> | null | undefined) {
+  if (!data) return "";
+  const directUri = asString(data.meetingUri);
+  if (directUri) return directUri;
+  const nestedUri = asString(asRecord(data.meeting).meetingUri);
+  if (nestedUri) return nestedUri;
+  return "";
+}
+
+function buildMeetingDetailsEmail(input: {
+  recipient: string;
+  meetingUri: string;
+  meetingCode?: string;
+  prompt: string;
+}) {
+  const safeCode = input.meetingCode?.trim() ?? "";
+  const subject = safeCode
+    ? `Google Meet details (${safeCode})`
+    : "Google Meet details";
+  const body = [
+    "Hello,",
+    "",
+    "Your Google Meet meeting has been created.",
+    `Meeting link: ${input.meetingUri}`,
+    ...(safeCode ? [`Meeting code: ${safeCode}`] : []),
+    "",
+    "Requested task:",
+    input.prompt.slice(0, 500),
+    "",
+    "Regards,",
+    "VorldX Agent"
+  ].join("\n");
+
+  return {
+    to: input.recipient,
+    recipient_email: input.recipient,
+    subject,
+    body
+  };
+}
+
 interface AgentToolActionRequest {
   toolkit: string;
   action: string;
@@ -654,6 +736,53 @@ function inferZoomToolAction(prompt: string, toolBindings: AgentToolBindingSumma
   return null;
 }
 
+function inferGoogleMeetToolAction(prompt: string, toolBindings: AgentToolBindingSummary[]) {
+  const normalized = prompt.toLowerCase();
+  const meetBindings = toolBindings.filter((binding) => binding.toolkit === "googlemeet");
+  if (meetBindings.length === 0) {
+    return null;
+  }
+
+  const meetingContext = /\b(google meet|gmeet|meeting|meet|call)\b/.test(normalized);
+  if (!meetingContext) {
+    return null;
+  }
+
+  const createIntent = /\b(create|schedule|set up|setup|book|arrange|plan)\b/.test(normalized);
+  if (createIntent) {
+    const createBinding = findBindingByKeywordSets(meetBindings, [
+      ["create", "meet"],
+      ["create", "space"],
+      ["create", "meeting"]
+    ]);
+    if (createBinding) {
+      return {
+        toolkit: "googlemeet",
+        action: createBinding.slug.toUpperCase(),
+        arguments: {}
+      } satisfies AgentToolActionRequest;
+    }
+  }
+
+  const listIntent = /\b(list|get|show|fetch|check|view|recent|upcoming)\b/.test(normalized);
+  if (listIntent) {
+    const listBinding = findBindingByKeywordSets(meetBindings, [
+      ["list", "conference", "records"],
+      ["get", "meet"],
+      ["list", "participants"]
+    ]);
+    if (listBinding) {
+      return {
+        toolkit: "googlemeet",
+        action: listBinding.slug.toUpperCase(),
+        arguments: {}
+      } satisfies AgentToolActionRequest;
+    }
+  }
+
+  return null;
+}
+
 function inferReadOnlyGenericToolAction(
   prompt: string,
   requestedToolkits: string[],
@@ -747,6 +876,11 @@ function inferAgentToolActionHeuristic(
   const inferredZoom = inferZoomToolAction(prompt, toolBindings);
   if (inferredZoom) {
     return inferredZoom;
+  }
+
+  const inferredGoogleMeet = inferGoogleMeetToolAction(prompt, toolBindings);
+  if (inferredGoogleMeet) {
+    return inferredGoogleMeet;
   }
 
   const gmailRequested = requestedToolkits.includes("gmail");
@@ -1642,8 +1776,12 @@ async function executeTaskById(
     const delegatedPersonnelId = await pickDelegationPersonnelCandidate({
       orgId,
       role: policyDecision.targetRole,
-      excludePersonnelId: logicalAgent.personnelId
+      excludePersonnelId: logicalAgent.personnelId,
+      taskPrompt: task.prompt,
+      requestedToolkits
     });
+    const delegatedSpecialty = inferDelegationSpecialty(task.prompt, requestedToolkits);
+    const criticalRules = buildChildAgentCriticalRules(task.prompt, requestedToolkits);
 
     activeLogicalAgent = await createChildAgent({
       orgId,
@@ -1653,6 +1791,8 @@ async function executeTaskById(
       role: policyDecision.targetRole,
       goal: `Delegated task: ${task.prompt}`.slice(0, 1400),
       allowedTools: requestedToolkits,
+      specialty: delegatedSpecialty,
+      criticalRules,
       budgetScope: {
         maxUsd: Math.max(0.01, Math.min(estimatedDelegationCostUsd, budgetSnapshot.remainingBudgetUsd))
       },
@@ -1669,7 +1809,8 @@ async function executeTaskById(
       reason: policyDecision.reason,
       metadata: toInputJsonValue({
         estimatedDelegationCostUsd,
-        complexity
+        complexity,
+        delegatedSpecialty
       })
     });
 
@@ -2085,6 +2226,195 @@ async function executeTaskById(
     }
   }
 
+  let followupToolActionExecution: ToolActionExecutionResult | null = null;
+  const primaryToolSuccess = toolActionExecution?.ok
+    ? (toolActionExecution as ToolActionExecutionSuccess)
+    : null;
+  const recipientEmail = extractFirstEmail(task.prompt);
+  const meetingUri =
+    primaryToolSuccess && primaryToolSuccess.toolkit === "googlemeet"
+      ? extractMeetingUriFromToolData(primaryToolSuccess.data)
+      : "";
+  const shouldAttemptMeetingEmail =
+    Boolean(
+      origin &&
+      executionUserId &&
+      recipientEmail &&
+      shouldSendMeetingDetailsEmail(task.prompt) &&
+      requestedToolkits.includes("gmail") &&
+      primaryToolSuccess &&
+      primaryToolSuccess.toolkit === "googlemeet" &&
+      primaryToolSuccess.action.includes("CREATE") &&
+      meetingUri
+    );
+
+  if (shouldAttemptMeetingEmail && executionUserId && origin && recipientEmail) {
+    const sendMarkerKey = `flow.meeting-email.sent.${task.flowId}.${recipientEmail.toLowerCase()}`;
+    const alreadySent = await prisma.memoryEntry.findFirst({
+      where: {
+        orgId,
+        flowId: task.flowId,
+        tier: MemoryTier.WORKING,
+        key: sendMarkerKey,
+        redactedAt: null
+      },
+      select: { id: true }
+    });
+
+    if (!alreadySent) {
+      const meetingCode = asString(asRecord(primaryToolSuccess?.data).meetingCode);
+      const emailArguments = buildMeetingDetailsEmail({
+        recipient: recipientEmail,
+        meetingUri,
+        ...(meetingCode ? { meetingCode } : {}),
+        prompt: task.prompt
+      });
+
+      try {
+        const internalKey = resolveAgentExecutionKey();
+        const executeResponse = await fetch(`${origin}/api/agent/tools/execute`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...buildInternalApiHeaders(),
+            ...(internalKey ? { "x-agent-exec-key": internalKey } : {})
+          },
+          body: JSON.stringify({
+            orgId,
+            userId: executionUserId,
+            toolkit: "gmail",
+            action: "SEND_EMAIL",
+            arguments: emailArguments,
+            taskId: task.id
+          }),
+          cache: "no-store"
+        });
+
+        const executePayload = (await executeResponse.json().catch(() => null)) as
+          | {
+              ok?: boolean;
+              result?: ToolActionExecutionResult;
+              error?: {
+                code?: string;
+                message?: string;
+                toolkit?: string;
+                action?: string;
+                connectUrl?: string;
+              };
+              attempts?: number;
+            }
+          | null;
+
+        if (!executeResponse.ok || !executePayload?.ok || !executePayload.result) {
+          const integrationError =
+            executePayload?.error?.code === "INTEGRATION_NOT_CONNECTED"
+              ? {
+                  code: "INTEGRATION_NOT_CONNECTED" as const,
+                  toolkit: executePayload.error.toolkit || "gmail",
+                  action: executePayload.error.action || "SEND_EMAIL",
+                  ...(executePayload.error.connectUrl
+                    ? { connectUrl: executePayload.error.connectUrl }
+                    : {})
+                }
+              : null;
+
+          if (integrationError) {
+            return handleEvent({
+              name: "vorldx/task.paused",
+              data: {
+                orgId,
+                taskId: task.id,
+                reason: `Tool integration "${integrationError.toolkit}" is not connected.`,
+                integrationError,
+                executionTrace: {
+                  requestedToolkits,
+                  integrationError
+                }
+              }
+            }, origin);
+          }
+
+          followupToolActionExecution = {
+            ok: false,
+            attempts: executePayload?.attempts ?? 1,
+            error: {
+              code: executePayload?.error?.code || "TOOLS_UNAVAILABLE",
+              message: executePayload?.error?.message || "Follow-up email execution failed.",
+              toolkit: "gmail",
+              action: "SEND_EMAIL"
+            }
+          };
+        } else {
+          followupToolActionExecution = executePayload.result;
+          await prisma.memoryEntry.create({
+            data: {
+              orgId,
+              flowId: task.flowId,
+              taskId: task.id,
+              tier: MemoryTier.WORKING,
+              key: sendMarkerKey,
+              value: toInputJsonValue({
+                sentAt: new Date().toISOString(),
+                recipient: recipientEmail,
+                meetingUri
+              })
+            }
+          });
+        }
+      } catch (error) {
+        followupToolActionExecution = {
+          ok: false,
+          attempts: 1,
+          error: {
+            code: "TOOLS_UNAVAILABLE",
+            message: error instanceof Error ? error.message : "Follow-up email execution failed.",
+            toolkit: "gmail",
+            action: "SEND_EMAIL"
+          }
+        };
+      }
+    }
+  }
+
+  if (followupToolActionExecution && !followupToolActionExecution.ok) {
+    const reason = `Meeting details email failed: ${followupToolActionExecution.error.message}`;
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      metadata: toInputJsonValue({
+        followupToolActionExecution
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        reason,
+        followupToolActionExecution
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          followupToolActionExecution,
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
+
   const lockResult = await acquireTaskFileLocks({
     orgId,
     taskId: task.id,
@@ -2201,6 +2531,12 @@ async function executeTaskById(
   const toolActionFailure = toolActionExecution && !toolActionExecution.ok
     ? (toolActionExecution as ToolActionExecutionFailure)
     : null;
+  const followupToolActionSuccess = followupToolActionExecution?.ok
+    ? (followupToolActionExecution as ToolActionExecutionSuccess)
+    : null;
+  const followupToolActionFailure = followupToolActionExecution && !followupToolActionExecution.ok
+    ? (followupToolActionExecution as ToolActionExecutionFailure)
+    : null;
 
   const toolActionContextBlocks =
     toolActionSuccess
@@ -2234,6 +2570,37 @@ async function executeTaskById(
           }
         ]
       : [];
+  const followupToolActionContextBlocks =
+    followupToolActionSuccess
+      ? [
+          {
+            id: "composio-tool-action-followup-result",
+            name: "Executed Follow-up Tool Result",
+            amnesiaProtected: false,
+            content: JSON.stringify(
+              {
+                toolkit: followupToolActionSuccess.toolkit,
+                action: followupToolActionSuccess.action,
+                toolSlug: followupToolActionSuccess.toolSlug,
+                data: followupToolActionSuccess.data
+              },
+              null,
+              2
+            )
+          }
+        ]
+      : [];
+  const followupToolActionErrorContextBlocks =
+    followupToolActionFailure
+      ? [
+          {
+            id: "composio-tool-action-followup-error",
+            name: "Follow-up Tool Action Error",
+            amnesiaProtected: false,
+            content: JSON.stringify(followupToolActionFailure.error)
+          }
+        ]
+      : [];
 
   const execution = await executeSwarmAgent({
     taskId: task.id,
@@ -2245,7 +2612,9 @@ async function executeTaskById(
       ...contextPack.blocks,
       ...integrationContextBlocks,
       ...toolActionContextBlocks,
-      ...toolActionErrorContextBlocks
+      ...toolActionErrorContextBlocks,
+      ...followupToolActionContextBlocks,
+      ...followupToolActionErrorContextBlocks
     ],
     organizationRuntime: await getOrgLlmRuntime(orgId)
   });
@@ -2259,6 +2628,7 @@ async function executeTaskById(
     inferredToolAction,
     toolInferenceReason: inferredToolPlan.reason ?? null,
     toolActionExecution,
+    followupToolActionExecution,
     toolBindings: toolBindings.map((item) => ({
       toolkit: item.toolkit,
       slug: item.slug

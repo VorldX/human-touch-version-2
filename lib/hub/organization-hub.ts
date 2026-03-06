@@ -315,3 +315,30 @@ export async function getOrganizationalOutputFiles(orgId: string) {
     };
   });
 }
+
+export async function getOrganizationalInputDocuments(orgId: string) {
+  const files = await prisma.file.findMany({
+    where: {
+      orgId,
+      type: HubFileType.INPUT,
+      name: {
+        not: COMPANY_DATA_FILE_NAME
+      }
+    },
+    orderBy: { updatedAt: "desc" },
+    take: 100
+  });
+
+  return files.map((file) => {
+    const metadata = asRecord(file.metadata);
+    return {
+      id: file.id,
+      name: file.name,
+      size: file.size.toString(),
+      url: file.url,
+      updatedAt: file.updatedAt,
+      contentType:
+        typeof metadata.contentType === "string" ? metadata.contentType : null
+    };
+  });
+}

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 
 import { createPlan, listPlans, type PlanSource, type PlanStatus } from "@/lib/plans/plans";

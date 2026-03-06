@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type Lane = "webhooks" | "identity" | "rails" | "orchestration";
@@ -147,31 +148,74 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           fetch(`/api/settings/credits?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" })
         ]);
 
-        const webhooksPayload = (await webhooksRes.json()) as { ok?: boolean; message?: string; webhooks?: WebhookItem[] };
-        const railsPayload = (await railsRes.json()) as { ok?: boolean; message?: string; rails?: RailItem[] };
-        const identityPayload = (await identityRes.json()) as {
+        const { payload: webhooksPayload, rawText: webhooksRawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          webhooks?: WebhookItem[];
+        }>(webhooksRes);
+        const { payload: railsPayload, rawText: railsRawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          rails?: RailItem[];
+        }>(railsRes);
+        const { payload: identityPayload, rawText: identityRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           accounts?: IdentityAccount[];
           agents?: IdentityAgent[];
-        };
-        const llmPayload = (await llmRes.json()) as {
+        }>(identityRes);
+        const { payload: llmPayload, rawText: llmRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           settings?: OrganizationLlmSettings;
           executionMode?: ExecutionMode;
-        };
-        const creditsPayload = (await creditsRes.json()) as {
+        }>(llmRes);
+        const { payload: creditsPayload, rawText: creditsRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           wallet?: OrgCreditsWallet;
-        };
+        }>(creditsRes);
 
-        if (!webhooksRes.ok || !webhooksPayload.ok) throw new Error(webhooksPayload.message ?? "Failed loading webhooks.");
-        if (!railsRes.ok || !railsPayload.ok) throw new Error(railsPayload.message ?? "Failed loading rails.");
-        if (!identityRes.ok || !identityPayload.ok) throw new Error(identityPayload.message ?? "Failed loading identity.");
-        if (!llmRes.ok || !llmPayload.ok || !llmPayload.settings) throw new Error(llmPayload.message ?? "Failed loading orchestration.");
-        if (!creditsRes.ok || !creditsPayload.ok || !creditsPayload.wallet) throw new Error(creditsPayload.message ?? "Failed loading credits.");
+        if (!webhooksRes.ok || !webhooksPayload?.ok) {
+          throw new Error(
+            webhooksPayload?.message ??
+              (webhooksRawText
+                ? `Failed loading webhooks (${webhooksRes.status}): ${webhooksRawText.slice(0, 180)}`
+                : "Failed loading webhooks.")
+          );
+        }
+        if (!railsRes.ok || !railsPayload?.ok) {
+          throw new Error(
+            railsPayload?.message ??
+              (railsRawText
+                ? `Failed loading rails (${railsRes.status}): ${railsRawText.slice(0, 180)}`
+                : "Failed loading rails.")
+          );
+        }
+        if (!identityRes.ok || !identityPayload?.ok) {
+          throw new Error(
+            identityPayload?.message ??
+              (identityRawText
+                ? `Failed loading identity (${identityRes.status}): ${identityRawText.slice(0, 180)}`
+                : "Failed loading identity.")
+          );
+        }
+        if (!llmRes.ok || !llmPayload?.ok || !llmPayload.settings) {
+          throw new Error(
+            llmPayload?.message ??
+              (llmRawText
+                ? `Failed loading orchestration (${llmRes.status}): ${llmRawText.slice(0, 180)}`
+                : "Failed loading orchestration.")
+          );
+        }
+        if (!creditsRes.ok || !creditsPayload?.ok || !creditsPayload.wallet) {
+          throw new Error(
+            creditsPayload?.message ??
+              (creditsRawText
+                ? `Failed loading credits (${creditsRes.status}): ${creditsRawText.slice(0, 180)}`
+                : "Failed loading credits.")
+          );
+        }
 
         setError(null);
         setWebhooks(webhooksPayload.webhooks ?? []);
@@ -219,9 +263,17 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           isActive: true
         })
       });
-      const payload = (await response.json()) as { ok?: boolean; message?: string };
-      if (!response.ok || !payload.ok) {
-        notify({ title: "Webhook", message: payload.message ?? "Create failed.", type: "error" });
+      const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+      if (!response.ok || !payload?.ok) {
+        notify({
+          title: "Webhook",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Create failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Create failed."),
+          type: "error"
+        });
         return;
       }
       setNewWebhookUrl("");
@@ -267,9 +319,17 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           config: { network: "mainnet" }
         })
       });
-      const payload = (await response.json()) as { ok?: boolean; message?: string };
-      if (!response.ok || !payload.ok) {
-        notify({ title: "Rail", message: payload.message ?? "Create failed.", type: "error" });
+      const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+      if (!response.ok || !payload?.ok) {
+        notify({
+          title: "Rail",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Create failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Create failed."),
+          type: "error"
+        });
         return;
       }
       setNewRailName("");
@@ -336,14 +396,19 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
               : {})
           })
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           settings?: OrganizationLlmSettings;
           executionMode?: ExecutionMode;
-        };
-        if (!response.ok || !payload.ok || !payload.settings) {
-          throw new Error(payload.message ?? "Save failed.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload.settings) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Save failed (${response.status}): ${rawText.slice(0, 180)}`
+                : "Save failed.")
+          );
         }
         setLlmSettings({
           ...payload.settings,
@@ -386,14 +451,19 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           wallet?: OrgCreditsWallet;
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.wallet) {
-          throw new Error(payload.message ?? "Credits update failed.");
+        if (!response.ok || !payload?.ok || !payload.wallet) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Credits update failed (${response.status}): ${rawText.slice(0, 180)}`
+                : "Credits update failed.")
+          );
         }
 
         setCreditsWallet(payload.wallet);

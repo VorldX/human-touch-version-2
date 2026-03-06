@@ -1,7 +1,10 @@
+export const dynamic = "force-dynamic";
+
 import { NextRequest, NextResponse } from "next/server";
 
 import {
   ensureCompanyDataFile,
+  getOrganizationalInputDocuments,
   getOrganizationalOutputFiles,
   updateCompanyDataFile
 } from "@/lib/hub/organization-hub";
@@ -27,6 +30,7 @@ export async function GET(request: NextRequest) {
   try {
     const company = await ensureCompanyDataFile(orgId);
     const outputs = await getOrganizationalOutputFiles(orgId);
+    const documents = await getOrganizationalInputDocuments(orgId);
     return NextResponse.json({
       ok: true,
       input: {
@@ -36,6 +40,7 @@ export async function GET(request: NextRequest) {
         updatedAt: company.file.updatedAt,
         content: company.content
       },
+      documents,
       output: outputs
     });
   } catch (error) {

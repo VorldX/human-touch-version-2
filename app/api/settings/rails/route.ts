@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { LogType, Prisma, SovereignRailType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 

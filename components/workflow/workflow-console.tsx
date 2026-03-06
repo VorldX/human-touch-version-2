@@ -17,8 +17,9 @@ import {
 import type { Edge, Node } from "reactflow";
 
 import { AutopsyBlueprint } from "@/components/autopsy/autopsy-blueprint";
-import { useVorldXStore } from "@/lib/store/vorldx-store";
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { getRealtimeClient } from "@/lib/realtime/client";
+import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type FlowStatus = "DRAFT" | "QUEUED" | "ACTIVE" | "PAUSED" | "COMPLETED" | "ABORTED" | "FAILED";
 type TaskStatus = "QUEUED" | "RUNNING" | "PAUSED" | "COMPLETED" | "FAILED" | "ABORTED";
@@ -88,6 +89,15 @@ interface AgentRuntimeTrace {
   logicalRole?: string;
   parentAgentId?: string;
   decisionType?: string;
+  decisionReason?: string;
+  executionMode?: string;
+  estimatedSelfCostUsd?: number;
+  estimatedDelegationCostUsd?: number;
+  budgetSnapshot?: {
+    remainingBudgetUsd?: number;
+    currentSpendUsd?: number;
+    monthlyBudgetUsd?: number;
+  };
 }
 
 function parseIntegrationError(trace: unknown): IntegrationErrorTrace | null {
@@ -130,8 +140,61 @@ function parseAgentRuntime(trace: unknown): AgentRuntimeTrace | null {
   const logicalRole = typeof runtime.logicalRole === "string" ? runtime.logicalRole : undefined;
   const parentAgentId = typeof runtime.parentAgentId === "string" ? runtime.parentAgentId : undefined;
   const decisionType = typeof runtime.decisionType === "string" ? runtime.decisionType : undefined;
+  const decisionReason =
+    typeof runtime.decisionReason === "string" ? runtime.decisionReason.trim() : undefined;
+  const executionMode =
+    typeof runtime.executionMode === "string" ? runtime.executionMode.trim() : undefined;
+  const estimatedSelfCostUsd =
+    typeof runtime.estimatedSelfCostUsd === "number"
+      ? runtime.estimatedSelfCostUsd
+      : typeof runtime.estimatedSelfCostUsd === "string"
+        ? Number(runtime.estimatedSelfCostUsd)
+        : undefined;
+  const estimatedDelegationCostUsd =
+    typeof runtime.estimatedDelegationCostUsd === "number"
+      ? runtime.estimatedDelegationCostUsd
+      : typeof runtime.estimatedDelegationCostUsd === "string"
+        ? Number(runtime.estimatedDelegationCostUsd)
+        : undefined;
+  const rawBudget =
+    runtime.budgetSnapshot && typeof runtime.budgetSnapshot === "object"
+      ? (runtime.budgetSnapshot as Record<string, unknown>)
+      : null;
+  const budgetSnapshot = rawBudget
+    ? {
+        remainingBudgetUsd:
+          typeof rawBudget.remainingBudgetUsd === "number"
+            ? rawBudget.remainingBudgetUsd
+            : typeof rawBudget.remainingBudgetUsd === "string"
+              ? Number(rawBudget.remainingBudgetUsd)
+              : undefined,
+        currentSpendUsd:
+          typeof rawBudget.currentSpendUsd === "number"
+            ? rawBudget.currentSpendUsd
+            : typeof rawBudget.currentSpendUsd === "string"
+              ? Number(rawBudget.currentSpendUsd)
+              : undefined,
+        monthlyBudgetUsd:
+          typeof rawBudget.monthlyBudgetUsd === "number"
+            ? rawBudget.monthlyBudgetUsd
+            : typeof rawBudget.monthlyBudgetUsd === "string"
+              ? Number(rawBudget.monthlyBudgetUsd)
+              : undefined
+      }
+    : undefined;
 
-  if (!agentRunId && !logicalAgentId && !logicalRole && !parentAgentId && !decisionType) {
+  if (
+    !agentRunId &&
+    !logicalAgentId &&
+    !logicalRole &&
+    !parentAgentId &&
+    !decisionType &&
+    !decisionReason &&
+    !executionMode &&
+    typeof estimatedSelfCostUsd !== "number" &&
+    typeof estimatedDelegationCostUsd !== "number" &&
+    !budgetSnapshot
+  ) {
     return null;
   }
 
@@ -140,8 +203,32 @@ function parseAgentRuntime(trace: unknown): AgentRuntimeTrace | null {
     logicalAgentId,
     logicalRole,
     parentAgentId,
-    decisionType
+    decisionType,
+    decisionReason,
+    executionMode,
+    estimatedSelfCostUsd:
+      typeof estimatedSelfCostUsd === "number" && Number.isFinite(estimatedSelfCostUsd)
+        ? estimatedSelfCostUsd
+        : undefined,
+    estimatedDelegationCostUsd:
+      typeof estimatedDelegationCostUsd === "number" &&
+      Number.isFinite(estimatedDelegationCostUsd)
+        ? estimatedDelegationCostUsd
+        : undefined,
+    budgetSnapshot
   };
+}
+
+function shortId(value: string | undefined, size = 8) {
+  if (!value) return "";
+  return value.slice(0, size);
+}
+
+function formatUsd(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  return `$${value.toFixed(2)}`;
 }
 
 function openCenteredPopup(url: string, name: string) {
@@ -201,7 +288,7 @@ function buildAutopsy(task?: FlowTask | null) {
   if (!task) return { nodes: [] as Node[], edges: [] as Edge[] };
   const runtime = parseAgentRuntime(task.executionTrace);
   const agentLabel = runtime?.logicalRole
-    ? `${runtime.logicalRole} (${runtime.logicalAgentId?.slice(0, 8) ?? "logical"})`
+    ? `${runtime.logicalRole} (${runtime.logicalAgentId?.slice(0, 8) ?? "logical"})${runtime.parentAgentId ? ` <- ${runtime.parentAgentId.slice(0, 8)}` : ""}`
     : task.agent
       ? `${task.agent.name} (${task.agent.role})`
       : "Unassigned Agent";
@@ -289,13 +376,18 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
       const response = await fetch(`/api/flows?orgId=${encodeURIComponent(orgId)}&limit=100`, {
         cache: "no-store"
       });
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonResponse<{
         ok?: boolean;
         message?: string;
         flows?: FlowListItem[];
-      };
-      if (!response.ok || !payload.ok || !payload.flows) {
-        setError(payload.message ?? "Failed to load workflows.");
+      }>(response);
+      if (!response.ok || !payload?.ok || !payload.flows) {
+        setError(
+          payload?.message ??
+            (rawText
+              ? `Failed to load workflows (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed to load workflows.")
+        );
         return;
       }
       setError(null);
@@ -310,16 +402,20 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
   const loadDetail = useCallback(async (id: string, silent?: boolean) => {
     if (!silent) setDetail(null);
     const response = await fetch(`/api/flows/${id}`, { cache: "no-store" });
-    const payload = (await response.json()) as {
+    const { payload, rawText } = await parseJsonResponse<{
       ok?: boolean;
       message?: string;
       flow?: FlowDetail;
       logs?: FlowLog[];
-    };
-    if (!response.ok || !payload.ok || !payload.flow) {
+    }>(response);
+    if (!response.ok || !payload?.ok || !payload.flow) {
       notify({
         title: "Deep Dive",
-        message: payload.message ?? "Unable to load flow details.",
+        message:
+          payload?.message ??
+          (rawText
+            ? `Unable to load flow details (${response.status}): ${rawText.slice(0, 180)}`
+            : "Unable to load flow details."),
         type: "error"
       });
       return;
@@ -572,14 +668,22 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonResponse<{
         ok?: boolean;
         message?: string;
         warning?: string;
         branch?: { id: string };
-      };
-      if (!response.ok || !payload.ok) {
-        notify({ title: "Action Failed", message: payload.message ?? "Request failed.", type: "error" });
+      }>(response);
+      if (!response.ok || !payload?.ok) {
+        notify({
+          title: "Action Failed",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Request failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Request failed."),
+          type: "error"
+        });
         return;
       }
       notify({
@@ -714,12 +818,33 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                             ? `${runtime.logicalRole} | ${runtime.logicalAgentId?.slice(0, 8) ?? "logical"}`
                             : null;
                           return (
-                            <div key={task.id} className="flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2">
+                            <div key={task.id} className="rounded-xl border border-white/10 bg-black/30 px-3 py-2">
+                              <div className="flex flex-wrap items-center gap-2">
                               <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase ${badgeClass(task.status)}`}>{task.status}</span>
                               <span className="text-xs text-slate-200">{runtimeLabel ?? (task.agent ? `${task.agent.name} | ${task.agent.role}` : "Unassigned")}</span>
                               {runtime?.decisionType ? (
                                 <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-cyan-300">
                                   {runtime.decisionType}
+                                </span>
+                              ) : null}
+                              {runtime?.executionMode ? (
+                                <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-indigo-200">
+                                  {runtime.executionMode}
+                                </span>
+                              ) : null}
+                              {runtime?.parentAgentId ? (
+                                <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-violet-200">
+                                  Parent {shortId(runtime.parentAgentId)}
+                                </span>
+                              ) : null}
+                              {typeof runtime?.estimatedSelfCostUsd === "number" ? (
+                                <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-emerald-200">
+                                  Est Self {formatUsd(runtime.estimatedSelfCostUsd)}
+                                </span>
+                              ) : null}
+                              {typeof runtime?.budgetSnapshot?.remainingBudgetUsd === "number" ? (
+                                <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-200">
+                                  Rem {formatUsd(runtime.budgetSnapshot.remainingBudgetUsd)}
                                 </span>
                               ) : null}
                               <span className="text-xs text-slate-400">{task.prompt}</span>
@@ -752,6 +877,17 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                                   {actionKey === `rewind:${task.id}` ? <Loader2 size={12} className="animate-spin" /> : <GitBranchPlus size={12} />} Rewind & Fork Here
                                 </button>
                               )}
+                              </div>
+                              {runtime?.decisionReason ? (
+                                <p className="mt-1 text-[11px] text-slate-400">
+                                  Decision: {runtime.decisionReason}
+                                </p>
+                              ) : null}
+                              {task.humanInterventionReason ? (
+                                <p className="mt-1 text-[11px] text-amber-200">
+                                  Human Touch: {task.humanInterventionReason}
+                                </p>
+                              ) : null}
                             </div>
                           );
                         })}

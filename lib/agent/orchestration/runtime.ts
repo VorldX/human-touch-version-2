@@ -4,13 +4,19 @@ import {
   AgentDecisionType,
   AgentRole,
   AgentStatus,
-  OrgExecutionMode,
   PersonnelStatus,
   PersonnelType,
   Prisma
 } from "@prisma/client";
 
 import { prisma } from "@/lib/db/prisma";
+
+const ORG_EXECUTION_MODE_VALUES = ["ECO", "BALANCED", "TURBO"] as const;
+export type OrgExecutionModeValue = (typeof ORG_EXECUTION_MODE_VALUES)[number];
+
+function isOrgExecutionModeValue(value: string): value is OrgExecutionModeValue {
+  return ORG_EXECUTION_MODE_VALUES.includes(value as OrgExecutionModeValue);
+}
 
 function parseRoleFromText(value: string | null | undefined): AgentRole {
   const role = value?.toLowerCase() ?? "";
@@ -41,12 +47,66 @@ function personnelMatchesRole(role: AgentRole, value: string) {
   return !/\bmain\b|\bboss\b/.test(text);
 }
 
+function inferTaskSpecialtyHints(input: {
+  taskPrompt?: string;
+  requestedToolkits?: string[];
+}) {
+  const prompt = (input.taskPrompt ?? "").toLowerCase();
+  const toolkitHints = normalizeTools(input.requestedToolkits ?? []);
+  const hints = new Set<string>(toolkitHints);
+
+  if (/\b(marketing|campaign|growth|content|seo|social)\b/.test(prompt)) hints.add("marketing");
+  if (/\b(sales|prospect|pipeline|outreach|crm)\b/.test(prompt)) hints.add("sales");
+  if (/\b(support|helpdesk|ticket|customer)\b/.test(prompt)) hints.add("support");
+  if (/\b(email|gmail|inbox|mailbox)\b/.test(prompt)) hints.add("email");
+  if (/\b(meeting|calendar|schedule|zoom|meet|google meet)\b/.test(prompt)) hints.add("calendar");
+  if (/\b(engineering|developer|code|repo|github|deploy)\b/.test(prompt)) hints.add("engineering");
+  if (/\b(finance|invoice|billing|budget|expense)\b/.test(prompt)) hints.add("finance");
+
+  return [...hints];
+}
+
+function scoreCandidateSpecialtyMatch(input: {
+  candidateRole: string;
+  candidateName?: string | null;
+  candidateExpertise?: string | null;
+  specialtyHints: string[];
+}) {
+  if (input.specialtyHints.length === 0) return 0;
+  const text = `${input.candidateRole} ${input.candidateName ?? ""} ${input.candidateExpertise ?? ""}`.toLowerCase();
+  let score = 0;
+  for (const hint of input.specialtyHints) {
+    const mappedHints =
+      hint === "googlemeet"
+        ? ["googlemeet", "meet", "meeting"]
+        : hint === "googlecalendar"
+          ? ["googlecalendar", "calendar", "scheduling"]
+          : hint === "gmail"
+            ? ["gmail", "email", "mail"]
+            : [hint];
+    if (mappedHints.some((value) => text.includes(value))) {
+      score += 1;
+    }
+  }
+  return score;
+}
+
 export async function resolveOrgExecutionMode(orgId: string) {
-  const org = await prisma.organization.findUnique({
-    where: { id: orgId },
-    select: { executionMode: true }
-  });
-  return org?.executionMode ?? OrgExecutionMode.BALANCED;
+  try {
+    const org = await prisma.organization.findUnique({
+      where: { id: orgId }
+    });
+    const candidate =
+      org && typeof (org as Record<string, unknown>).executionMode === "string"
+        ? ((org as Record<string, unknown>).executionMode as string).trim().toUpperCase()
+        : "";
+    if (isOrgExecutionModeValue(candidate)) {
+      return candidate;
+    }
+    return "BALANCED";
+  } catch {
+    return "BALANCED";
+  }
 }
 
 export async function ensureMainAgentProfile(input: {
@@ -223,7 +283,14 @@ export async function pickDelegationPersonnelCandidate(input: {
   orgId: string;
   role: AgentRole;
   excludePersonnelId?: string | null;
+  taskPrompt?: string;
+  requestedToolkits?: string[];
 }) {
+  const specialtyHints = inferTaskSpecialtyHints({
+    taskPrompt: input.taskPrompt,
+    requestedToolkits: input.requestedToolkits
+  });
+
   const candidates = await prisma.personnel.findMany({
     where: {
       orgId: input.orgId,
@@ -234,10 +301,31 @@ export async function pickDelegationPersonnelCandidate(input: {
     orderBy: [{ autonomyScore: "desc" }, { updatedAt: "desc" }],
     select: {
       id: true,
-      role: true
+      role: true,
+      name: true,
+      expertise: true
     },
     take: 25
   });
+
+  if (specialtyHints.length > 0) {
+    const roleMatchedCandidates = candidates
+      .filter((candidate) => personnelMatchesRole(input.role, candidate.role))
+      .map((candidate) => ({
+        id: candidate.id,
+        score: scoreCandidateSpecialtyMatch({
+          candidateRole: candidate.role,
+          candidateName: candidate.name,
+          candidateExpertise: candidate.expertise,
+          specialtyHints
+        })
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (roleMatchedCandidates[0] && roleMatchedCandidates[0].score > 0) {
+      return roleMatchedCandidates[0].id;
+    }
+  }
 
   const matched = candidates.find((candidate) => personnelMatchesRole(input.role, candidate.role));
   if (matched) {
@@ -261,11 +349,19 @@ export async function createChildAgent(input: {
   role: AgentRole;
   goal: string;
   allowedTools: string[];
+  specialty?: string | null;
+  criticalRules?: string[];
   budgetScope: {
     maxUsd: number;
   };
-  executionMode: OrgExecutionMode;
+  executionMode: OrgExecutionModeValue;
 }) {
+  const constraints = [
+    "Child agent must stay within inherited budget and permissions.",
+    "Request human approval when policy, tools, or confidence blocks execution.",
+    ...((input.criticalRules ?? []).map((rule) => rule.trim()).filter(Boolean))
+  ];
+
   return prisma.agent.create({
     data: {
       orgId: input.orgId,
@@ -284,10 +380,8 @@ export async function createChildAgent(input: {
       } as Prisma.InputJsonValue,
       instructions: {
         role: input.role,
-        constraints: [
-          "Child agent must stay within inherited budget and permissions.",
-          "Request human approval when policy, tools, or confidence blocks execution."
-        ]
+        specialty: input.specialty ?? undefined,
+        constraints: [...new Set(constraints)]
       } as Prisma.InputJsonValue
     }
   });
@@ -304,7 +398,7 @@ export async function createAgentRun(input: {
   contextPack: Prisma.InputJsonValue;
   decisionType: AgentDecisionType;
   decisionReason: string;
-  executionMode: OrgExecutionMode;
+  executionMode: OrgExecutionModeValue;
   budgetBefore: number;
   estimatedCostUsd: number;
 }) {

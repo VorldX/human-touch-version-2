@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import {
   FlowStatus,
   LogType,
@@ -14,7 +16,10 @@ import {
   recordPassivePolicy,
   recordPassiveSpend
 } from "@/lib/enterprise/passive";
-import { ensureMainAgentProfile } from "@/lib/agent/orchestration/runtime";
+import {
+  ensureMainAgentProfile,
+  resolveOrgExecutionMode
+} from "@/lib/agent/orchestration/runtime";
 import { linkFlowToDirection, updateDirection } from "@/lib/direction/directions";
 import {
   composioAllowlistedToolkits,
@@ -118,6 +123,45 @@ function buildTaskPlan(prompt: string, swarmDensity: number) {
       return `Execution step ${index + 1}: ${step} | ${formatToolkitMarker(stepToolkits)}`;
     })
   ];
+}
+
+function inferTaskSpecialtyHints(prompt: string) {
+  const lower = prompt.toLowerCase();
+  const hints = new Set<string>();
+
+  if (/\b(marketing|campaign|content|growth|seo|social)\b/.test(lower)) hints.add("marketing");
+  if (/\b(sales|prospect|crm|pipeline|outreach)\b/.test(lower)) hints.add("sales");
+  if (/\b(support|helpdesk|ticket|customer)\b/.test(lower)) hints.add("support");
+  if (/\b(email|gmail|inbox|mail)\b/.test(lower)) hints.add("email");
+  if (/\b(meeting|calendar|schedule|zoom|google meet|gmeet)\b/.test(lower)) hints.add("calendar");
+  if (/\b(engineering|developer|code|repo|github|deploy)\b/.test(lower)) hints.add("engineering");
+  if (/\b(finance|invoice|billing|budget|expense)\b/.test(lower)) hints.add("finance");
+
+  for (const toolkit of inferRequestedToolkits(prompt)) {
+    hints.add(toolkit);
+  }
+
+  return [...hints];
+}
+
+function scoreAgentSpecialty(agent: { role: string; name?: string | null; expertise?: string | null }, hints: string[]) {
+  if (hints.length === 0) return 0;
+  const text = `${agent.role} ${agent.name ?? ""} ${agent.expertise ?? ""}`.toLowerCase();
+  let score = 0;
+  for (const hint of hints) {
+    const mapped =
+      hint === "googlemeet"
+        ? ["googlemeet", "meet", "meeting"]
+        : hint === "googlecalendar"
+          ? ["googlecalendar", "calendar", "schedule"]
+          : hint === "gmail"
+            ? ["gmail", "email", "mail"]
+            : [hint];
+    if (mapped.some((item) => text.includes(item))) {
+      score += 1;
+    }
+  }
+  return score;
 }
 
 export async function GET(request: NextRequest) {
@@ -264,7 +308,7 @@ export async function POST(request: NextRequest) {
   try {
     const org = await prisma.organization.findUnique({
       where: { id: orgId },
-      select: { id: true, monthlyBtuCap: true, executionMode: true }
+      select: { id: true, monthlyBtuCap: true }
     });
 
     if (!org) {
@@ -276,6 +320,7 @@ export async function POST(request: NextRequest) {
         { status: 404 }
       );
     }
+    const orgExecutionMode = await resolveOrgExecutionMode(orgId);
 
     const activeAgents = await prisma.personnel.findMany({
       where: {
@@ -288,7 +333,9 @@ export async function POST(request: NextRequest) {
       orderBy: [{ autonomyScore: "desc" }, { updatedAt: "desc" }],
       select: {
         id: true,
-        role: true
+        role: true,
+        name: true,
+        expertise: true
       }
     });
 
@@ -329,9 +376,29 @@ export async function POST(request: NextRequest) {
       });
 
       for (let index = 0; index < taskPrompts.length; index += 1) {
-        const assignedAgent =
-          assignmentPool.length > 0 ? assignmentPool[index % assignmentPool.length] : null;
         const stepPrompt = taskPrompts[index];
+        const specialtyHints = inferTaskSpecialtyHints(stepPrompt);
+        const specialistPool =
+          mainAgent && index > 0
+            ? activeAgents.filter((agent) => agent.id !== mainAgent.id)
+            : activeAgents;
+        const specialistCandidate =
+          specialtyHints.length > 0
+            ? specialistPool
+                .map((agent) => ({
+                  agent,
+                  score: scoreAgentSpecialty(agent, specialtyHints)
+                }))
+                .sort((a, b) => b.score - a.score)[0]
+            : null;
+        const assignedAgent =
+          index === 0
+            ? mainAgent
+            : (specialistCandidate && specialistCandidate.score > 0
+                ? specialistCandidate.agent
+                : assignmentPool.length > 0
+                  ? assignmentPool[index % assignmentPool.length]
+                  : null);
         const taskRequestedToolkits = [
           ...new Set([...requestedToolkits, ...inferRequestedToolkits(stepPrompt)])
         ];
@@ -485,7 +552,7 @@ export async function POST(request: NextRequest) {
       requestedToolkits,
       initiatedByUserId,
       executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-      orgExecutionMode: org.executionMode
+      orgExecutionMode
     });
 
     let localKickWarning: string | undefined;
@@ -510,7 +577,7 @@ export async function POST(request: NextRequest) {
               requestedToolkits,
               initiatedByUserId,
               executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-              orgExecutionMode: org.executionMode
+              orgExecutionMode
             }
           }
         ]),
@@ -580,7 +647,7 @@ export async function POST(request: NextRequest) {
           ...(fallbackPlanId ? { fallbackPlanId } : {}),
           taskCount: taskPrompts.length,
           executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-          orgExecutionMode: org.executionMode
+          orgExecutionMode
         },
         warning: [publish.ok ? undefined : publish.message, localKickWarning]
           .filter(Boolean)

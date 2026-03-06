@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { MemoryTier } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 

@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Bot, Building2, Dna, Loader2, RefreshCw, Users } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type Scope = "ORGANIZATION" | "EMPLOYEE" | "AGENT";
@@ -122,30 +123,45 @@ export function DnaMemoryPanel({ orgId }: DnaMemoryPanelProps) {
           fetch(`/api/storage/assets?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
           fetch(`/api/squad/personnel?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" })
         ]);
-        const profilePayload = (await profileResponse.json()) as {
+        const { payload: profilePayload, rawText: profileRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           profiles?: DnaProfile[];
-        };
-        const assetPayload = (await assetResponse.json()) as {
+        }>(profileResponse);
+        const { payload: assetPayload, rawText: assetRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           assets?: StorageAsset[];
-        };
-        const personnelPayload = (await personnelResponse.json()) as {
+        }>(assetResponse);
+        const { payload: personnelPayload, rawText: personnelRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           personnel?: PersonnelItem[];
-        };
+        }>(personnelResponse);
 
-        if (!profileResponse.ok || !profilePayload.ok || !profilePayload.profiles) {
-          throw new Error(profilePayload.message ?? "Failed loading DNA profiles.");
+        if (!profileResponse.ok || !profilePayload?.ok || !profilePayload.profiles) {
+          throw new Error(
+            profilePayload?.message ??
+              (profileRawText
+                ? `Failed loading DNA profiles (${profileResponse.status}): ${profileRawText.slice(0, 180)}`
+                : "Failed loading DNA profiles.")
+          );
         }
-        if (!assetResponse.ok || !assetPayload.ok || !assetPayload.assets) {
-          throw new Error(assetPayload.message ?? "Failed loading storage assets.");
+        if (!assetResponse.ok || !assetPayload?.ok || !assetPayload.assets) {
+          throw new Error(
+            assetPayload?.message ??
+              (assetRawText
+                ? `Failed loading storage assets (${assetResponse.status}): ${assetRawText.slice(0, 180)}`
+                : "Failed loading storage assets.")
+          );
         }
-        if (!personnelResponse.ok || !personnelPayload.ok || !personnelPayload.personnel) {
-          throw new Error(personnelPayload.message ?? "Failed loading personnel.");
+        if (!personnelResponse.ok || !personnelPayload?.ok || !personnelPayload.personnel) {
+          throw new Error(
+            personnelPayload?.message ??
+              (personnelRawText
+                ? `Failed loading personnel (${personnelResponse.status}): ${personnelRawText.slice(0, 180)}`
+                : "Failed loading personnel.")
+          );
         }
 
         setProfiles(profilePayload.profiles);
@@ -228,9 +244,16 @@ export function DnaMemoryPanel({ orgId }: DnaMemoryPanelProps) {
             sourceAssetIds: selectedAssetIds
           })
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed building DNA profile.");
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed building DNA profile (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed building DNA profile.")
+          );
         }
         notify({
           title: "DNA Memory",
@@ -424,4 +447,3 @@ export function DnaMemoryPanel({ orgId }: DnaMemoryPanelProps) {
     </div>
   );
 }
-

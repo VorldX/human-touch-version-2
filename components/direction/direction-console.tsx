@@ -6,6 +6,7 @@ import type { Edge, Node } from "reactflow";
 
 import { AutopsyBlueprint } from "@/components/autopsy/autopsy-blueprint";
 import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type DirectionStatus = "DRAFT" | "ACTIVE" | "ARCHIVED";
@@ -244,20 +245,26 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         const response = await fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           directions?: DirectionRecord[];
           message?: string;
-        };
-        if (!response.ok || !payload.ok || !payload.directions) {
-          throw new Error(payload.message ?? "Failed loading directions.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload?.directions) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading directions (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading directions.")
+          );
         }
-        setDirections(payload.directions);
+        const loadedDirections = payload.directions;
+        setDirections(loadedDirections);
         const hasSelected = Boolean(
-          selectedDirectionId && payload.directions.some((item) => item.id === selectedDirectionId)
+          selectedDirectionId && loadedDirections.some((item) => item.id === selectedDirectionId)
         );
         if (!hasSelected) {
-          setSelectedDirectionId(payload.directions[0]?.id ?? null);
+          setSelectedDirectionId(loadedDirections[0]?.id ?? null);
         }
       } catch (error) {
         notify({
@@ -287,28 +294,50 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         })
       ]);
 
-      const linkPayload = (await linkResponse.json()) as {
+      const { payload: linkPayload, rawText: linkRawText } = await parseJsonResponse<{
         ok?: boolean;
+        message?: string;
         links?: DirectionLink[];
-      };
-      const workflowPayload = (await workflowResponse.json()) as {
+      }>(linkResponse);
+      const { payload: workflowPayload, rawText: workflowRawText } = await parseJsonResponse<{
         ok?: boolean;
+        message?: string;
         workflows?: WorkflowRecord[];
-      };
-      const autopsyPayload = (await autopsyResponse.json()) as {
+      }>(workflowResponse);
+      const { payload: autopsyPayload, rawText: autopsyRawText } = await parseJsonResponse<{
         ok?: boolean;
+        message?: string;
         autopsy?: DirectionAutopsy;
-      };
+      }>(autopsyResponse);
 
-      if (!linkResponse.ok || !linkPayload.ok) throw new Error("Failed loading links.");
-      if (!workflowResponse.ok || !workflowPayload.ok) throw new Error("Failed loading workflows.");
-      if (!autopsyResponse.ok || !autopsyPayload.ok || !autopsyPayload.autopsy) {
-        throw new Error("Failed loading autopsy.");
+      if (!linkResponse.ok || !linkPayload?.ok) {
+        throw new Error(
+          linkPayload?.message ??
+            (linkRawText
+              ? `Failed loading links (${linkResponse.status}): ${linkRawText.slice(0, 180)}`
+              : "Failed loading links.")
+        );
+      }
+      if (!workflowResponse.ok || !workflowPayload?.ok) {
+        throw new Error(
+          workflowPayload?.message ??
+            (workflowRawText
+              ? `Failed loading workflows (${workflowResponse.status}): ${workflowRawText.slice(0, 180)}`
+              : "Failed loading workflows.")
+        );
+      }
+      if (!autopsyResponse.ok || !autopsyPayload?.ok || !autopsyPayload.autopsy) {
+        throw new Error(
+          autopsyPayload?.message ??
+            (autopsyRawText
+              ? `Failed loading autopsy (${autopsyResponse.status}): ${autopsyRawText.slice(0, 180)}`
+              : "Failed loading autopsy.")
+        );
       }
 
-      setLinks(linkPayload.links ?? []);
-      setWorkflows(workflowPayload.workflows ?? []);
-      setAutopsy(autopsyPayload.autopsy);
+      setLinks(linkPayload?.links ?? []);
+      setWorkflows(workflowPayload?.workflows ?? []);
+      setAutopsy(autopsyPayload?.autopsy ?? null);
     },
     [orgId]
   );
@@ -347,9 +376,21 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
           ownerEmail: user?.email ?? null
         })
       });
-      const payload = (await response.json()) as { ok?: boolean; direction?: DirectionRecord; message?: string };
-      if (!response.ok || !payload.ok || !payload.direction) {
-        notify({ title: "Direction", message: payload.message ?? "Create failed.", type: "error" });
+      const { payload, rawText } = await parseJsonResponse<{
+        ok?: boolean;
+        direction?: DirectionRecord;
+        message?: string;
+      }>(response);
+      if (!response.ok || !payload?.ok || !payload?.direction) {
+        notify({
+          title: "Direction",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Create failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Create failed."),
+          type: "error"
+        });
         return;
       }
       setSelectedDirectionId(payload.direction.id);
@@ -372,9 +413,17 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         status: statusDraft
       })
     });
-    const payload = (await response.json()) as { ok?: boolean; message?: string };
-    if (!response.ok || !payload.ok) {
-      notify({ title: "Direction", message: payload.message ?? "Save failed.", type: "error" });
+    const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+    if (!response.ok || !payload?.ok) {
+      notify({
+        title: "Direction",
+        message:
+          payload?.message ??
+          (rawText
+            ? `Save failed (${response.status}): ${rawText.slice(0, 180)}`
+            : "Save failed."),
+        type: "error"
+      });
       return;
     }
     await loadDirections(true);
@@ -392,9 +441,17 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         relation: linkRelation
       })
     });
-    const payload = (await response.json()) as { ok?: boolean; message?: string };
-    if (!response.ok || !payload.ok) {
-      notify({ title: "Direction Link", message: payload.message ?? "Link failed.", type: "error" });
+    const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+    if (!response.ok || !payload?.ok) {
+      notify({
+        title: "Direction Link",
+        message:
+          payload?.message ??
+          (rawText
+            ? `Link failed (${response.status}): ${rawText.slice(0, 180)}`
+            : "Link failed."),
+        type: "error"
+      });
       return;
     }
     setLinkTargetId("");
@@ -422,9 +479,17 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         ...(user?.email ? { userEmail: user.email } : {})
       })
     });
-    const payload = (await response.json()) as { ok?: boolean; message?: string };
-    if (!response.ok || !payload.ok) {
-      notify({ title: "Direction", message: payload.message ?? "Launch failed.", type: "error" });
+    const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(response);
+    if (!response.ok || !payload?.ok) {
+      notify({
+        title: "Direction",
+        message:
+          payload?.message ??
+          (rawText
+            ? `Launch failed (${response.status}): ${rawText.slice(0, 180)}`
+            : "Launch failed."),
+        type: "error"
+      });
       return;
     }
     await loadDirectionDetail(selectedDirection.id);

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { NextResponse } from "next/server";
 
 import { SESSION_COOKIE_NAME } from "@/lib/security/session";

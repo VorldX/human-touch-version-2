@@ -13,6 +13,7 @@ import {
   X
 } from "lucide-react";
 
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type FlowStatus = "DRAFT" | "QUEUED" | "ACTIVE" | "PAUSED" | "COMPLETED" | "ABORTED" | "FAILED";
@@ -151,7 +152,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
           })
         ]);
 
-        const ledgerPayload = (await ledgerResponse.json()) as {
+        const { payload: ledgerPayload, rawText: ledgerRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           metrics?: LedgerMetrics;
@@ -159,20 +160,30 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
             machine?: LedgerStreamEntry[];
             carbon?: LedgerStreamEntry[];
           };
-        };
+        }>(ledgerResponse);
 
-        const flowPayload = (await flowsResponse.json()) as {
+        const { payload: flowPayload, rawText: flowsRawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           flows?: FlowListItem[];
-        };
+        }>(flowsResponse);
 
-        if (!ledgerResponse.ok || !ledgerPayload.ok) {
-          setError(ledgerPayload.message ?? "Failed to load memory ledger.");
+        if (!ledgerResponse.ok || !ledgerPayload?.ok) {
+          setError(
+            ledgerPayload?.message ??
+              (ledgerRawText
+                ? `Failed to load memory ledger (${ledgerResponse.status}): ${ledgerRawText.slice(0, 180)}`
+                : "Failed to load memory ledger.")
+          );
           return;
         }
-        if (!flowsResponse.ok || !flowPayload.ok) {
-          setError(flowPayload.message ?? "Failed to load archived workflows.");
+        if (!flowsResponse.ok || !flowPayload?.ok) {
+          setError(
+            flowPayload?.message ??
+              (flowsRawText
+                ? `Failed to load archived workflows (${flowsResponse.status}): ${flowsRawText.slice(0, 180)}`
+                : "Failed to load archived workflows.")
+          );
           return;
         }
 
@@ -217,17 +228,21 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
       setAuditLoadingId(flowId);
       try {
         const response = await fetch(`/api/flows/${flowId}`, { cache: "no-store" });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           flow?: FlowDetail;
           logs?: FlowLog[];
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.flow) {
+        if (!response.ok || !payload?.ok || !payload.flow) {
           notify({
             title: "Audit Ledger",
-            message: payload.message ?? "Unable to open audit ledger.",
+            message:
+              payload?.message ??
+              (rawText
+                ? `Unable to open audit ledger (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to open audit ledger."),
             type: "error"
           });
           return;

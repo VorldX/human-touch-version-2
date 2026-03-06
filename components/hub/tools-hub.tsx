@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Loader2, PlugZap, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 
 import { IntegrationsConsole } from "@/components/settings/integrations-console";
+import { parseJsonResponse } from "@/lib/http/json-response";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type ToolName = "GOOGLE_DRIVE" | "S3_COMPATIBLE" | "MANAGED_VAULT";
@@ -72,19 +73,24 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
         const response = await fetch(`/api/storage/tools?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           tools?: StorageTool[];
           connectors?: StorageConnector[];
           grants?: ToolGrant[];
-        };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed loading organization tools.");
+        }>(response);
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading organization tools (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading organization tools.")
+          );
         }
-        setTools(payload.tools ?? []);
-        setConnectors(payload.connectors ?? []);
-        setGrants(payload.grants ?? []);
+        setTools(payload?.tools ?? []);
+        setConnectors(payload?.connectors ?? []);
+        setGrants(payload?.grants ?? []);
       } catch (error) {
         notify({
           title: "Tools",
@@ -124,9 +130,16 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
             credential: connectorCredential.trim() || null
           })
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Connector creation failed.");
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Connector creation failed (${response.status}): ${rawText.slice(0, 180)}`
+                : "Connector creation failed.")
+          );
         }
         setConnectorAccountHint("");
         setConnectorCredential("");
@@ -163,9 +176,16 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
               .filter(Boolean)
           })
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Grant creation failed.");
+        const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Grant creation failed (${response.status}): ${rawText.slice(0, 180)}`
+                : "Grant creation failed.")
+          );
         }
         setGrantPrincipalId("");
         await loadTools(true);
@@ -188,11 +208,17 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
         `/api/storage/tools?orgId=${encodeURIComponent(orgId)}&grantId=${encodeURIComponent(grantId)}`,
         { method: "DELETE" }
       );
-      const payload = (await response.json()) as { ok?: boolean; message?: string };
-      if (!response.ok || !payload.ok) {
+      const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+        response
+      );
+      if (!response.ok || !payload?.ok) {
         notify({
           title: "Tools",
-          message: payload.message ?? "Delete grant failed.",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Delete grant failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Delete grant failed."),
           type: "error"
         });
         return;

@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { HubFileType, TaskStatus } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
