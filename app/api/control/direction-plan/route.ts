@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { LogType, PersonnelStatus } from "@prisma/client";
+import { LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
@@ -41,6 +41,25 @@ interface PermissionHint {
   reason: string;
   workflowTitle: string;
   taskTitle: string;
+}
+
+interface AutoSquadTemplate {
+  role: string;
+  name: string;
+  expertise: string;
+  autonomyScore: number;
+}
+
+interface AutoSquadResult {
+  triggered: boolean;
+  reason?: string;
+  domain?: string;
+  requestedRoles: string[];
+  created: Array<{
+    id: string;
+    name: string;
+    role: string;
+  }>;
 }
 
 interface ModelPlanResponse {
@@ -242,6 +261,111 @@ function titleFromDirection(direction: string) {
   return words.length > 96 ? `${words.slice(0, 93)}...` : words;
 }
 
+function normalizeToolkitName(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, "-");
+}
+
+function collectPlanToolkits(plan: ExecutionPlan) {
+  const unique = new Set<string>();
+  for (const workflow of plan.workflows) {
+    for (const task of workflow.tasks) {
+      for (const tool of task.tools) {
+        const normalized = normalizeToolkitName(tool);
+        if (normalized) {
+          unique.add(normalized);
+        }
+      }
+    }
+  }
+  return [...unique];
+}
+
+function inferAutoSquadTemplates(input: {
+  direction: string;
+  humanPlan: string;
+  history: Array<{ role: string; content: string }>;
+}): { triggered: boolean; reason: string; domain: string; templates: AutoSquadTemplate[] } {
+  const ownerHistory = input.history
+    .filter((entry) => entry.role === "owner")
+    .map((entry) => entry.content)
+    .join("\n");
+  const combined = `${input.direction}\n${input.humanPlan}\n${ownerHistory}`.toLowerCase();
+
+  const hasAgentLikeIntent =
+    /\b(ai|a\.i\.|agent|agents|agnt|agnets|age?nts?|agebnts?)\b/.test(combined) ||
+    /\b(automation|automate|autonomous)\b/.test(combined);
+  const looksLikeHumanHiringOnly =
+    /\b(hire|recruit|interview|headcount)\b/.test(combined) && !hasAgentLikeIntent;
+  const wantsTeam =
+    !looksLikeHumanHiringOnly &&
+    /\b(create|build|form|assemble|set up|setup|make|start|launch)\b/.test(combined) &&
+    /\b(team|squad)\b/.test(combined) &&
+    hasAgentLikeIntent;
+
+  if (!wantsTeam) {
+    return {
+      triggered: false,
+      reason: "No explicit team-creation intent detected.",
+      domain: "general",
+      templates: []
+    };
+  }
+
+  if (/\b(marketing|campaign|growth|content|social|seo)\b/.test(combined)) {
+    return {
+      triggered: true,
+      reason: "Marketing team intent detected.",
+      domain: "marketing",
+      templates: [
+        {
+          role: "Marketing Strategist Agent",
+          name: "Marketing Strategist Agent",
+          expertise: "Campaign strategy, audience segmentation, go-to-market planning.",
+          autonomyScore: 0.72
+        },
+        {
+          role: "Content Strategy Agent",
+          name: "Content Strategy Agent",
+          expertise: "Content planning, copywriting, editorial operations.",
+          autonomyScore: 0.68
+        },
+        {
+          role: "Campaign Automation Agent",
+          name: "Campaign Automation Agent",
+          expertise: "Workflow automation, outreach sequencing, lifecycle campaigns.",
+          autonomyScore: 0.7
+        },
+        {
+          role: "Lead Research Agent",
+          name: "Lead Research Agent",
+          expertise: "Lead intelligence, account research, qualification signals.",
+          autonomyScore: 0.66
+        }
+      ]
+    };
+  }
+
+  return {
+    triggered: true,
+    reason: "General team intent detected.",
+    domain: "general",
+    templates: [
+      {
+        role: "Manager Agent",
+        name: "Manager Agent",
+        expertise: "Mission decomposition, dependency tracking, delegation control.",
+        autonomyScore: 0.7
+      },
+      {
+        role: "Execution Worker Agent",
+        name: "Execution Worker Agent",
+        expertise: "Task execution, artifact generation, completion reporting.",
+        autonomyScore: 0.62
+      }
+    ]
+  };
+}
+
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as
     | {
@@ -276,19 +400,20 @@ export async function POST(request: NextRequest) {
     return access.response;
   }
 
-  const org = await prisma.organization.findUnique({
-    where: { id: orgId },
-    select: { id: true, name: true }
-  });
-  if (!org) {
-    return NextResponse.json(
-      {
-        ok: false,
-        message: "Organization not found."
-      },
-      { status: 404 }
-    );
-  }
+  try {
+    const org = await prisma.organization.findUnique({
+      where: { id: orgId },
+      select: { id: true, name: true }
+    });
+    if (!org) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: "Organization not found."
+        },
+        { status: 404 }
+      );
+    }
 
   const [mainAgent, personnel] = await Promise.all([
     prisma.personnel.findFirst({
@@ -454,7 +579,9 @@ export async function POST(request: NextRequest) {
       : {}),
     systemPromptOverride: [
       `You are the Main Agent planner for organization ${org.name}.`,
-      "Produce complete, auditable implementation plans with realistic dependency and approval mapping."
+      "Produce complete, auditable implementation plans with realistic dependency and approval mapping.",
+      "Do not fabricate capabilities, tool availability, approvals, or execution outcomes.",
+      "When required information is missing, mark explicit assumptions and risk notes."
     ].join("\n"),
     userPromptOverride: modelPrompt
   });
@@ -470,6 +597,17 @@ export async function POST(request: NextRequest) {
   }
 
   const parsed = parseModelPlan(execution.outputText, direction);
+  const requiredToolkits = [
+    ...new Set([
+      ...collectPlanToolkits(parsed.primaryPlan),
+      ...collectPlanToolkits(parsed.fallbackPlan)
+    ])
+  ];
+  const autoSquadInference = inferAutoSquadTemplates({
+    direction,
+    humanPlan,
+    history
+  });
   const permissionItemsFromPlans: PermissionHint[] = [];
 
   for (const workflow of parsed.primaryPlan.workflows) {
@@ -517,6 +655,69 @@ export async function POST(request: NextRequest) {
   const directionTitle = titleFromDirection(directionGiven);
 
   const persisted = await prisma.$transaction(async (tx) => {
+    const autoSquadResult: AutoSquadResult = {
+      triggered: autoSquadInference.triggered,
+      reason: autoSquadInference.reason,
+      domain: autoSquadInference.domain,
+      requestedRoles: autoSquadInference.templates.map((item) => item.role),
+      created: []
+    };
+
+    if (autoSquadInference.triggered && autoSquadInference.templates.length > 0) {
+      const existingAiRoles = await tx.personnel.findMany({
+        where: {
+          orgId,
+          type: PersonnelType.AI
+        },
+        select: {
+          id: true,
+          role: true
+        }
+      });
+      const existingRoleSet = new Set(
+        existingAiRoles.map((item) => item.role.trim().toLowerCase()).filter(Boolean)
+      );
+
+      for (const template of autoSquadInference.templates) {
+        const roleKey = template.role.trim().toLowerCase();
+        if (!roleKey || existingRoleSet.has(roleKey)) {
+          continue;
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        const created = await tx.personnel.create({
+          data: {
+            orgId,
+            type: PersonnelType.AI,
+            name: template.name,
+            role: template.role,
+            expertise: template.expertise,
+            autonomyScore: template.autonomyScore,
+            status: PersonnelStatus.IDLE
+          },
+          select: {
+            id: true,
+            name: true,
+            role: true
+          }
+        });
+
+        autoSquadResult.created.push(created);
+        existingRoleSet.add(roleKey);
+      }
+
+      if (autoSquadResult.created.length > 0) {
+        await tx.log.create({
+          data: {
+            orgId,
+            type: LogType.SYS,
+            actor: "MAIN_AGENT_ORCHESTRATOR",
+            message: `Auto-squad bootstrap created ${autoSquadResult.created.length} AI personnel from planning intent (${autoSquadResult.domain}).`
+          }
+        });
+      }
+    }
+
     const directionRecord = await createDirection(
       orgId,
       {
@@ -567,34 +768,48 @@ export async function POST(request: NextRequest) {
         orgId,
         type: LogType.USER,
         actor: "CONTROL",
-        message: `Direction plans generated by ${access.actor.email}. direction=${directionRecord.id}, plan=${planRecord.id}, permissionRequests=${permissionRequests.length}.`
+        message: `Direction plans generated by ${access.actor.email}. direction=${directionRecord.id}, plan=${planRecord.id}, permissionRequests=${permissionRequests.length}, requiredToolkits=${requiredToolkits.length}.`
       }
     });
 
     return {
       directionRecord,
       planRecord,
-      permissionRequests
+      permissionRequests,
+      autoSquadResult
     };
   });
 
-  return NextResponse.json({
-    ok: true,
-    analysis: parsed.analysis,
-    directionGiven,
-    primaryPlan: parsed.primaryPlan,
-    fallbackPlan: parsed.fallbackPlan,
-    permissions: dedupedPermissions,
-    permissionRequests: persisted.permissionRequests,
-    requestCount: persisted.permissionRequests.length,
-    directionRecord: persisted.directionRecord,
-    planRecord: persisted.planRecord,
-    model: {
-      provider: execution.usedProvider ?? null,
-      name: execution.usedModel ?? null,
-      source: execution.apiSource ?? null
-    },
-    tokenUsage: execution.tokenUsage ?? null,
-    billing: execution.billing ?? null
-  });
+    return NextResponse.json({
+      ok: true,
+      analysis: parsed.analysis,
+      directionGiven,
+      primaryPlan: parsed.primaryPlan,
+      fallbackPlan: parsed.fallbackPlan,
+      permissions: dedupedPermissions,
+      permissionRequests: persisted.permissionRequests,
+      requestCount: persisted.permissionRequests.length,
+      requiredToolkits,
+      autoSquad: persisted.autoSquadResult,
+      directionRecord: persisted.directionRecord,
+      planRecord: persisted.planRecord,
+      model: {
+        provider: execution.usedProvider ?? null,
+        name: execution.usedModel ?? null,
+        source: execution.apiSource ?? null
+      },
+      tokenUsage: execution.tokenUsage ?? null,
+      billing: execution.billing ?? null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed generating plans.";
+    console.error("[api/control/direction-plan] unexpected error", error);
+    return NextResponse.json(
+      {
+        ok: false,
+        message
+      },
+      { status: 500 }
+    );
+  }
 }

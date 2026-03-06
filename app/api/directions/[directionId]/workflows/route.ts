@@ -5,6 +5,7 @@ import {
   getDirection,
   listDirectionFlowLinksByDirection
 } from "@/lib/direction/directions";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface RouteContext {
   params: Promise<{
@@ -20,6 +21,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
       { ok: false, message: "orgId and directionId are required." },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const direction = await getDirection(orgId, directionId);
@@ -69,4 +75,3 @@ export async function GET(request: NextRequest, context: RouteContext) {
     links
   });
 }
-

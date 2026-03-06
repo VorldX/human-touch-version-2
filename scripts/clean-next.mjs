@@ -1,14 +1,17 @@
-import { readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
 
-const nextDir = ".next";
+const nextDir = resolve(process.cwd(), process.env.NEXT_DIST_DIR?.trim() || ".next");
 
 try {
-  const entries = readdirSync(nextDir);
-  for (const entry of entries) {
-    const target = join(nextDir, entry);
-    rmSync(target, { recursive: true, force: true });
+  if (existsSync(nextDir)) {
+    rmSync(nextDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 6,
+      retryDelay: 180
+    });
   }
 } catch {
-  // Ignore when .next doesn't exist yet.
+  // Ignore when the cache dir does not exist or is briefly locked by another process.
 }

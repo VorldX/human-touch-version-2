@@ -38,7 +38,7 @@ function fetchUrl(url){
     console.log('STDOUT=' + out.slice(-4000));
   } else {
     try{
-      const res = await fetchUrl(`http://localhost:${port}/app?tab=settings&settingsLane=integrations&composio=connected&toolkit=gmail`);
+      const res = await fetchUrl(`http://localhost:${port}/app?tab=hub&hubScope=TOOLS&composio=connected&toolkit=gmail`);
       console.log('STATUS=' + res.status);
       console.log('BODY=' + res.body.slice(0, 600).replace(/\n/g,' '));
     } catch(e){

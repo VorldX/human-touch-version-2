@@ -1,6 +1,8 @@
 "use server";
 
 import {
+  AgentRole,
+  AgentStatus,
   LogType,
   OAuthProvider,
   OrganizationTheme,
@@ -222,7 +224,7 @@ export async function completeOnboardingAction(
         assignedOAuthIds.push(linked.id);
       }
 
-      await tx.personnel.create({
+      const mainPersonnel = await tx.personnel.create({
         data: {
           orgId: org.id,
           type: PersonnelType.AI,
@@ -252,6 +254,23 @@ export async function completeOnboardingAction(
           isRented: false,
           status: PersonnelStatus.IDLE,
           assignedOAuthIds
+        }
+      });
+
+      await tx.agent.create({
+        data: {
+          orgId: org.id,
+          personnelId: mainPersonnel.id,
+          role: AgentRole.MAIN,
+          status: AgentStatus.ACTIVE,
+          name: mainPersonnel.name,
+          goal: "Orchestrate organization missions with budget-aware delegation and human touch safeguards.",
+          instructions: {
+            role: "Main Agent",
+            hierarchy: ["main", "manager", "worker"],
+            defaultMode: "BALANCED"
+          },
+          allowedTools: []
         }
       });
 

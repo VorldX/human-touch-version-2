@@ -7,6 +7,7 @@ import {
   listDirectionLinks,
   type DirectionRelation
 } from "@/lib/direction/directions";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface RouteContext {
   params: Promise<{
@@ -41,6 +42,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const links = await listDirectionLinks(orgId, directionId);
   return NextResponse.json({
     ok: true,
@@ -68,6 +74,11 @@ export async function POST(request: NextRequest, context: RouteContext) {
       { ok: false, message: "orgId, directionId, and toDirectionId are required." },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const org = await prisma.organization.findUnique({
@@ -115,6 +126,11 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const deleted = await deleteDirectionLink(orgId, directionId, toDirectionId);
   if (!deleted) {
     return NextResponse.json({ ok: false, message: "Link not found." }, { status: 404 });
@@ -124,4 +140,3 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     ok: true
   });
 }
-

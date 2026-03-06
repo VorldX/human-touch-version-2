@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 
 import {
+  AgentDecisionType,
+  AgentStatus,
   FlowStatus,
   HubFileType,
   LogType,
+  Personnel,
   PersonnelStatus,
   Prisma,
   SpendEventType,
@@ -12,6 +15,26 @@ import {
 import { NextRequest, NextResponse } from "next/server";
 
 import { createDeterministicEmbedding, toPgVectorLiteral } from "@/lib/ai/embeddings";
+import {
+  estimateDelegationOverheadUsd,
+  estimateTaskExecutionCostUsd,
+  getAgentBudgetSnapshot
+} from "@/lib/agent/orchestration/budget";
+import { inferUnverifiedExternalActionClaim } from "@/lib/agent/hallucination-guard";
+import { assessTaskComplexity } from "@/lib/agent/orchestration/complexity";
+import { buildAgentContextPack } from "@/lib/agent/orchestration/context-compiler";
+import { decideDelegation } from "@/lib/agent/orchestration/delegation-policy";
+import {
+  createAgentRun,
+  createApprovalCheckpoint,
+  createChildAgent,
+  finalizeAgentRun,
+  listReusableChildAgents,
+  pickDelegationPersonnelCandidate,
+  recordDelegation,
+  resolveOrCreateTaskAgentProfile,
+  resolveOrgExecutionMode
+} from "@/lib/agent/orchestration/runtime";
 import { executeSwarmAgent, type AgentContextBlock } from "@/lib/ai/swarm-runtime";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
 import { featureFlags } from "@/lib/config/feature-flags";
@@ -21,7 +44,11 @@ import { readLocalUploadByUrl, toPreviewText } from "@/lib/hub/storage";
 import { getToolsForAgent, inferRequestedToolkits } from "@/lib/integrations/composio/service";
 import { publishRealtimeEvent } from "@/lib/realtime/publish";
 import { createJoltProofStub } from "@/lib/security/crypto";
-import { buildInternalApiHeaders, resolveInternalApiKey } from "@/lib/security/internal-api";
+import {
+  buildInternalApiHeaders,
+  hasValidInternalApiKey,
+  resolveInternalApiKey
+} from "@/lib/security/internal-api";
 
 interface InboundEvent {
   name?: string;
@@ -35,6 +62,34 @@ interface EventHandleResult {
   error?: string;
   [key: string]: unknown;
 }
+
+type RuntimeAgentProfile = Pick<
+  Personnel,
+  | "id"
+  | "name"
+  | "role"
+  | "brainConfig"
+  | "fallbackBrainConfig"
+  | "brainKeyEnc"
+  | "brainKeyIv"
+  | "brainKeyAuthTag"
+  | "brainKeyKeyVer"
+  | "fallbackBrainKeyEnc"
+  | "fallbackBrainKeyIv"
+  | "fallbackBrainKeyAuthTag"
+  | "fallbackBrainKeyKeyVer"
+>;
+
+const ALLOWED_INTERNAL_EVENTS = new Set([
+  "vorldx/flow.launched",
+  "vorldx/flow.rewindForked",
+  "vorldx/task.paused",
+  "vorldx/task.resumed",
+  "vorldx/task.completed",
+  "vorldx/task.failed",
+  "vorldx/flow.progress",
+  "vorldx/dna.ingest"
+]);
 
 function asString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -53,6 +108,72 @@ function asRecord(value: unknown) {
 
 function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue;
+}
+
+function normalizeToolkitList(value: string[]) {
+  return [...new Set(value.map((item) => item.trim().toLowerCase()).filter(Boolean))];
+}
+
+function parseTaskStage(value: string) {
+  const upper = value.toUpperCase();
+  if (upper === "PLANNING") return "PLANNING" as const;
+  if (upper === "EXECUTION") return "EXECUTION" as const;
+  return "GENERAL" as const;
+}
+
+function parseAgentBudgetLimitUsd(scope: unknown): number | null {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+    return null;
+  }
+
+  const value = (scope as Record<string, unknown>).maxUsd;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, value);
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, parsed);
+    }
+  }
+  return null;
+}
+
+function resolveScopeViolations(input: {
+  agentName: string;
+  allowedTools: string[];
+  requestedToolkits: string[];
+  estimatedCostUsd: number;
+  budgetScope: unknown;
+}) {
+  const allowedTools = normalizeToolkitList(input.allowedTools);
+  const requestedToolkits = normalizeToolkitList(input.requestedToolkits);
+  const blockedToolkits =
+    allowedTools.length > 0
+      ? requestedToolkits.filter((toolkit) => !allowedTools.includes(toolkit))
+      : [];
+  const budgetLimit = parseAgentBudgetLimitUsd(input.budgetScope);
+  const exceedsBudget =
+    typeof budgetLimit === "number" ? input.estimatedCostUsd > budgetLimit + 0.0001 : false;
+
+  if (blockedToolkits.length > 0) {
+    return {
+      violation: `Agent scope blocked tools [${blockedToolkits.join(", ")}] for ${input.agentName}.`,
+      budgetLimitUsd: budgetLimit
+    };
+  }
+
+  if (exceedsBudget && typeof budgetLimit === "number") {
+    return {
+      violation: `Agent budget scope exceeded for ${input.agentName}: estimated ${input.estimatedCostUsd.toFixed(4)} USD > scope ${budgetLimit.toFixed(4)} USD.`,
+      budgetLimitUsd: budgetLimit
+    };
+  }
+
+  return {
+    violation: null,
+    budgetLimitUsd: budgetLimit
+  };
 }
 
 interface HubLockSnapshot {
@@ -347,6 +468,18 @@ interface AgentToolActionRequest {
   arguments: Record<string, unknown>;
 }
 
+interface ToolInferenceResult {
+  action: AgentToolActionRequest | null;
+  reason?: string;
+}
+
+interface AgentToolBindingSummary {
+  toolkit: string;
+  slug: string;
+  name: string;
+  description: string;
+}
+
 interface ToolActionExecutionSuccess {
   ok: true;
   toolkit: string;
@@ -372,18 +505,286 @@ interface ToolActionExecutionFailure {
 
 type ToolActionExecutionResult = ToolActionExecutionSuccess | ToolActionExecutionFailure;
 
-function inferAgentToolAction(prompt: string, requestedToolkits: string[]): AgentToolActionRequest | null {
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractFirstEmail(value: string) {
+  const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match?.[0]?.trim() ?? "";
+}
+
+function extractLabeledValue(prompt: string, labels: string[]) {
+  const labelsPattern = labels.map((label) => escapeRegex(label)).join("|");
+  const pattern = new RegExp(
+    `(?:\\*{1,2})?(?:${labelsPattern})(?:\\*{1,2})?\\s*[:\\-]\\s*(.+)`,
+    "i"
+  );
+  const line = prompt
+    .split(/\r?\n/g)
+    .map((item) => item.trim())
+    .find((item) => pattern.test(item));
+  if (!line) {
+    return "";
+  }
+
+  const match = line.match(pattern);
+  if (!match?.[1]) {
+    return "";
+  }
+
+  return match[1].trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+}
+
+function tokenizeToolText(value: string) {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 1);
+}
+
+function bindingTokenSet(binding: AgentToolBindingSummary) {
+  return new Set(tokenizeToolText(`${binding.slug} ${binding.name} ${binding.description}`));
+}
+
+function findBindingByKeywordSets(bindings: AgentToolBindingSummary[], keywordSets: string[][]) {
+  for (const keywords of keywordSets) {
+    const normalizedKeywords = keywords.map((item) => item.trim().toLowerCase()).filter(Boolean);
+    if (normalizedKeywords.length === 0) {
+      continue;
+    }
+    const found = bindings.find((binding) => {
+      const tokens = bindingTokenSet(binding);
+      return normalizedKeywords.every((keyword) => tokens.has(keyword));
+    });
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
+function extractDurationMinutes(prompt: string) {
+  const labeled = extractLabeledValue(prompt, ["duration", "length"]);
+  const candidate = labeled || prompt;
+  const match = candidate.match(/(\d{1,3})\s*(minutes?|mins?|hours?|hrs?)/i);
+  if (!match?.[1]) {
+    return null;
+  }
+
+  const amount = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+
+  const unit = (match[2] ?? "").toLowerCase();
+  if (unit.startsWith("hour") || unit.startsWith("hr")) {
+    return Math.min(8 * 60, amount * 60);
+  }
+  return Math.min(24 * 60, amount);
+}
+
+function buildZoomCreateArguments(prompt: string) {
+  const topic =
+    extractLabeledValue(prompt, ["topic", "title", "subject"]) ||
+    prompt.replace(/\s+/g, " ").trim().slice(0, 120);
+  const agenda = extractLabeledValue(prompt, ["agenda", "description", "details", "message"]);
+  const startTime = extractLabeledValue(prompt, ["start time", "start", "time", "date"]);
+  const timezone = extractLabeledValue(prompt, ["timezone", "time zone", "tz"]);
+  const duration = extractDurationMinutes(prompt);
+
+  return {
+    ...(topic ? { topic } : {}),
+    ...(agenda ? { agenda } : {}),
+    ...(startTime ? { start_time: startTime } : {}),
+    ...(timezone ? { timezone } : {}),
+    ...(duration ? { duration } : {})
+  };
+}
+
+function inferZoomToolAction(prompt: string, toolBindings: AgentToolBindingSummary[]) {
   const normalized = prompt.toLowerCase();
+  const zoomBindings = toolBindings.filter((binding) => binding.toolkit === "zoom");
+  if (zoomBindings.length === 0) {
+    return null;
+  }
+
+  const meetingContext = /\b(zoom|meeting|call|webinar)\b/.test(normalized);
+  if (!meetingContext) {
+    return null;
+  }
+
+  const createIntent = /\b(create|schedule|set up|setup|book|arrange|plan)\b/.test(normalized);
+  if (createIntent) {
+    const createBinding = findBindingByKeywordSets(zoomBindings, [
+      ["create", "meeting"],
+      ["schedule", "meeting"],
+      ["add", "meeting"],
+      ["create", "webinar"],
+      ["schedule", "webinar"]
+    ]);
+    if (createBinding) {
+      return {
+        toolkit: "zoom",
+        action: createBinding.slug.toUpperCase(),
+        arguments: buildZoomCreateArguments(prompt)
+      } satisfies AgentToolActionRequest;
+    }
+  }
+
+  const listIntent = /\b(list|get|show|fetch|check|view|upcoming|recent)\b/.test(normalized);
+  if (listIntent) {
+    const listBinding = findBindingByKeywordSets(zoomBindings, [
+      ["list", "meeting"],
+      ["get", "meeting"],
+      ["fetch", "meeting"],
+      ["upcoming", "meeting"],
+      ["list", "webinar"]
+    ]);
+    if (listBinding) {
+      return {
+        toolkit: "zoom",
+        action: listBinding.slug.toUpperCase(),
+        arguments: {}
+      } satisfies AgentToolActionRequest;
+    }
+  }
+
+  return null;
+}
+
+function inferReadOnlyGenericToolAction(
+  prompt: string,
+  requestedToolkits: string[],
+  toolBindings: AgentToolBindingSummary[]
+) {
+  const normalizedPrompt = prompt.toLowerCase();
+  const readIntent = /\b(list|get|show|fetch|find|search|check|read|view|lookup)\b/.test(
+    normalizedPrompt
+  );
+  if (!readIntent) {
+    return null;
+  }
+
+  const promptTokens = new Set(tokenizeToolText(prompt));
+  const candidates = toolBindings.filter((binding) => requestedToolkits.includes(binding.toolkit));
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const readTokens = new Set([
+    "list",
+    "get",
+    "fetch",
+    "find",
+    "search",
+    "read",
+    "view",
+    "lookup",
+    "upcoming",
+    "recent"
+  ]);
+  const destructiveTokens = new Set(["delete", "remove", "cancel", "archive", "revoke", "disconnect"]);
+
+  let best: { binding: AgentToolBindingSummary; score: number } | null = null;
+  for (const binding of candidates) {
+    const tokens = bindingTokenSet(binding);
+    let score = 0;
+    for (const token of promptTokens) {
+      if (tokens.has(token)) {
+        score += 1;
+      }
+    }
+    if ([...readTokens].some((token) => tokens.has(token))) {
+      score += 2;
+    }
+    if ([...destructiveTokens].some((token) => tokens.has(token))) {
+      score -= 3;
+    }
+    if (normalizedPrompt.includes(binding.toolkit)) {
+      score += 1;
+    }
+
+    if (!best || score > best.score) {
+      best = { binding, score };
+    }
+  }
+
+  if (!best || best.score < 3) {
+    return null;
+  }
+
+  const query = extractLabeledValue(prompt, ["query", "search", "keyword", "keywords"]);
+  return {
+    toolkit: best.binding.toolkit,
+    action: best.binding.slug.toUpperCase(),
+    arguments: query ? { query } : {}
+  } satisfies AgentToolActionRequest;
+}
+
+function inferAgentToolActionHeuristic(
+  prompt: string,
+  requestedToolkits: string[],
+  toolBindings: AgentToolBindingSummary[]
+): AgentToolActionRequest | null {
+  const normalized = prompt.toLowerCase();
+  const explicitSlug = prompt.match(/\b[A-Z][A-Z0-9_]{6,}\b/g)?.find((token) => {
+    const upper = token.toUpperCase();
+    return toolBindings.some((binding) => binding.slug.toUpperCase() === upper);
+  });
+  if (explicitSlug) {
+    const matched = toolBindings.find((binding) => binding.slug.toUpperCase() === explicitSlug);
+    if (matched) {
+      return {
+        toolkit: matched.toolkit,
+        action: matched.slug.toUpperCase(),
+        arguments: {}
+      };
+    }
+  }
+
+  const inferredZoom = inferZoomToolAction(prompt, toolBindings);
+  if (inferredZoom) {
+    return inferredZoom;
+  }
+
   const gmailRequested = requestedToolkits.includes("gmail");
   if (!gmailRequested) {
-    return null;
+    return inferReadOnlyGenericToolAction(prompt, requestedToolkits, toolBindings);
+  }
+
+  const hasMailContext = /gmail|email|mail|inbox/.test(normalized);
+  const sendIntent =
+    /\b(send|compose)\b/.test(normalized) && /\b(?:email|mail)\b/.test(normalized);
+  if (hasMailContext && sendIntent) {
+    const recipientCandidate =
+      extractFirstEmail(prompt) || extractLabeledValue(prompt, ["recipient", "to"]);
+    const recipient = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientCandidate)
+      ? recipientCandidate
+      : "";
+    const subject = extractLabeledValue(prompt, ["subject", "title"]);
+    const body = extractLabeledValue(prompt, ["body", "message", "content"]);
+
+    if (recipient && subject && body) {
+      return {
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        arguments: {
+          to: recipient,
+          recipient_email: recipient,
+          subject,
+          body
+        }
+      };
+    }
   }
 
   // MVP behavior: if task mentions inbox/email fetch semantics, call Gmail fetch.
   const asksForMailboxRead = /gmail|email|inbox/.test(normalized);
   const asksForList = /list|latest|recent|last|show|fetch|check|read/.test(normalized);
   if (!asksForMailboxRead || !asksForList) {
-    return null;
+    return inferReadOnlyGenericToolAction(prompt, requestedToolkits, toolBindings);
   }
 
   const limitMatch = normalized.match(/(?:last|latest|recent)\s+(\d{1,2})/i);
@@ -398,6 +799,319 @@ function inferAgentToolAction(prompt: string, requestedToolkits: string[]): Agen
       limit
     }
   };
+}
+
+function parseJsonObjectFromText(value: string) {
+  const direct = value.trim();
+  if (!direct) return null;
+  try {
+    const parsed = JSON.parse(direct);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // continue to fence extraction
+  }
+
+  const fenced = direct.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  if (fenced) {
+    try {
+      const parsed = JSON.parse(fenced);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // continue to brace extraction
+    }
+  }
+
+  const firstBrace = direct.indexOf("{");
+  const lastBrace = direct.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const candidate = direct.slice(firstBrace, lastBrace + 1);
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function normalizeToolArguments(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {} as Record<string, unknown>;
+  }
+
+  const output: Record<string, unknown> = {};
+  for (const [key, current] of Object.entries(value)) {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) continue;
+    if (
+      current === null ||
+      typeof current === "string" ||
+      typeof current === "number" ||
+      typeof current === "boolean" ||
+      Array.isArray(current) ||
+      (typeof current === "object" && current !== null)
+    ) {
+      output[normalizedKey] = current;
+    }
+  }
+  return output;
+}
+
+function isDestructiveToolAction(action: string, binding?: AgentToolBindingSummary | null) {
+  const text = `${action} ${binding?.name ?? ""} ${binding?.description ?? ""}`.toLowerCase();
+  return /\b(delete|remove|revoke|disconnect|cancel|archive|destroy|wipe|terminate)\b/.test(text);
+}
+
+function hasExplicitDestructiveIntent(prompt: string) {
+  return /\b(delete|remove|revoke|disconnect|cancel|archive|destroy|wipe|terminate)\b/i.test(prompt);
+}
+
+async function inferAgentToolAction(
+  input: {
+    orgId: string;
+    prompt: string;
+    requestedToolkits: string[];
+    toolBindings: AgentToolBindingSummary[];
+    runtimeAgent: RuntimeAgentProfile;
+  }
+): Promise<ToolInferenceResult> {
+  const heuristic = inferAgentToolActionHeuristic(
+    input.prompt,
+    input.requestedToolkits,
+    input.toolBindings
+  );
+  if (heuristic) {
+    return { action: heuristic };
+  }
+
+  const candidateBindings = input.toolBindings.filter(
+    (binding) =>
+      input.requestedToolkits.length === 0 || input.requestedToolkits.includes(binding.toolkit)
+  );
+  if (candidateBindings.length === 0) {
+    return { action: null };
+  }
+
+  try {
+    const runtime = await getOrgLlmRuntime(input.orgId);
+    const actionCatalog = candidateBindings.slice(0, 80).map((binding) => ({
+      toolkit: binding.toolkit,
+      action: binding.slug.toUpperCase(),
+      name: binding.name,
+      description: binding.description
+    }));
+
+    const execution = await executeSwarmAgent({
+      taskId: `tool-router-${Date.now()}`,
+      flowId: "tool-router",
+      prompt: input.prompt,
+      agent: input.runtimeAgent,
+      contextBlocks: [],
+      organizationRuntime: runtime,
+      systemPromptOverride: [
+        "You are a deterministic tool-action router for the workflow engine.",
+        "Select exactly one best tool action from the provided catalog if tool execution is needed now.",
+        "Never invent tool actions. Only use action values from the catalog.",
+        "Return strict JSON only, no markdown, no commentary.",
+        "Response schema:",
+        '{"mode":"EXECUTE","toolkit":"<slug>","action":"<ACTION_SLUG>","arguments":{},"reason":"..."}',
+        '{"mode":"HUMAN_INPUT","reason":"...","missing":["field1","field2"]}',
+        '{"mode":"NONE","reason":"..."}',
+        "If prompt lacks required parameters for a write/destructive action, return HUMAN_INPUT.",
+        "Prefer least-risk action that still satisfies the request."
+      ].join("\n"),
+      userPromptOverride: [
+        `Task prompt:\n${input.prompt}`,
+        "",
+        `Requested toolkits: ${input.requestedToolkits.join(", ") || "none"}`,
+        "",
+        "Action catalog (JSON):",
+        JSON.stringify(actionCatalog)
+      ].join("\n")
+    });
+
+    if (!execution.ok || !execution.outputText) {
+      return { action: null };
+    }
+
+    const parsed = parseJsonObjectFromText(execution.outputText);
+    if (!parsed) {
+      return { action: null };
+    }
+
+    const mode = asString(parsed.mode).toUpperCase();
+    if (mode === "NONE") {
+      return { action: null };
+    }
+
+    if (mode === "HUMAN_INPUT") {
+      const missing = Array.isArray(parsed.missing)
+        ? parsed.missing
+            .map((item) => (typeof item === "string" ? item.trim() : ""))
+            .filter(Boolean)
+        : [];
+      const reason = asString(parsed.reason) || "Tool action needs additional human input.";
+      return {
+        action: null,
+        reason: missing.length > 0 ? `${reason} Missing: ${missing.join(", ")}` : reason
+      };
+    }
+
+    if (mode !== "EXECUTE") {
+      return { action: null };
+    }
+
+    const toolkit = asString(parsed.toolkit).toLowerCase();
+    const action = asString(parsed.action).toUpperCase();
+    if (!toolkit || !action) {
+      return { action: null };
+    }
+
+    const binding = candidateBindings.find(
+      (item) => item.toolkit === toolkit && item.slug.toUpperCase() === action
+    );
+    if (!binding) {
+      return { action: null };
+    }
+
+    if (isDestructiveToolAction(action, binding) && !hasExplicitDestructiveIntent(input.prompt)) {
+      return {
+        action: null,
+        reason: `Action ${action} is destructive. Explicit user confirmation is required before execution.`
+      };
+    }
+
+    return {
+      action: {
+        toolkit,
+        action,
+        arguments: normalizeToolArguments(parsed.arguments)
+      }
+    };
+  } catch {
+    return { action: null };
+  }
+}
+
+function cleanHumanInputLine(line: string) {
+  return line
+    .replace(/^#+\s*/, "")
+    .replace(/\*\*/g, "")
+    .replace(/`/g, "")
+    .trim();
+}
+
+function parseHumanInputListItem(line: string) {
+  const bullet = line.match(/^(?:[-*]|\u2022)\s+(.+)$/u);
+  if (bullet?.[1]) {
+    return bullet[1].trim();
+  }
+
+  const numbered = line.match(/^\d+\s*[\).:-]\s+(.+)$/);
+  if (numbered?.[1]) {
+    return numbered[1].trim();
+  }
+
+  return null;
+}
+
+function collectHumanInputItems(lines: string[], startIndex: number) {
+  const items: string[] = [];
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const rawLine = lines[index];
+    const line = cleanHumanInputLine(rawLine);
+    if (!line) {
+      continue;
+    }
+
+    if (/^human\s*touch\s*(intervention)?\s*required:?$/i.test(line)) {
+      break;
+    }
+
+    if (/^(?:missing\s*data|please\s+provide)\b/i.test(line)) {
+      continue;
+    }
+
+    if (/^[A-Za-z][A-Za-z\s]{0,40}:\s*$/.test(line)) {
+      if (items.length > 0) {
+        break;
+      }
+      continue;
+    }
+
+    if (/^\*\*.+\*\*$/.test(rawLine) && items.length > 0) {
+      break;
+    }
+
+    const parsedItem = parseHumanInputListItem(line);
+    if (parsedItem) {
+      items.push(parsedItem);
+      continue;
+    }
+
+    if (items.length === 0) {
+      items.push(line.replace(/:$/, "").trim());
+    } else {
+      items[items.length - 1] = `${items[items.length - 1]} ${line}`;
+    }
+  }
+
+  return items;
+}
+
+function inferHumanInputReasonFromOutput(outputText: string) {
+  const normalized = outputText.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const requiresInputSignal =
+    /missing\s*data|human\s*touch\s*(intervention)?\s*required|please\s+provide|input\s+required/i.test(
+      normalized
+    );
+  if (!requiresInputSignal) {
+    return null;
+  }
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const missingDataIndex = lines.findIndex((line) => /missing\s*data/i.test(line));
+  if (missingDataIndex >= 0) {
+    const missingItems = collectHumanInputItems(lines, missingDataIndex);
+    if (missingItems.length > 0) {
+      return `Missing required input: ${missingItems.join(" | ")}`;
+    }
+  }
+
+  const provideIndex = lines.findIndex((line) => /please\s+provide/i.test(line));
+  if (provideIndex >= 0) {
+    const provideItems = collectHumanInputItems(lines, provideIndex);
+    if (provideItems.length > 0) {
+      return `Please provide: ${provideItems.join(" | ")}`;
+    }
+
+    const provideLine = cleanHumanInputLine(lines[provideIndex]).replace(
+      /^(?:[-*]|\u2022)\s+/u,
+      ""
+    );
+    if (provideLine) {
+      return provideLine;
+    }
+  }
+
+  return "Human Touch required: additional input is needed before task execution can continue.";
 }
 
 function resolveAgentExecutionKey() {
@@ -448,7 +1162,159 @@ function buildVirtualMainAgent(orgId: string) {
     fallbackBrainKeyIv: null,
     fallbackBrainKeyAuthTag: null,
     fallbackBrainKeyKeyVer: null
+  } satisfies RuntimeAgentProfile;
+}
+
+const runtimeAgentSelect = {
+  id: true,
+  name: true,
+  role: true,
+  brainConfig: true,
+  fallbackBrainConfig: true,
+  brainKeyEnc: true,
+  brainKeyIv: true,
+  brainKeyAuthTag: true,
+  brainKeyKeyVer: true,
+  fallbackBrainKeyEnc: true,
+  fallbackBrainKeyIv: true,
+  fallbackBrainKeyAuthTag: true,
+  fallbackBrainKeyKeyVer: true
+} as const;
+
+async function resolveMainBrainProfile(orgId: string): Promise<RuntimeAgentProfile | null> {
+  const primary =
+    (await prisma.personnel.findFirst({
+      where: {
+        orgId,
+        type: "AI",
+        role: { contains: "Main", mode: "insensitive" },
+        status: { not: PersonnelStatus.DISABLED }
+      },
+      select: runtimeAgentSelect
+    })) ??
+    (await prisma.personnel.findFirst({
+      where: {
+        orgId,
+        type: "AI",
+        role: { contains: "Boss", mode: "insensitive" },
+        status: { not: PersonnelStatus.DISABLED }
+      },
+      select: runtimeAgentSelect
+    })) ??
+    (await prisma.personnel.findFirst({
+      where: {
+        orgId,
+        type: "AI",
+        status: { not: PersonnelStatus.DISABLED }
+      },
+      orderBy: {
+        updatedAt: "desc"
+      },
+      select: runtimeAgentSelect
+    }));
+
+  return primary ?? null;
+}
+
+function applyMainBrainProfile(
+  target: RuntimeAgentProfile,
+  mainBrain: RuntimeAgentProfile | null
+) {
+  if (!mainBrain) {
+    return {
+      agent: target,
+      inherited: false,
+      sourceAgentId: null
+    };
+  }
+
+  return {
+    agent: {
+      ...target,
+      brainConfig: mainBrain.brainConfig,
+      fallbackBrainConfig: mainBrain.fallbackBrainConfig,
+      brainKeyEnc: mainBrain.brainKeyEnc,
+      brainKeyIv: mainBrain.brainKeyIv,
+      brainKeyAuthTag: mainBrain.brainKeyAuthTag,
+      brainKeyKeyVer: mainBrain.brainKeyKeyVer,
+      fallbackBrainKeyEnc: mainBrain.fallbackBrainKeyEnc,
+      fallbackBrainKeyIv: mainBrain.fallbackBrainKeyIv,
+      fallbackBrainKeyAuthTag: mainBrain.fallbackBrainKeyAuthTag,
+      fallbackBrainKeyKeyVer: mainBrain.fallbackBrainKeyKeyVer
+    },
+    inherited: true,
+    sourceAgentId: mainBrain.id
   };
+}
+
+function isFlowExecutionBlocked(status: FlowStatus) {
+  return (
+    status === FlowStatus.PAUSED ||
+    status === FlowStatus.FAILED ||
+    status === FlowStatus.ABORTED ||
+    status === FlowStatus.COMPLETED
+  );
+}
+
+async function dispatchQueuedTasksForFlow(input: {
+  orgId: string;
+  flowId: string;
+  initiatedByUserId?: string | null;
+  origin?: string;
+}) {
+  let dispatched = 0;
+
+  while (true) {
+    const flow = await prisma.flow.findUnique({
+      where: { id: input.flowId },
+      select: {
+        id: true,
+        orgId: true,
+        status: true
+      }
+    });
+
+    if (!flow || flow.orgId !== input.orgId) {
+      break;
+    }
+
+    if (isFlowExecutionBlocked(flow.status)) {
+      break;
+    }
+
+    const nextTask = await prisma.task.findFirst({
+      where: {
+        flowId: input.flowId,
+        status: TaskStatus.QUEUED
+      },
+      orderBy: {
+        createdAt: "asc"
+      },
+      select: {
+        id: true
+      }
+    });
+
+    if (!nextTask) {
+      break;
+    }
+
+    // Sequential execution keeps deterministic ordering and allows a pause gate to stop dispatch.
+    // eslint-disable-next-line no-await-in-loop
+    const result = await executeTaskById(
+      nextTask.id,
+      input.orgId,
+      input.initiatedByUserId ?? null,
+      input.origin
+    );
+    dispatched += 1;
+
+    if (!result.ok) {
+      break;
+    }
+  }
+
+  return { dispatched };
 }
 
 async function executeTaskById(
@@ -467,21 +1333,7 @@ async function executeTaskById(
         }
       },
       agent: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-          brainConfig: true,
-          fallbackBrainConfig: true,
-          brainKeyEnc: true,
-          brainKeyIv: true,
-          brainKeyAuthTag: true,
-          brainKeyKeyVer: true,
-          fallbackBrainKeyEnc: true,
-          fallbackBrainKeyIv: true,
-          fallbackBrainKeyAuthTag: true,
-          fallbackBrainKeyKeyVer: true
-        }
+        select: runtimeAgentSelect
       }
     }
   });
@@ -508,21 +1360,7 @@ async function executeTaskById(
           role: { contains: "Main", mode: "insensitive" },
           status: { not: PersonnelStatus.DISABLED }
         },
-        select: {
-          id: true,
-          name: true,
-          role: true,
-          brainConfig: true,
-          fallbackBrainConfig: true,
-          brainKeyEnc: true,
-          brainKeyIv: true,
-          brainKeyAuthTag: true,
-          brainKeyKeyVer: true,
-          fallbackBrainKeyEnc: true,
-          fallbackBrainKeyIv: true,
-          fallbackBrainKeyAuthTag: true,
-          fallbackBrainKeyKeyVer: true
-        }
+        select: runtimeAgentSelect
       })) ??
       (await prisma.personnel.findFirst({
         where: {
@@ -531,21 +1369,7 @@ async function executeTaskById(
           role: { contains: "Boss", mode: "insensitive" },
           status: { not: PersonnelStatus.DISABLED }
         },
-        select: {
-          id: true,
-          name: true,
-          role: true,
-          brainConfig: true,
-          fallbackBrainConfig: true,
-          brainKeyEnc: true,
-          brainKeyIv: true,
-          brainKeyAuthTag: true,
-          brainKeyKeyVer: true,
-          fallbackBrainKeyEnc: true,
-          fallbackBrainKeyIv: true,
-          fallbackBrainKeyAuthTag: true,
-          fallbackBrainKeyKeyVer: true
-        }
+        select: runtimeAgentSelect
       })) ??
       (await prisma.personnel.findFirst({
         where: {
@@ -556,21 +1380,7 @@ async function executeTaskById(
         orderBy: {
           updatedAt: "desc"
         },
-        select: {
-          id: true,
-          name: true,
-          role: true,
-          brainConfig: true,
-          fallbackBrainConfig: true,
-          brainKeyEnc: true,
-          brainKeyIv: true,
-          brainKeyAuthTag: true,
-          brainKeyKeyVer: true,
-          fallbackBrainKeyEnc: true,
-          fallbackBrainKeyIv: true,
-          fallbackBrainKeyAuthTag: true,
-          fallbackBrainKeyKeyVer: true
-        }
+        select: runtimeAgentSelect
       }));
 
     if (agent) {
@@ -665,12 +1475,7 @@ async function executeTaskById(
     orchestratorUserIdHint || traceInitiatedByUserId || null
   );
 
-  let toolBindings: Array<{
-    toolkit: string;
-    slug: string;
-    name: string;
-    description: string;
-  }> = [];
+  let toolBindings: AgentToolBindingSummary[] = [];
   if (requestedToolkits.length > 0 && !executionUserId) {
     const integrationError = {
       code: "INTEGRATION_NOT_CONNECTED" as const,
@@ -741,8 +1546,452 @@ async function executeTaskById(
     }
   }
 
-  const inferredToolAction = inferAgentToolAction(task.prompt, requestedToolkits);
+  const executionMode = await resolveOrgExecutionMode(orgId);
+  const logicalAgent = await resolveOrCreateTaskAgentProfile({
+    orgId,
+    flowId: task.flowId,
+    taskPrompt: task.prompt,
+    personnelId: agent.id.startsWith("main-agent-proxy:") ? null : agent.id
+  });
+  if (!logicalAgent) {
+    return handleEvent({
+      name: "vorldx/task.failed",
+      data: {
+        orgId,
+        taskId: task.id,
+        error: "Agent runtime profile could not be resolved."
+      }
+    }, origin);
+  }
+
+  const budgetSnapshot = await getAgentBudgetSnapshot({
+    orgId,
+    flowId: task.flowId
+  });
+  const complexity = assessTaskComplexity({
+    prompt: task.prompt,
+    requiredFiles: task.requiredFiles,
+    requestedToolkits
+  });
+  const contextPack = await buildAgentContextPack({
+    orgId,
+    flowId: task.flowId,
+    taskId: task.id,
+    prompt: task.prompt,
+    mode: executionMode,
+    agentId: logicalAgent.id,
+    parentRunId: asString(asRecord(asRecord(task.executionTrace).agentRuntime).agentRunId) || null,
+    requiredToolkits: requestedToolkits,
+    budgetSnapshot
+  });
+  const contextCharCount = [...context.contextBlocks, ...contextPack.blocks].reduce(
+    (total, block) => total + block.content.length,
+    0
+  );
+  const estimatedSelfCostUsd = estimateTaskExecutionCostUsd({
+    prompt: task.prompt,
+    contextCharCount,
+    requiredToolkits: requestedToolkits,
+    complexityScore: complexity.score,
+    mode: executionMode
+  });
+  const estimatedDelegationCostUsd = Number(
+    (estimatedSelfCostUsd + estimateDelegationOverheadUsd(executionMode)).toFixed(4)
+  );
+
+  const orchestratorTrace = asRecord(asRecord(task.executionTrace).orchestrator);
+  const multiAgentRequested = asString(orchestratorTrace.mode).toUpperCase() === "MULTI_AGENT";
+  const taskStage = parseTaskStage(asString(orchestratorTrace.stage));
+  const stepIndex = asNumber(orchestratorTrace.stepIndex);
+  const totalSteps = asNumber(orchestratorTrace.totalSteps);
+  const targetDelegationRole = complexity.score >= 0.78 ? "MANAGER" : "WORKER";
+
+  const reusableChildren = await listReusableChildAgents({
+    orgId,
+    flowId: task.flowId,
+    parentAgentId: logicalAgent.id,
+    role: targetDelegationRole,
+    requestedToolkits
+  });
+  const policyDecision = decideDelegation({
+    executionMode,
+    agentRole: logicalAgent.role,
+    budget: budgetSnapshot,
+    complexity,
+    estimatedSelfCostUsd,
+    estimatedDelegationCostUsd,
+    requiredToolkits: requestedToolkits,
+    missingToolkits: [],
+    requiresApproval:
+      complexity.riskScore >=
+      (executionMode === "ECO" ? 0.9 : executionMode === "TURBO" ? 0.72 : 0.82),
+    blockedByPolicy: false,
+    availableChildAgents: reusableChildren.length,
+    multiAgentRequested,
+    taskStage,
+    stepIndex,
+    totalSteps
+  });
+
+  let effectiveDecision = policyDecision;
+  let activeLogicalAgent = logicalAgent;
+  if (
+    policyDecision.decision === AgentDecisionType.DELEGATE_NEW &&
+    policyDecision.targetRole
+  ) {
+    const delegatedPersonnelId = await pickDelegationPersonnelCandidate({
+      orgId,
+      role: policyDecision.targetRole,
+      excludePersonnelId: logicalAgent.personnelId
+    });
+
+    activeLogicalAgent = await createChildAgent({
+      orgId,
+      flowId: task.flowId,
+      parentAgentId: logicalAgent.id,
+      personnelId: delegatedPersonnelId,
+      role: policyDecision.targetRole,
+      goal: `Delegated task: ${task.prompt}`.slice(0, 1400),
+      allowedTools: requestedToolkits,
+      budgetScope: {
+        maxUsd: Math.max(0.01, Math.min(estimatedDelegationCostUsd, budgetSnapshot.remainingBudgetUsd))
+      },
+      executionMode
+    });
+
+    await recordDelegation({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      fromAgentId: logicalAgent.id,
+      toAgentId: activeLogicalAgent.id,
+      decisionType: AgentDecisionType.DELEGATE_NEW,
+      reason: policyDecision.reason,
+      metadata: toInputJsonValue({
+        estimatedDelegationCostUsd,
+        complexity
+      })
+    });
+
+    await publishRealtimeEvent({
+      orgId,
+      event: "agent.delegated",
+      payload: {
+        flowId: task.flowId,
+        taskId: task.id,
+        fromAgentId: logicalAgent.id,
+        toAgentId: activeLogicalAgent.id,
+        toRole: activeLogicalAgent.role,
+        decisionType: AgentDecisionType.DELEGATE_NEW
+      }
+    });
+  } else if (policyDecision.decision === AgentDecisionType.DELEGATE_EXISTING && reusableChildren[0]) {
+    activeLogicalAgent = reusableChildren[0];
+    await recordDelegation({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      fromAgentId: logicalAgent.id,
+      toAgentId: activeLogicalAgent.id,
+      decisionType: AgentDecisionType.DELEGATE_EXISTING,
+      reason: policyDecision.reason,
+      metadata: toInputJsonValue({
+        reusedChildAgentId: activeLogicalAgent.id,
+        complexity
+      })
+    });
+
+    await publishRealtimeEvent({
+      orgId,
+      event: "agent.delegated",
+      payload: {
+        flowId: task.flowId,
+        taskId: task.id,
+        fromAgentId: logicalAgent.id,
+        toAgentId: activeLogicalAgent.id,
+        toRole: activeLogicalAgent.role,
+        decisionType: AgentDecisionType.DELEGATE_EXISTING
+      }
+    });
+  }
+
+  const scopeCheck = resolveScopeViolations({
+    agentName: activeLogicalAgent.name,
+    allowedTools: activeLogicalAgent.allowedTools,
+    requestedToolkits,
+    estimatedCostUsd: effectiveDecision.estimatedCostUsd,
+    budgetScope: activeLogicalAgent.budgetScope
+  });
+  if (scopeCheck.violation) {
+    effectiveDecision = {
+      decision: AgentDecisionType.HALT_POLICY,
+      reason: scopeCheck.violation,
+      targetRole: null,
+      shouldCreateChild: false,
+      estimatedCostUsd: effectiveDecision.estimatedCostUsd,
+      estimatedDelegationCostUsd: effectiveDecision.estimatedDelegationCostUsd
+    };
+  }
+
+  const priorRuntimeTrace = asRecord(asRecord(task.executionTrace).agentRuntime);
+  const priorRunId = asString(priorRuntimeTrace.agentRunId) || null;
+  const createdDelegatorRun = activeLogicalAgent.id !== logicalAgent.id;
+
+  let parentRunId: string | null = priorRunId;
+  if (createdDelegatorRun) {
+    const parentRun = await createAgentRun({
+      orgId,
+      agentId: logicalAgent.id,
+      flowId: task.flowId,
+      taskId: task.id,
+      parentRunId: priorRunId,
+      goal: logicalAgent.goal ?? task.prompt,
+      prompt: task.prompt,
+      contextPack: toInputJsonValue({
+        summary: contextPack.summary,
+        delegatedTo: activeLogicalAgent.id,
+        executionMode: contextPack.executionMode
+      }),
+      decisionType: effectiveDecision.decision,
+      decisionReason: effectiveDecision.reason,
+      executionMode,
+      budgetBefore: budgetSnapshot.remainingBudgetUsd,
+      estimatedCostUsd: effectiveDecision.estimatedDelegationCostUsd
+    });
+    parentRunId = parentRun.id;
+  }
+
+  const agentRun = await createAgentRun({
+    orgId,
+    agentId: activeLogicalAgent.id,
+    flowId: task.flowId,
+    taskId: task.id,
+    parentRunId,
+    goal: activeLogicalAgent.goal ?? task.prompt,
+    prompt: task.prompt,
+    contextPack: toInputJsonValue({
+      summary: contextPack.summary,
+      memoryHighlights: contextPack.memoryHighlights,
+      dnaHighlights: contextPack.dnaHighlights,
+      executionMode: contextPack.executionMode,
+      budgetSnapshot: contextPack.budgetSnapshot
+    }),
+    decisionType: effectiveDecision.decision,
+    decisionReason: effectiveDecision.reason,
+    executionMode,
+    budgetBefore: budgetSnapshot.remainingBudgetUsd,
+    estimatedCostUsd: effectiveDecision.estimatedCostUsd
+  });
+
+  if (createdDelegatorRun && parentRunId) {
+    await finalizeAgentRun({
+      runId: parentRunId,
+      status: AgentStatus.COMPLETED,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        delegatedToRunId: agentRun.id,
+        delegatedToAgentId: activeLogicalAgent.id
+      })
+    });
+
+    const pendingDelegation = await prisma.agentDelegation.findFirst({
+      where: {
+        orgId,
+        flowId: task.flowId,
+        taskId: task.id,
+        fromAgentId: logicalAgent.id,
+        toAgentId: activeLogicalAgent.id,
+        fromRunId: null,
+        toRunId: null
+      },
+      orderBy: {
+        createdAt: "desc"
+      },
+      select: {
+        id: true
+      }
+    });
+
+    if (pendingDelegation) {
+      await prisma.agentDelegation.update({
+        where: {
+          id: pendingDelegation.id
+        },
+        data: {
+          fromRunId: parentRunId,
+          toRunId: agentRun.id,
+          status: "dispatched"
+        }
+      });
+    }
+  }
+
+  if (
+    effectiveDecision.decision === AgentDecisionType.HALT_BUDGET ||
+    effectiveDecision.decision === AgentDecisionType.HALT_POLICY ||
+    effectiveDecision.decision === AgentDecisionType.ASK_HUMAN
+  ) {
+    const reason =
+      effectiveDecision.decision === AgentDecisionType.HALT_BUDGET
+        ? `Budget policy halted execution: ${effectiveDecision.reason}`
+        : effectiveDecision.reason;
+
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      approvalPolicy: toInputJsonValue({
+        decision: effectiveDecision.decision
+      }),
+      metadata: toInputJsonValue({
+        budgetSnapshot,
+        complexity
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        decision: effectiveDecision
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
+
+  let runtimeAgent = agent;
+  if (activeLogicalAgent.personnelId && activeLogicalAgent.personnelId !== task.agentId) {
+    const delegatedPersonnel = await prisma.personnel.findUnique({
+      where: { id: activeLogicalAgent.personnelId },
+      select: runtimeAgentSelect
+    });
+    if (delegatedPersonnel) {
+      runtimeAgent = delegatedPersonnel;
+      await prisma.task.update({
+        where: { id: task.id },
+        data: { agentId: delegatedPersonnel.id }
+      });
+    }
+  }
+
+  const mainBrainProfile = await resolveMainBrainProfile(orgId);
+  const sharedBrain = applyMainBrainProfile(runtimeAgent, mainBrainProfile);
+  runtimeAgent = sharedBrain.agent;
+
+  const inferredToolPlan = await inferAgentToolAction({
+    orgId,
+    prompt: task.prompt,
+    requestedToolkits,
+    toolBindings,
+    runtimeAgent
+  });
+  const inferredToolAction = inferredToolPlan.action;
   let toolActionExecution: ToolActionExecutionResult | null = null;
+
+  if (inferredToolPlan.reason) {
+    const reason = inferredToolPlan.reason;
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      approvalPolicy: toInputJsonValue({
+        decision: AgentDecisionType.ASK_HUMAN
+      }),
+      metadata: toInputJsonValue({
+        requestedToolkits
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        reason
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
+
+  const scopedAllowedTools = normalizeToolkitList(activeLogicalAgent.allowedTools);
+  if (
+    inferredToolAction &&
+    scopedAllowedTools.length > 0 &&
+    !scopedAllowedTools.includes(inferredToolAction.toolkit)
+  ) {
+    const reason = `Agent scope blocked toolkit "${inferredToolAction.toolkit}" for ${activeLogicalAgent.name}.`;
+
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      approvalPolicy: toInputJsonValue({
+        decision: AgentDecisionType.HALT_POLICY
+      }),
+      metadata: toInputJsonValue({
+        requestedToolkits,
+        allowedTools: scopedAllowedTools
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        reason,
+        blockedToolkit: inferredToolAction.toolkit
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          blockedToolkit: inferredToolAction.toolkit,
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
 
   if (inferredToolAction && executionUserId && origin) {
     try {
@@ -839,7 +2088,7 @@ async function executeTaskById(
   const lockResult = await acquireTaskFileLocks({
     orgId,
     taskId: task.id,
-    agentId: agent.id,
+    agentId: runtimeAgent.id,
     fileIds: context.resolvedRequiredFileIds
   });
 
@@ -849,12 +2098,26 @@ async function executeTaskById(
       ? `Required file "${blocking.fileName}" is locked by ${blocking.lockOwnerAgent ?? "another agent"}${blocking.lockOwnerTaskId ? ` (task ${blocking.lockOwnerTaskId})` : ""}.`
       : "Required file lock is currently held by another task.";
 
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.BLOCKED,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        blockedReason,
+        policyDecision: effectiveDecision
+      })
+    });
+
     return handleEvent({
       name: "vorldx/task.paused",
       data: {
         orgId,
         taskId: task.id,
-        reason: blockedReason
+        reason: blockedReason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          agentRunId: agentRun.id
+        }
       }
     }, origin);
   }
@@ -876,14 +2139,14 @@ async function executeTaskById(
       }
     });
 
-    await tx.log.create({
-      data: {
-        orgId,
-        type: LogType.EXE,
-        actor: "SWARM_RUNTIME",
-        message: `Task ${task.id} executing on agent ${agent.name} (${agent.role}).`
-      }
-    });
+      await tx.log.create({
+        data: {
+          orgId,
+          type: LogType.EXE,
+          actor: "SWARM_RUNTIME",
+          message: `Task ${task.id} executing on agent ${runtimeAgent.name} (${runtimeAgent.role}) as logical role ${activeLogicalAgent.role}.${sharedBrain.inherited ? ` Brain source: Main Agent (${sharedBrain.sourceAgentId}).` : ""}`
+        }
+      });
 
     if (context.amnesiaProofs.length > 0) {
       await tx.log.create({
@@ -902,7 +2165,12 @@ async function executeTaskById(
     event: "task.resumed",
     payload: {
       taskId: task.id,
-      flowId: task.flowId
+      flowId: task.flowId,
+      agentId: activeLogicalAgent.id,
+      agentRole: activeLogicalAgent.role,
+      parentAgentId: activeLogicalAgent.parentAgentId,
+      agentRunId: agentRun.id,
+      decisionType: effectiveDecision.decision
     }
   });
 
@@ -971,9 +2239,10 @@ async function executeTaskById(
     taskId: task.id,
     flowId: task.flowId,
     prompt: task.prompt,
-    agent,
+    agent: runtimeAgent,
     contextBlocks: [
       ...context.contextBlocks,
+      ...contextPack.blocks,
       ...integrationContextBlocks,
       ...toolActionContextBlocks,
       ...toolActionErrorContextBlocks
@@ -987,11 +2256,30 @@ async function executeTaskById(
     amnesiaProofs: context.amnesiaProofs,
     requestedFiles: task.requiredFiles,
     requestedToolkits,
+    inferredToolAction,
+    toolInferenceReason: inferredToolPlan.reason ?? null,
     toolActionExecution,
     toolBindings: toolBindings.map((item) => ({
       toolkit: item.toolkit,
       slug: item.slug
-    }))
+    })),
+    agentRuntime: {
+      agentRunId: agentRun.id,
+      logicalAgentId: activeLogicalAgent.id,
+      logicalRole: activeLogicalAgent.role,
+      parentAgentId: activeLogicalAgent.parentAgentId,
+      decisionType: effectiveDecision.decision,
+      decisionReason: effectiveDecision.reason,
+      executionMode,
+      budgetSnapshot,
+      estimatedSelfCostUsd,
+      estimatedDelegationCostUsd,
+      contextSummary: contextPack.summary,
+      memoryHighlights: contextPack.memoryHighlights,
+      dnaHighlights: contextPack.dnaHighlights,
+      sharedBrainFromMain: sharedBrain.inherited,
+      sharedBrainSourceAgentId: sharedBrain.sourceAgentId
+    }
   };
 
   if (!execution.ok) {
@@ -1000,15 +2288,45 @@ async function executeTaskById(
       errorText.toLowerCase()
     );
     if (requiresHumanTouch) {
+      await createApprovalCheckpoint({
+        orgId,
+        flowId: task.flowId,
+        taskId: task.id,
+        agentId: activeLogicalAgent.id,
+        agentRunId: agentRun.id,
+        reason: `Agent configuration requires Human Touch: ${errorText}`,
+        metadata: toInputJsonValue({
+          executionTrace
+        })
+      });
+      await finalizeAgentRun({
+        runId: agentRun.id,
+        status: AgentStatus.WAITING_HUMAN,
+        budgetAfter: budgetSnapshot.remainingBudgetUsd,
+        metadata: toInputJsonValue({
+          errorText,
+          requiresHumanTouch: true
+        })
+      });
       return handleEvent({
         name: "vorldx/task.paused",
         data: {
           orgId,
           taskId: task.id,
-          reason: `Agent configuration requires Human Touch: ${errorText}`
+          reason: `Agent configuration requires Human Touch: ${errorText}`,
+          executionTrace
         }
       }, origin);
     }
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.FAILED,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        errorText
+      })
+    });
 
     return handleEvent({
       name: "vorldx/task.failed",
@@ -1021,8 +2339,89 @@ async function executeTaskById(
     }, origin);
   }
 
-  let outputFileId: string | null = null;
   const outputText = execution.outputText?.trim() ?? "";
+  const humanInputReason = inferHumanInputReasonFromOutput(outputText);
+  if (humanInputReason) {
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason: humanInputReason,
+      metadata: toInputJsonValue({
+        outputPreview: outputText.slice(0, 1200)
+      })
+    });
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        humanInputReason
+      })
+    });
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason: humanInputReason,
+        executionTrace: {
+          ...executionTrace,
+          humanInputRequired: true,
+          outputPreview: outputText.slice(0, 1200)
+        }
+      }
+    }, origin);
+  }
+
+  const unverifiedActionReason = inferUnverifiedExternalActionClaim({
+    outputText,
+    requestedToolkits,
+    inferredToolAction,
+    toolActionExecution
+  });
+  if (unverifiedActionReason) {
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason: unverifiedActionReason,
+      metadata: toInputJsonValue({
+        outputPreview: outputText.slice(0, 1200),
+        requestedToolkits,
+        inferredToolAction,
+        toolActionExecution
+      })
+    });
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        hallucinationGuard: true,
+        reason: unverifiedActionReason
+      })
+    });
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason: unverifiedActionReason,
+        executionTrace: {
+          ...executionTrace,
+          hallucinationGuard: true,
+          outputPreview: outputText.slice(0, 1200)
+        }
+      }
+    }, origin);
+  }
+
+  let outputFileId: string | null = null;
   if (outputText.length > 0) {
     const outputFile = await prisma.file.create({
       data: {
@@ -1035,6 +2434,7 @@ async function executeTaskById(
         metadata: toInputJsonValue({
           sourceTaskId: task.id,
           sourceFlowId: task.flowId,
+          sourceAgentRunId: agentRun.id,
           provider: execution.usedProvider,
           model: execution.usedModel,
           apiSource: execution.apiSource,
@@ -1046,6 +2446,55 @@ async function executeTaskById(
     });
     outputFileId = outputFile.id;
   }
+
+  if (outputText.length > 0) {
+    await prisma.memoryEntry.create({
+      data: {
+        orgId,
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        tier: "AGENT",
+        key: `agent.run.${agentRun.id}.summary`,
+        value: toInputJsonValue({
+          outputPreview: outputText.slice(0, 1600),
+          executionMode,
+          decisionType: effectiveDecision.decision,
+          sourceTaskId: task.id
+        })
+      }
+    });
+  }
+
+  const tokenInput =
+    typeof execution.tokenUsage?.promptTokens === "number"
+      ? execution.tokenUsage.promptTokens
+      : null;
+  const tokenOutput =
+    typeof execution.tokenUsage?.completionTokens === "number"
+      ? execution.tokenUsage.completionTokens
+      : null;
+  const billedCost =
+    typeof execution.billing?.totalCostUsd === "number" ? execution.billing.totalCostUsd : null;
+  const fallbackCost =
+    typeof execution.tokenUsage?.totalTokens === "number"
+      ? execution.tokenUsage.totalTokens / 1_000_000
+      : null;
+  const actualCost = billedCost ?? fallbackCost ?? estimatedSelfCostUsd;
+
+  await finalizeAgentRun({
+    runId: agentRun.id,
+    status: AgentStatus.COMPLETED,
+    actualCostUsd: actualCost,
+    budgetAfter: Math.max(0, budgetSnapshot.remainingBudgetUsd - actualCost),
+    modelProvider: execution.usedProvider ?? null,
+    modelName: execution.usedModel ?? null,
+    tokenInput,
+    tokenOutput,
+    metadata: toInputJsonValue({
+      outputFileId
+    })
+  });
 
   const verifiableProof =
     context.amnesiaProofs.length > 0
@@ -1096,26 +2545,14 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       };
     }
 
-    const queuedTasks = await prisma.task.findMany({
-      where: {
-        flowId,
-        status: {
-          in: [TaskStatus.QUEUED, TaskStatus.RUNNING]
-        }
-      },
-      orderBy: {
-        createdAt: "asc"
-      },
-      select: { id: true }
+    const dispatch = await dispatchQueuedTasksForFlow({
+      orgId,
+      flowId,
+      initiatedByUserId,
+      origin
     });
 
-    for (const queuedTask of queuedTasks) {
-      // Sequential execution keeps task ordering deterministic for the same flow.
-      // eslint-disable-next-line no-await-in-loop
-      await executeTaskById(queuedTask.id, orgId, initiatedByUserId, origin);
-    }
-
-    return { ok: true, queued: queuedTasks.length };
+    return { ok: true, queued: dispatch.dispatched };
   }
 
   if (name === "vorldx/task.paused") {
@@ -1141,6 +2578,14 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       data.executionTrace && typeof data.executionTrace === "object"
         ? asRecord(data.executionTrace)
         : null;
+    const runtimeTrace = incomingExecutionTrace
+      ? asRecord(incomingExecutionTrace.agentRuntime)
+      : {};
+    const agentRunId = asString(runtimeTrace.agentRunId) || asString(incomingExecutionTrace?.agentRunId);
+    const logicalAgentId = asString(runtimeTrace.logicalAgentId);
+    const logicalRole = asString(runtimeTrace.logicalRole);
+    const parentAgentId = asString(runtimeTrace.parentAgentId);
+    const decisionType = asString(runtimeTrace.decisionType);
 
     if (!taskId || !orgId) {
       return { ok: false, error: "task.paused requires taskId and orgId." };
@@ -1181,6 +2626,31 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         }
       });
 
+      if (agentRunId) {
+        await tx.agentRun.updateMany({
+          where: {
+            id: agentRunId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.WAITING_HUMAN,
+            completedAt: new Date()
+          }
+        });
+      }
+
+      if (logicalAgentId) {
+        await tx.agent.updateMany({
+          where: {
+            id: logicalAgentId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.WAITING_HUMAN
+          }
+        });
+      }
+
       await tx.flow.update({
         where: { id: task.flowId },
         data: {
@@ -1205,7 +2675,12 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         taskId,
         flowId: task.flowId,
         reason,
-        ...(integrationError ? { integrationError } : {})
+        ...(integrationError ? { integrationError } : {}),
+        ...(logicalAgentId ? { agentId: logicalAgentId } : {}),
+        ...(logicalRole ? { agentRole: logicalRole } : {}),
+        ...(parentAgentId ? { parentAgentId } : {}),
+        ...(agentRunId ? { agentRunId } : {}),
+        ...(decisionType ? { decisionType } : {})
       }
     });
 
@@ -1290,7 +2765,14 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       typeof resumedTrace.initiatedByUserId === "string" ? resumedTrace.initiatedByUserId : null,
       origin
     );
-    return { ok: true, executionResult };
+    const dispatch = await dispatchQueuedTasksForFlow({
+      orgId,
+      flowId: task.flowId,
+      initiatedByUserId:
+        typeof resumedTrace.initiatedByUserId === "string" ? resumedTrace.initiatedByUserId : null,
+      origin
+    });
+    return { ok: true, executionResult, queued: dispatch.dispatched };
   }
 
   if (name === "vorldx/task.completed") {
@@ -1301,6 +2783,12 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         ? (data.executionTrace as Record<string, unknown>)
         : null;
     const verifiableProof = asString(data.verifiableProof) || null;
+    const runtimeTrace = executionTrace ? asRecord(executionTrace.agentRuntime) : {};
+    const agentRunId = asString(runtimeTrace.agentRunId);
+    const logicalAgentId = asString(runtimeTrace.logicalAgentId);
+    const logicalRole = asString(runtimeTrace.logicalRole);
+    const parentAgentId = asString(runtimeTrace.parentAgentId);
+    const decisionType = asString(runtimeTrace.decisionType);
 
     if (!taskId || !orgId) {
       return { ok: false, error: "task.completed requires taskId and orgId." };
@@ -1341,6 +2829,31 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
             : {})
         }
       });
+
+      if (agentRunId) {
+        await tx.agentRun.updateMany({
+          where: {
+            id: agentRunId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.COMPLETED,
+            completedAt: new Date()
+          }
+        });
+      }
+
+      if (logicalAgentId) {
+        await tx.agent.updateMany({
+          where: {
+            id: logicalAgentId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.COMPLETED
+          }
+        });
+      }
 
       const flowTasks = await tx.task.findMany({
         where: { flowId: task.flowId },
@@ -1416,7 +2929,12 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       event: "task.completed",
       payload: {
         taskId,
-        flowId: task.flowId
+        flowId: task.flowId,
+        ...(logicalAgentId ? { agentId: logicalAgentId } : {}),
+        ...(logicalRole ? { agentRole: logicalRole } : {}),
+        ...(parentAgentId ? { parentAgentId } : {}),
+        ...(agentRunId ? { agentRunId } : {}),
+        ...(decisionType ? { decisionType } : {})
       }
     });
 
@@ -1439,6 +2957,12 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       data.executionTrace && typeof data.executionTrace === "object"
         ? (data.executionTrace as Record<string, unknown>)
         : null;
+    const runtimeTrace = executionTrace ? asRecord(executionTrace.agentRuntime) : {};
+    const agentRunId = asString(runtimeTrace.agentRunId);
+    const logicalAgentId = asString(runtimeTrace.logicalAgentId);
+    const logicalRole = asString(runtimeTrace.logicalRole);
+    const parentAgentId = asString(runtimeTrace.parentAgentId);
+    const decisionType = asString(runtimeTrace.decisionType);
 
     if (!taskId || !orgId) {
       return { ok: false, error: "task.failed requires taskId and orgId." };
@@ -1475,6 +2999,31 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         }
       });
 
+      if (agentRunId) {
+        await tx.agentRun.updateMany({
+          where: {
+            id: agentRunId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.FAILED,
+            completedAt: new Date()
+          }
+        });
+      }
+
+      if (logicalAgentId) {
+        await tx.agent.updateMany({
+          where: {
+            id: logicalAgentId,
+            orgId
+          },
+          data: {
+            status: AgentStatus.FAILED
+          }
+        });
+      }
+
       await tx.flow.update({
         where: { id: task.flowId },
         data: {
@@ -1498,7 +3047,12 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
       payload: {
         taskId,
         flowId: task.flowId,
-        error
+        error,
+        ...(logicalAgentId ? { agentId: logicalAgentId } : {}),
+        ...(logicalRole ? { agentRole: logicalRole } : {}),
+        ...(parentAgentId ? { parentAgentId } : {}),
+        ...(agentRunId ? { agentRunId } : {}),
+        ...(decisionType ? { decisionType } : {})
       }
     });
 
@@ -1715,6 +3269,16 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
 }
 
 async function processRequest(request: NextRequest) {
+  if (!hasValidInternalApiKey(request)) {
+    return NextResponse.json(
+      {
+        ok: false,
+        message: "Internal API key is required for durable worker mutations."
+      },
+      { status: 403 }
+    );
+  }
+
   let payload: unknown = null;
 
   try {
@@ -1761,6 +3325,17 @@ async function processRequest(request: NextRequest) {
         })()
       ];
 
+  const unsupported = events.find((event) => !ALLOWED_INTERNAL_EVENTS.has(asString(event.name)));
+  if (unsupported) {
+    return NextResponse.json(
+      {
+        ok: false,
+        message: `Unsupported event: ${unsupported.name ?? "unknown"}`
+      },
+      { status: 400 }
+    );
+  }
+
   const results = [];
   for (const event of events) {
     // Sequential handling is intentional to preserve event order.
@@ -1799,3 +3374,4 @@ export async function POST(request: NextRequest) {
 export async function PUT(request: NextRequest) {
   return processRequest(request);
 }
+

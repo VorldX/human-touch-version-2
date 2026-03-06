@@ -166,7 +166,7 @@ export function AgentRunConsole({ orgId }: AgentRunConsoleProps) {
   const connectUrl =
     result?.error?.code === "INTEGRATION_NOT_CONNECTED"
       ? asText(result.error.details?.connectUrl) ||
-        "/app?tab=settings&settingsLane=integrations&toolkit=gmail"
+        "/app?tab=hub&hubScope=TOOLS&toolkit=gmail"
       : "";
 
   return (

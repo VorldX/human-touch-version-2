@@ -15,5 +15,7 @@ export const featureFlags = {
   evalGatesScaffold: parseBoolean(process.env.FEATURE_EVAL_GATES_SCAFFOLD, false),
   memoryGovernance: parseBoolean(process.env.FEATURE_MEMORY_GOVERNANCE, true),
   capabilityVault: parseBoolean(process.env.FEATURE_CAPABILITY_VAULT, false),
-  composioIntegrations: parseBoolean(process.env.FEATURE_COMPOSIO_INTEGRATIONS, false)
+  composioIntegrations: parseBoolean(process.env.FEATURE_COMPOSIO_INTEGRATIONS, false),
+  agentHierarchy: parseBoolean(process.env.FEATURE_AGENT_HIERARCHY, true),
+  agentContextRag: parseBoolean(process.env.FEATURE_AGENT_CONTEXT_RAG, true)
 } as const;

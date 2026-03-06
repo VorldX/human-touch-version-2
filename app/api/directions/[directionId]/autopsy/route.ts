@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { getDirectionAutopsy } from "@/lib/direction/directions";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface RouteContext {
   params: Promise<{
@@ -18,6 +19,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const autopsy = await getDirectionAutopsy(orgId, directionId);
   if (!autopsy) {
     return NextResponse.json({ ok: false, message: "Direction not found." }, { status: 404 });
@@ -28,4 +34,3 @@ export async function GET(request: NextRequest, context: RouteContext) {
     autopsy
   });
 }
-

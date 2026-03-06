@@ -9,6 +9,7 @@ import {
   type OrgLlmMode,
   type OrgServicePlan
 } from "@/lib/ai/org-llm-settings";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 function normalizeMode(value: unknown): OrgLlmMode | null {
   if (value === "BYOK") return "BYOK";
@@ -20,6 +21,13 @@ function normalizePlan(value: unknown): OrgServicePlan | null {
   if (value === "STARTER") return "STARTER";
   if (value === "GROWTH") return "GROWTH";
   if (value === "ENTERPRISE") return "ENTERPRISE";
+  return null;
+}
+
+function normalizeExecutionMode(value: unknown): "ECO" | "BALANCED" | "TURBO" | null {
+  if (value === "ECO") return "ECO";
+  if (value === "BALANCED") return "BALANCED";
+  if (value === "TURBO") return "TURBO";
   return null;
 }
 
@@ -53,9 +61,17 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const org = await prisma.organization.findUnique({
     where: { id: orgId },
-    select: { id: true }
+    select: {
+      id: true,
+      executionMode: true
+    }
   });
 
   if (!org) {
@@ -69,7 +85,11 @@ export async function GET(request: NextRequest) {
   }
 
   const settings = await getOrgLlmSettings(orgId);
-  return NextResponse.json({ ok: true, settings });
+  return NextResponse.json({
+    ok: true,
+    settings,
+    executionMode: org.executionMode
+  });
 }
 
 export async function PUT(request: NextRequest) {
@@ -85,6 +105,7 @@ export async function PUT(request: NextRequest) {
         serviceMarkupPct?: number;
         organizationApiKey?: string;
         providerApiKeys?: Record<string, string>;
+        executionMode?: "ECO" | "BALANCED" | "TURBO";
       }
     | null;
 
@@ -96,6 +117,7 @@ export async function PUT(request: NextRequest) {
   const fallbackModel = toTrimmedString(body?.fallbackModel);
   const servicePlan = normalizePlan(body?.servicePlan);
   const providerApiKeys = asStringRecord(body?.providerApiKeys);
+  const executionMode = normalizeExecutionMode(body?.executionMode);
 
   if (!orgId || !mode || !provider || !model || !fallbackProvider || !fallbackModel || !servicePlan) {
     return NextResponse.json(
@@ -108,9 +130,17 @@ export async function PUT(request: NextRequest) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const org = await prisma.organization.findUnique({
     where: { id: orgId },
-    select: { id: true }
+    select: {
+      id: true,
+      executionMode: true
+    }
   });
 
   if (!org) {
@@ -146,6 +176,15 @@ export async function PUT(request: NextRequest) {
       : defaultServiceMarkupForPlan(servicePlan);
 
   const result = await prisma.$transaction(async (tx) => {
+    if (executionMode) {
+      await tx.organization.update({
+        where: { id: orgId },
+        data: {
+          executionMode
+        }
+      });
+    }
+
     const updated = await upsertOrgLlmSettings(
       {
         orgId,
@@ -169,7 +208,7 @@ export async function PUT(request: NextRequest) {
         orgId,
         type: LogType.USER,
         actor: "SETTINGS",
-        message: `Organization LLM settings updated. mode=${mode}, plan=${servicePlan}, provider=${provider}, model=${model}.`
+        message: `Organization LLM settings updated. mode=${mode}, executionMode=${executionMode ?? "unchanged"}, plan=${servicePlan}, provider=${provider}, model=${model}.`
       }
     });
 
@@ -178,6 +217,7 @@ export async function PUT(request: NextRequest) {
 
   return NextResponse.json({
     ok: true,
-    settings: result.settings
+    settings: result.settings,
+    executionMode: executionMode ?? org.executionMode
   });
 }

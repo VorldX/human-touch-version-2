@@ -3,16 +3,19 @@ import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 
 import { prisma } from "@/lib/db/prisma";
+import { hasValidInternalApiKey } from "@/lib/security/internal-api";
 
 export interface OrgActor {
   userId: string;
   email: string;
   orgId: string;
+  isInternal?: boolean;
 }
 
 export async function requireOrgAccess(input: {
   request: NextRequest;
   orgId: string;
+  allowInternal?: boolean;
 }) {
   const orgId = input.orgId.trim();
   if (!orgId) {
@@ -25,6 +28,35 @@ export async function requireOrgAccess(input: {
         },
         { status: 400 }
       )
+    };
+  }
+
+  if (input.allowInternal && hasValidInternalApiKey(input.request)) {
+    const org = await prisma.organization.findUnique({
+      where: { id: orgId },
+      select: { id: true }
+    });
+    if (!org) {
+      return {
+        ok: false as const,
+        response: NextResponse.json(
+          {
+            ok: false,
+            message: "Organization not found."
+          },
+          { status: 404 }
+        )
+      };
+    }
+
+    return {
+      ok: true as const,
+      actor: {
+        userId: "internal-system",
+        email: "internal@vorldx.local",
+        orgId,
+        isInternal: true
+      } satisfies OrgActor
     };
   }
 
@@ -82,4 +114,3 @@ export async function requireOrgAccess(input: {
     } satisfies OrgActor
   };
 }
-

@@ -46,6 +46,25 @@ function dedupeSlugs(slugs: string[]) {
   return [...new Set(slugs.map((item) => item.trim().toUpperCase()).filter(Boolean))];
 }
 
+function ensureComposioExecutionSucceeded(input: {
+  successful: boolean;
+  error: string | null;
+  toolSlug: string;
+}) {
+  if (input.successful) {
+    return;
+  }
+
+  const detail = asText(input.error) || "Unknown provider error.";
+  throw new ComposioServiceError(
+    `Tool ${input.toolSlug} execution failed: ${detail}`,
+    {
+      code: "TOOL_EXECUTION_FAILED",
+      status: 502
+    }
+  );
+}
+
 function pickByCandidates(available: Set<string>, candidates: string[], fallback: string) {
   for (const candidate of candidates) {
     if (available.has(candidate)) {
@@ -245,6 +264,11 @@ export async function listRecentEmails(input: {
       ...(query ? { query } : {})
     }
   });
+  ensureComposioExecutionSucceeded({
+    successful: result.successful,
+    error: result.error,
+    toolSlug: tools.listSlug
+  });
 
   return {
     toolSlug: tools.listSlug,
@@ -299,6 +323,11 @@ export async function readEmail(input: {
         messageId,
         message_id: messageId
       }
+    });
+    ensureComposioExecutionSucceeded({
+      successful: result.successful,
+      error: result.error,
+      toolSlug: tools.readSlug
     });
 
     const records = extractGmailEmailRecords(result.data);
@@ -369,6 +398,11 @@ export async function sendEmail(input: {
       ...(cc ? { cc } : {}),
       ...(bcc ? { bcc } : {})
     }
+  });
+  ensureComposioExecutionSucceeded({
+    successful: result.successful,
+    error: result.error,
+    toolSlug: tools.sendSlug
   });
 
   return {

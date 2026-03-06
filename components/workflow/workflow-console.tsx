@@ -68,6 +68,11 @@ interface WorkflowConsoleProps {
     accentSoft: string;
     border: string;
   };
+  onTaskNeedsInput?: (input: {
+    taskId: string;
+    flowId: string | null;
+    reason: string;
+  }) => void;
 }
 
 interface IntegrationErrorTrace {
@@ -75,6 +80,14 @@ interface IntegrationErrorTrace {
   toolkit: string;
   action: string;
   connectUrl?: string;
+}
+
+interface AgentRuntimeTrace {
+  agentRunId?: string;
+  logicalAgentId?: string;
+  logicalRole?: string;
+  parentAgentId?: string;
+  decisionType?: string;
 }
 
 function parseIntegrationError(trace: unknown): IntegrationErrorTrace | null {
@@ -103,6 +116,34 @@ function parseIntegrationError(trace: unknown): IntegrationErrorTrace | null {
   };
 }
 
+function parseAgentRuntime(trace: unknown): AgentRuntimeTrace | null {
+  if (!trace || typeof trace !== "object" || Array.isArray(trace)) {
+    return null;
+  }
+  const record = trace as Record<string, unknown>;
+  if (!record.agentRuntime || typeof record.agentRuntime !== "object") {
+    return null;
+  }
+  const runtime = record.agentRuntime as Record<string, unknown>;
+  const agentRunId = typeof runtime.agentRunId === "string" ? runtime.agentRunId : undefined;
+  const logicalAgentId = typeof runtime.logicalAgentId === "string" ? runtime.logicalAgentId : undefined;
+  const logicalRole = typeof runtime.logicalRole === "string" ? runtime.logicalRole : undefined;
+  const parentAgentId = typeof runtime.parentAgentId === "string" ? runtime.parentAgentId : undefined;
+  const decisionType = typeof runtime.decisionType === "string" ? runtime.decisionType : undefined;
+
+  if (!agentRunId && !logicalAgentId && !logicalRole && !parentAgentId && !decisionType) {
+    return null;
+  }
+
+  return {
+    agentRunId,
+    logicalAgentId,
+    logicalRole,
+    parentAgentId,
+    decisionType
+  };
+}
+
 function openCenteredPopup(url: string, name: string) {
   const width = Math.max(720, Math.min(980, window.outerWidth - 80));
   const height = Math.max(620, Math.min(760, window.outerHeight - 90));
@@ -126,8 +167,44 @@ function badgeClass(status: FlowStatus | TaskStatus) {
   return "border-white/20 bg-white/5 text-slate-300";
 }
 
+function normalizeTaskReason(reason: string | null | undefined) {
+  return typeof reason === "string" ? reason.trim() : "";
+}
+
+function taskNeedsHumanInput(task: FlowTask) {
+  if (parseIntegrationError(task.executionTrace)) {
+    return true;
+  }
+  const reason = normalizeTaskReason(task.humanInterventionReason).toLowerCase();
+  if (!reason) {
+    return false;
+  }
+
+  return /missing|please provide|input required|human touch|not connected|requires .*input|needs .*input|provide/.test(
+    reason
+  );
+}
+
+function resolveHumanInputReason(task: FlowTask) {
+  const integrationError = parseIntegrationError(task.executionTrace);
+  if (integrationError) {
+    return `Connect ${integrationError.toolkit} integration before resuming this task.`;
+  }
+  const reason = normalizeTaskReason(task.humanInterventionReason);
+  if (reason) {
+    return reason;
+  }
+  return "This task requires additional human input before resume.";
+}
+
 function buildAutopsy(task?: FlowTask | null) {
   if (!task) return { nodes: [] as Node[], edges: [] as Edge[] };
+  const runtime = parseAgentRuntime(task.executionTrace);
+  const agentLabel = runtime?.logicalRole
+    ? `${runtime.logicalRole} (${runtime.logicalAgentId?.slice(0, 8) ?? "logical"})`
+    : task.agent
+      ? `${task.agent.name} (${task.agent.role})`
+      : "Unassigned Agent";
 
   const nodes: Node[] = [
     {
@@ -140,7 +217,7 @@ function buildAutopsy(task?: FlowTask | null) {
     {
       id: "agent",
       position: { x: 300, y: 100 },
-      data: { label: task.agent ? `${task.agent.name} (${task.agent.role})` : "Unassigned Agent" },
+      data: { label: agentLabel },
       style: { border: "1px solid rgba(16,185,129,0.5)", background: "#052e2b", color: "#d1fae5" }
     },
     {
@@ -188,9 +265,10 @@ function buildAutopsy(task?: FlowTask | null) {
   return { nodes, edges };
 }
 
-export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
+export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: WorkflowConsoleProps) {
   const notify = useVorldXStore((s) => s.pushNotification);
   const realtimeRefreshTimerRef = useRef<number | null>(null);
+  const surfacedInputTasksRef = useRef<Set<string>>(new Set());
   const [flows, setFlows] = useState<FlowListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -265,6 +343,40 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
     return () => clearInterval(interval);
   }, [flowId, loadDetail]);
 
+  useEffect(() => {
+    if (!detail) {
+      return;
+    }
+
+    const surfaced = surfacedInputTasksRef.current;
+    for (const task of detail.tasks) {
+      const stillPaused = task.status === "PAUSED" || task.isPausedForInput;
+      if (!stillPaused) {
+        surfaced.delete(task.id);
+      }
+    }
+
+    if (!onTaskNeedsInput) {
+      return;
+    }
+
+    const candidate = detail.tasks.find((task) => {
+      const paused = task.status === "PAUSED" || task.isPausedForInput;
+      return paused && taskNeedsHumanInput(task) && !surfaced.has(task.id);
+    });
+
+    if (!candidate) {
+      return;
+    }
+
+    surfaced.add(candidate.id);
+    onTaskNeedsInput({
+      taskId: candidate.id,
+      flowId: detail.id,
+      reason: resolveHumanInputReason(candidate)
+    });
+  }, [detail, onTaskNeedsInput]);
+
   const queueRealtimeRefresh = useCallback(
     (candidateFlowId?: string) => {
       if (typeof window === "undefined") {
@@ -309,6 +421,7 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
       "flow.created",
       "flow.updated",
       "flow.progress",
+      "agent.delegated",
       "task.paused",
       "task.resumed",
       "task.completed",
@@ -338,6 +451,14 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
             title: "Kill Switch",
             message: "All active missions were aborted for this organization.",
             type: "warning"
+          });
+        } else if (name === "agent.delegated") {
+          const role =
+            typeof payload?.payload?.toRole === "string" ? payload.payload.toRole : "worker";
+          notify({
+            title: "Delegation",
+            message: `Task delegated to ${role.toLowerCase()} agent.`,
+            type: "info"
           });
         }
       };
@@ -393,7 +514,7 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
   const openIntegrationSetup = useCallback((integrationError: IntegrationErrorTrace) => {
     const target =
       integrationError.connectUrl ||
-      `/app?tab=settings&settingsLane=integrations&toolkit=${encodeURIComponent(integrationError.toolkit)}`;
+      `/app?tab=hub&hubScope=TOOLS&toolkit=${encodeURIComponent(integrationError.toolkit)}`;
     const popup = openCenteredPopup(target, `integrations-${integrationError.toolkit}`);
     if (!popup) {
       window.location.assign(target);
@@ -414,6 +535,26 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
   const runAction = useCallback(async (id: string, action: "pause" | "resume" | "rewind") => {
     setActionKey(`${action}:${id}`);
     try {
+      if (action === "resume") {
+        const task = detail?.tasks.find((candidate) => candidate.id === id) ?? null;
+        const hasInlineInput =
+          fileUrl.trim().length > 0 || overridePrompt.trim().length > 0 || note.trim().length > 0;
+        if (task && taskNeedsHumanInput(task) && !hasInlineInput) {
+          onTaskNeedsInput?.({
+            taskId: task.id,
+            flowId: detail?.id ?? null,
+            reason: resolveHumanInputReason(task)
+          });
+          setDetailTab("human");
+          notify({
+            title: "Human Input Required",
+            message: "Provide required input before resuming this task.",
+            type: "warning"
+          });
+          return;
+        }
+      }
+
       const endpoint = `/api/tasks/${id}/${action === "rewind" ? "rewind" : action}`;
       const body =
         action === "pause"
@@ -455,13 +596,13 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
     } finally {
       setActionKey(null);
     }
-  }, [fileUrl, flowId, loadDetail, loadFlows, note, notify, orgId, overridePrompt, rewindPrompt]);
+  }, [detail, fileUrl, flowId, loadDetail, loadFlows, note, notify, onTaskNeedsInput, orgId, overridePrompt, rewindPrompt]);
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6">
-      <div className="flex items-center justify-between border-b border-white/10 pb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Work Flow</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Work Flow</h2>
           <p className="text-[10px] uppercase tracking-[0.32em] text-slate-500">
             Kanban + Deep Dive Console
           </p>
@@ -477,7 +618,7 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
 
       {error && <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>}
 
-      <div className="grid gap-4 xl:grid-cols-4">
+      <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-4">
         {lanes.map((lane) => (
           <div key={lane.id} className={`vx-panel min-h-[420px] rounded-3xl p-4 ${themeStyle.border}`}>
             <div className="mb-3 flex items-center justify-between">
@@ -521,7 +662,7 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
 
       {flowId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="vx-panel flex h-[90vh] w-full max-w-7xl flex-col overflow-hidden rounded-[34px] border border-white/15">
+          <div className="vx-panel flex h-[90dvh] w-full max-w-7xl flex-col overflow-hidden rounded-[34px] border border-white/15">
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
               <h3 className="font-display text-2xl font-black uppercase">Deep Dive Console</h3>
               <button onClick={() => setFlowId(null)} className="rounded-full border border-white/20 p-2">
@@ -568,10 +709,19 @@ export function WorkflowConsole({ orgId, themeStyle }: WorkflowConsoleProps) {
                       <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
                         {detail.tasks.map((task) => {
                           const integrationError = parseIntegrationError(task.executionTrace);
+                          const runtime = parseAgentRuntime(task.executionTrace);
+                          const runtimeLabel = runtime?.logicalRole
+                            ? `${runtime.logicalRole} | ${runtime.logicalAgentId?.slice(0, 8) ?? "logical"}`
+                            : null;
                           return (
                             <div key={task.id} className="flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2">
                               <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase ${badgeClass(task.status)}`}>{task.status}</span>
-                              <span className="text-xs text-slate-200">{task.agent ? `${task.agent.name} | ${task.agent.role}` : "Unassigned"}</span>
+                              <span className="text-xs text-slate-200">{runtimeLabel ?? (task.agent ? `${task.agent.name} | ${task.agent.role}` : "Unassigned")}</span>
+                              {runtime?.decisionType ? (
+                                <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-cyan-300">
+                                  {runtime.decisionType}
+                                </span>
+                              ) : null}
                               <span className="text-xs text-slate-400">{task.prompt}</span>
                               {integrationError ? (
                                 <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-300">

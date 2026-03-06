@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { buildDnaProfileFromStorage, listDnaProfiles } from "@/lib/dna/profiles";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 type Scope = "ORGANIZATION" | "EMPLOYEE" | "AGENT";
 
@@ -14,6 +15,11 @@ export async function GET(request: NextRequest) {
   const orgId = request.nextUrl.searchParams.get("orgId")?.trim();
   if (!orgId) {
     return NextResponse.json({ ok: false, message: "orgId query param is required." }, { status: 400 });
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const scopeRaw = request.nextUrl.searchParams.get("scope");
@@ -46,6 +52,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const profile = await buildDnaProfileFromStorage({
     orgId,
     scope: parseScope(body?.scope),
@@ -62,4 +73,3 @@ export async function POST(request: NextRequest) {
     { status: 201 }
   );
 }
-

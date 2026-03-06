@@ -21,6 +21,7 @@ export function buildCompanyDataText(input: {
     name: string;
     description: string | null;
     theme: string;
+    executionMode?: string;
     monthlyBudget: unknown;
     monthlyBtuCap: number;
     currentSpend: unknown;
@@ -44,7 +45,8 @@ export function buildCompanyDataText(input: {
       orgId: input.organization.id,
       name: input.organization.name,
       description: input.organization.description ?? "",
-      theme: input.organization.theme
+      theme: input.organization.theme,
+      executionMode: input.organization.executionMode ?? "BALANCED"
     },
     financials: {
       monthlyBudgetUsd: String(input.organization.monthlyBudget),
@@ -104,6 +106,7 @@ export async function ensureCompanyDataFile(
       description: true,
       theme: true,
       monthlyBudget: true,
+      executionMode: true,
       monthlyBtuCap: true,
       currentSpend: true,
       currentBtuBurn: true,

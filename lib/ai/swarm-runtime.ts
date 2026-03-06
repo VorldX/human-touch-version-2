@@ -117,7 +117,7 @@ function normalizeProvider(value: string | undefined): ProviderKind {
 
 function fallbackModel(provider: ProviderKind): string {
   if (provider === "anthropic") return "claude-3-5-sonnet-20241022";
-  if (provider === "gemini") return "gemini-1.5-pro";
+  if (provider === "gemini") return "gemini-2.5-flash";
   return "gpt-4o-mini";
 }
 
@@ -317,13 +317,38 @@ function safeDecryptKey(
   }
 }
 
-function buildSystemPrompt(agentName: string, agentRole: string) {
+function isMainOrchestratorRole(agentRole: string) {
+  const normalized = agentRole.trim().toLowerCase();
+  return normalized.includes("orchestrator") || normalized.includes("main");
+}
+
+function buildMainOrchestratorCriticalRules() {
   return [
+    "CRITICAL RULES (MAIN ORCHESTRATOR):",
+    "1) Determine required platform/toolkit before execution and explicitly include `toolkits: ...` in your plan.",
+    "2) Connection gate is mandatory: if a required toolkit is not connected, stop and request Human Touch to connect it.",
+    "3) Never report external execution as complete unless tool execution evidence is present in context.",
+    "4) For action tasks, provide exact execution fields (for email: recipient, subject, body) without ambiguity.",
+    "5) If a step fails, return root cause plus immediate retry/fallback path instead of silent continuation.",
+    "6) If evidence is missing, explicitly mark outcome as `Not executed` instead of implying completion."
+  ].join("\n");
+}
+
+function buildSystemPrompt(agentName: string, agentRole: string) {
+  const base = [
     `You are ${agentName}, acting as ${agentRole} in VorldX Swarm.`,
     "Follow Human Touch philosophy: be precise, cite assumptions, and avoid unsafe leaps.",
+    "Never fabricate facts, IDs, links, numbers, tool outputs, or completion status.",
+    "If certainty is low, say `Unknown based on current context` and ask for the missing evidence.",
     "If data is missing, explicitly state what is missing and request Human Touch intervention.",
     "Return concise actionable output."
-  ].join("\n");
+  ];
+
+  if (!isMainOrchestratorRole(agentRole)) {
+    return base.join("\n");
+  }
+
+  return [...base, "", buildMainOrchestratorCriticalRules()].join("\n");
 }
 
 function buildUserPrompt(prompt: string, contextBlocks: AgentContextBlock[]) {
@@ -668,6 +693,34 @@ function resolveFallbackSettings(input: AgentExecutionInput): BrainSettings | nu
   };
 }
 
+function resolveEmergencyFallbackSettings(
+  input: AgentExecutionInput,
+  attemptedProviders: ProviderKind[]
+): BrainSettings | null {
+  const runtime = input.organizationRuntime;
+  const candidates: ProviderKind[] = ["gemini", "anthropic", "openai"];
+
+  for (const provider of candidates) {
+    if (attemptedProviders.includes(provider)) {
+      continue;
+    }
+
+    const resolvedKey = resolveKeyForProvider(provider, null, runtime);
+    if (!resolvedKey.apiKey) {
+      continue;
+    }
+
+    return {
+      provider,
+      model: fallbackModel(provider),
+      apiKey: resolvedKey.apiKey,
+      apiSource: resolvedKey.apiSource
+    };
+  }
+
+  return null;
+}
+
 export async function executeSwarmAgent(input: AgentExecutionInput): Promise<AgentExecutionResult> {
   const startedAt = Date.now();
   const system =
@@ -680,6 +733,13 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
       : buildUserPrompt(input.prompt, input.contextBlocks);
   const primary = resolvePrimarySettings(input);
   const fallback = resolveFallbackSettings(input);
+  const preferredProviderRaw =
+    typeof input.modelPreference?.provider === "string"
+      ? input.modelPreference.provider.trim()
+      : "";
+  const pinnedProvider = preferredProviderRaw
+    ? normalizeProvider(preferredProviderRaw)
+    : null;
   const contextDigest = createHash("sha256")
     .update(
       input.contextBlocks
@@ -741,7 +801,16 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
       }
     };
   } catch (primaryError) {
-    if (!fallback) {
+    let candidateFallback =
+      fallback ?? resolveEmergencyFallbackSettings(input, [primary.provider]);
+
+    // If caller explicitly selected a provider (for example from UI model picker),
+    // do not silently switch to another provider on fallback.
+    if (pinnedProvider && candidateFallback && candidateFallback.provider !== pinnedProvider) {
+      candidateFallback = null;
+    }
+
+    if (!candidateFallback) {
       return {
         ok: false,
         fallbackUsed: false,
@@ -762,11 +831,11 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     }
 
     try {
-      const providerResult = await invokeProvider(fallback, system, userPrompt);
+      const providerResult = await invokeProvider(candidateFallback, system, userPrompt);
       const outputText = providerResult.text;
       const billing = computeBilling(
-        fallback.provider,
-        fallback.model,
+        candidateFallback.provider,
+        candidateFallback.model,
         providerResult.usage,
         input.organizationRuntime
       );
@@ -774,9 +843,9 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
       return {
         ok: true,
         outputText,
-        usedProvider: fallback.provider,
-        usedModel: fallback.model,
-        apiSource: fallback.apiSource,
+        usedProvider: candidateFallback.provider,
+        usedModel: candidateFallback.model,
+        apiSource: candidateFallback.apiSource,
         tokenUsage: providerResult.usage,
         billing,
         fallbackUsed: true,
@@ -784,10 +853,11 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           taskId: input.taskId,
           flowId: input.flowId,
           agentId: input.agent.id,
-          provider: fallback.provider,
-          model: fallback.model,
-          apiSource: fallback.apiSource,
+          provider: candidateFallback.provider,
+          model: candidateFallback.model,
+          apiSource: candidateFallback.apiSource,
           fallbackUsed: true,
+          fallbackSource: fallback ? "configured" : "emergency",
           primaryError:
             primaryError instanceof Error ? primaryError.message : "Primary model call failed.",
           contextCount: input.contextBlocks.length,
@@ -807,9 +877,10 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           taskId: input.taskId,
           flowId: input.flowId,
           agentId: input.agent.id,
-          provider: fallback.provider,
-          model: fallback.model,
+          provider: candidateFallback.provider,
+          model: candidateFallback.model,
           fallbackUsed: true,
+          fallbackSource: fallback ? "configured" : "emergency",
           primaryError:
             primaryError instanceof Error ? primaryError.message : "Primary model call failed.",
           fallbackError:

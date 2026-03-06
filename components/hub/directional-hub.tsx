@@ -119,7 +119,7 @@ export function DirectionalHub({ orgId, themeStyle }: DirectionalHubProps) {
         </button>
       </div>
 
-      <div className="grid gap-3 xl:grid-cols-[1fr_1fr]">
+      <div className="grid gap-3 2xl:grid-cols-[1fr_1fr]">
         <div className={`vx-panel rounded-2xl p-3 ${themeStyle.border}`}>
           {loading ? (
             <div className="inline-flex items-center gap-2 text-sm text-slate-400">
@@ -183,4 +183,3 @@ export function DirectionalHub({ orgId, themeStyle }: DirectionalHubProps) {
     </div>
   );
 }
-

@@ -374,12 +374,12 @@ export async function runAgentEngine(
   const actionsTaken: AgentRunResponse["actions_taken"] = [];
 
   if (planner.intent === "send_email") {
-    const rawRecipientEmail =
+    let recipientEmail =
       asText(args.recipient_email) || asText(args.to) || pickEmailFromPrompt(prompt);
     const recipientName = asText(args.recipient_name) || asText(args.name);
 
     const missing = new Set<string>(planner.needs);
-    if (!rawRecipientEmail) {
+    if (!recipientEmail) {
       missing.add("recipient_email");
     }
 
@@ -393,7 +393,7 @@ export async function runAgentEngine(
       };
     }
 
-    if (!isValidEmail(rawRecipientEmail)) {
+    if (!isValidEmail(recipientEmail)) {
       return {
         status: "needs_input",
         assistant_message: "Please provide a valid recipient email address.",
@@ -409,7 +409,7 @@ export async function runAgentEngine(
       try {
         const generated = await deps.writeEmail({
           prompt,
-          recipientEmail: rawRecipientEmail,
+          recipientEmail,
           ...(recipientName ? { recipientName } : {}),
           ...(asText(args.context) ? { extraContext: asText(args.context) } : {})
         });
@@ -418,7 +418,7 @@ export async function runAgentEngine(
       } catch {
         const fallbackDraft = buildDraftFallback({
           prompt,
-          recipientEmail: rawRecipientEmail,
+          recipientEmail,
           ...(recipientName ? { recipientName } : {})
         });
         subject = asText(fallbackDraft.subject);
@@ -454,7 +454,7 @@ export async function runAgentEngine(
         assistant_message:
           planner.assistant_message || "Please confirm this draft before sending.",
         draft: {
-          to: rawRecipientEmail,
+          to: recipientEmail,
           subject,
           body
         },
@@ -462,7 +462,7 @@ export async function runAgentEngine(
           {
             type: "draft_created",
             meta: {
-              to: rawRecipientEmail,
+              to: recipientEmail,
               subjectLength: subject.length,
               bodyLength: body.length
             }
@@ -471,10 +471,64 @@ export async function runAgentEngine(
       };
     }
 
+    const confirmDraftInput = asRecord(providedInput.draft);
+    const confirmRecipient =
+      asText(providedInput.recipient_email) ||
+      asText(providedInput.to) ||
+      asText(confirmDraftInput.to);
+    const confirmSubject = asText(providedInput.subject) || asText(confirmDraftInput.subject);
+    const confirmBody = asText(providedInput.body) || asText(confirmDraftInput.body);
+
+    if (!confirmRecipient || !confirmSubject || !confirmBody) {
+      return {
+        status: "needs_confirmation",
+        assistant_message:
+          "Approval requires reviewing the draft preview first. Please approve the visible draft to send.",
+        draft: {
+          to: recipientEmail,
+          subject,
+          body
+        },
+        actions_taken: [
+          {
+            type: "draft_created",
+            meta: {
+              to: recipientEmail,
+              subjectLength: subject.length,
+              bodyLength: body.length
+            }
+          }
+        ]
+      };
+    }
+
+    if (!isValidEmail(confirmRecipient)) {
+      return {
+        status: "needs_input",
+        assistant_message: "Please provide a valid recipient email address.",
+        required_inputs: [toRequiredInput("recipient_email")]
+      };
+    }
+
+    recipientEmail = confirmRecipient;
+    subject = confirmSubject;
+    body = confirmBody;
+
+    if (body.length > MAX_EMAIL_BODY_CHARS) {
+      return {
+        status: "error",
+        assistant_message: "Draft is too long. Please shorten the request.",
+        error: {
+          code: "INVALID_DRAFT",
+          message: `Email body exceeds ${MAX_EMAIL_BODY_CHARS} characters.`
+        }
+      };
+    }
+
     const sendResult = await deps.executeGmailAction({
       action: "SEND_EMAIL",
       arguments: {
-        to: rawRecipientEmail,
+        to: recipientEmail,
         subject,
         body,
         ...(asText(args.cc) ? { cc: asText(args.cc) } : {}),
@@ -489,7 +543,7 @@ export async function runAgentEngine(
     const sendAction = {
       type: "email_sent",
       meta: {
-        to: rawRecipientEmail,
+        to: recipientEmail,
         subject,
         toolSlug: sendResult.toolSlug
       }
@@ -501,7 +555,7 @@ export async function runAgentEngine(
 
     return {
       status: "completed",
-      assistant_message: `Email sent to ${rawRecipientEmail}.`,
+      assistant_message: `Email sent to ${recipientEmail}.`,
       actions_taken: actionsTaken
     };
   }

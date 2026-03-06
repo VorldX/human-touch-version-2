@@ -1528,7 +1528,7 @@ async function main() {
         code: "INTEGRATION_NOT_CONNECTED",
         toolkit: "notion",
         action: "LEGAL_REVIEW_NOTE",
-        connectUrl: "/app?tab=settings&settingsLane=integrations&toolkit=notion"
+        connectUrl: "/app?tab=hub&hubScope=TOOLS&toolkit=notion"
       },
       seedTag: SEED_TAG
     },

@@ -14,6 +14,7 @@ import {
   recordPassivePolicy,
   recordPassiveSpend
 } from "@/lib/enterprise/passive";
+import { ensureMainAgentProfile } from "@/lib/agent/orchestration/runtime";
 import { linkFlowToDirection, updateDirection } from "@/lib/direction/directions";
 import {
   composioAllowlistedToolkits,
@@ -28,6 +29,9 @@ interface LaunchFlowRequest {
   orgId?: string;
   prompt?: string;
   directionId?: string;
+  planId?: string;
+  fallbackPlanId?: string;
+  executionMode?: "ECO" | "BALANCED" | "TURBO";
   swarmDensity?: number;
   predictedBurn?: number;
   requiredSignatures?: number;
@@ -97,13 +101,22 @@ function splitDirectionIntoTasks(direction: string, swarmDensity: number) {
   return unique;
 }
 
+function formatToolkitMarker(toolkits: string[]) {
+  return `toolkits: ${toolkits.length > 0 ? toolkits.join(",") : "none"}`;
+}
+
 function buildTaskPlan(prompt: string, swarmDensity: number) {
   const executionSteps = splitDirectionIntoTasks(prompt, swarmDensity);
-  const planStep = `Main Agent planning phase: break this mission into ordered subtasks, dependencies, and required toolkit access before execution. Mission: ${compactText(prompt)}`;
+  const mission = compactText(prompt);
+  const missionToolkits = inferRequestedToolkits(mission);
+  const planStep = `Main Agent planning phase: break this mission into ordered subtasks, dependencies, and required toolkit access before execution. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`;
 
   return [
     planStep,
-    ...executionSteps.map((step, index) => `Execution step ${index + 1}: ${step}`)
+    ...executionSteps.map((step, index) => {
+      const stepToolkits = [...new Set([...missionToolkits, ...inferRequestedToolkits(step)])];
+      return `Execution step ${index + 1}: ${step} | ${formatToolkitMarker(stepToolkits)}`;
+    })
   ];
 }
 
@@ -215,6 +228,8 @@ export async function POST(request: NextRequest) {
   const orgId = body.orgId?.trim();
   const prompt = body.prompt?.trim();
   const directionId = body.directionId?.trim();
+  const planId = body.planId?.trim();
+  const fallbackPlanId = body.fallbackPlanId?.trim();
   const swarmDensity = asPositiveInt(body.swarmDensity);
   const predictedBurn = asPositiveInt(body.predictedBurn);
   const requiredSignatures = asPositiveInt(body.requiredSignatures);
@@ -249,7 +264,7 @@ export async function POST(request: NextRequest) {
   try {
     const org = await prisma.organization.findUnique({
       where: { id: orgId },
-      select: { id: true, monthlyBtuCap: true }
+      select: { id: true, monthlyBtuCap: true, executionMode: true }
     });
 
     if (!org) {
@@ -427,7 +442,30 @@ export async function POST(request: NextRequest) {
         });
       }
 
+      if (planId) {
+        await tx.memoryEntry.create({
+          data: {
+            orgId,
+            tier: "ORG",
+            key: `plan.flow.${planId}.${created.id}`,
+            value: {
+              planId,
+              flowId: created.id,
+              directionId: directionId ?? null,
+              fallbackPlanId: fallbackPlanId ?? null,
+              linkedAt: new Date().toISOString()
+            }
+          }
+        });
+      }
+
       return created;
+    });
+
+    await ensureMainAgentProfile({
+      orgId,
+      flowId: flow.id,
+      missionGoal: prompt
     });
 
     if (directionId) {
@@ -446,7 +484,8 @@ export async function POST(request: NextRequest) {
       taskCount: taskPrompts.length,
       requestedToolkits,
       initiatedByUserId,
-      executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+      executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+      orgExecutionMode: org.executionMode
     });
 
     let localKickWarning: string | undefined;
@@ -470,7 +509,8 @@ export async function POST(request: NextRequest) {
               taskCount: taskPrompts.length,
               requestedToolkits,
               initiatedByUserId,
-              executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+              executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+              orgExecutionMode: org.executionMode
             }
           }
         ]),
@@ -536,8 +576,11 @@ export async function POST(request: NextRequest) {
           predictedBurn: flow.predictedBurn,
           requiredSignatures: flow.requiredSignatures,
           ...(directionId ? { directionId } : {}),
+          ...(planId ? { planId } : {}),
+          ...(fallbackPlanId ? { fallbackPlanId } : {}),
           taskCount: taskPrompts.length,
-          executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+          executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+          orgExecutionMode: org.executionMode
         },
         warning: [publish.ok ? undefined : publish.message, localKickWarning]
           .filter(Boolean)

@@ -683,6 +683,33 @@ export async function executeAgentTool(input: ExecuteAgentToolInput): Promise<Ex
         };
       }
 
+      if (code === "INVALID_TOOL_ACTION") {
+        return {
+          ok: false,
+          attempts: attempt,
+          error: {
+            code: "INVALID_TOOL_ACTION",
+            message,
+            toolkit,
+            action
+          }
+        };
+      }
+
+      if (code === "TOOL_EXECUTION_FAILED") {
+        return {
+          ok: false,
+          attempts: attempt,
+          error: {
+            code: "TOOL_EXECUTION_FAILED",
+            message,
+            toolkit,
+            action,
+            retryable: false
+          }
+        };
+      }
+
       const retryable = isTransientFailure(status, message);
       if (retryable && attempt < RETRY_ATTEMPTS) {
         await sleep(200 * attempt);

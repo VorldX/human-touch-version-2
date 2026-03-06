@@ -489,7 +489,7 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Squad</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Squad</h2>
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             Human / AI Personnel Grid
           </p>
@@ -625,7 +625,7 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4 2xl:grid-cols-2">
         <PersonnelPanel
           title="Human Personnel"
           items={humans}
@@ -646,7 +646,7 @@ export function SquadConsole({ orgId, themeStyle }: SquadConsoleProps) {
 
       {showRecruitModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="vx-panel vx-scrollbar h-[90vh] w-full max-w-4xl overflow-y-auto rounded-[34px] border border-white/15 p-6">
+          <div className="vx-panel vx-scrollbar h-[90dvh] w-full max-w-4xl overflow-y-auto rounded-[34px] border border-white/15 p-6">
             <div className="mb-4 flex items-center justify-between border-b border-white/10 pb-3">
               <div>
                 <h3 className="font-display text-2xl font-black uppercase tracking-tight">

@@ -46,8 +46,113 @@ interface AppPopupState {
 const TOOLKIT_APP_FALLBACKS: Record<string, string> = {
   gmail: "https://mail.google.com",
   slack: "https://app.slack.com/client",
-  notion: "https://www.notion.so"
+  notion: "https://www.notion.so",
+  github: "https://github.com",
+  googlecalendar: "https://calendar.google.com",
+  googledrive: "https://drive.google.com",
+  googledocs: "https://docs.google.com/document",
+  googlesheets: "https://docs.google.com/spreadsheets",
+  outlook: "https://outlook.live.com",
+  microsoftteams: "https://teams.microsoft.com",
+  jira: "https://www.atlassian.com/software/jira",
+  trello: "https://trello.com",
+  asana: "https://app.asana.com",
+  monday: "https://monday.com",
+  linear: "https://linear.app",
+  shopify: "https://www.shopify.com",
+  stripe: "https://dashboard.stripe.com",
+  salesforce: "https://www.salesforce.com",
+  hubspot: "https://app.hubspot.com",
+  pipedrive: "https://app.pipedrive.com",
+  quickbooks: "https://quickbooks.intuit.com",
+  zendesk: "https://www.zendesk.com",
+  whatsapp: "https://web.whatsapp.com",
+  twitter: "https://x.com",
+  linkedin: "https://www.linkedin.com",
+  youtube: "https://studio.youtube.com",
+  zoom: "https://app.zoom.us",
+  intercom: "https://www.intercom.com",
+  typeform: "https://admin.typeform.com"
 };
+
+const TOOLKIT_ICON_SLUGS: Record<string, string> = {
+  gmail: "gmail",
+  slack: "slack",
+  notion: "notion",
+  github: "github",
+  googlecalendar: "googlecalendar",
+  googledrive: "googledrive",
+  googledocs: "googledocs",
+  googlesheets: "googlesheets",
+  outlook: "microsoftoutlook",
+  microsoftteams: "microsoftteams",
+  jira: "jira",
+  trello: "trello",
+  asana: "asana",
+  monday: "mondaydotcom",
+  linear: "linear",
+  shopify: "shopify",
+  stripe: "stripe",
+  salesforce: "salesforce",
+  hubspot: "hubspot",
+  pipedrive: "pipedrive",
+  quickbooks: "intuitquickbooks",
+  zendesk: "zendesk",
+  whatsapp: "whatsapp",
+  twitter: "x",
+  linkedin: "linkedin",
+  youtube: "youtube",
+  zoom: "zoom",
+  intercom: "intercom",
+  typeform: "typeform"
+};
+
+function iconCandidateUrls(toolkitSlug: string, toolkitLogoUrl?: string | null) {
+  const normalized = toolkitSlug.trim().toLowerCase();
+  const simpleIconSlug = TOOLKIT_ICON_SLUGS[normalized] ?? normalized.replace(/[^a-z0-9]/g, "");
+  const candidates: string[] = [];
+
+  if (toolkitLogoUrl?.trim()) {
+    candidates.push(toolkitLogoUrl.trim());
+  }
+  if (simpleIconSlug) {
+    candidates.push(`https://cdn.simpleicons.org/${encodeURIComponent(simpleIconSlug)}/ffffff`);
+    candidates.push(`https://cdn.simpleicons.org/${encodeURIComponent(simpleIconSlug)}`);
+  }
+
+  return [...new Set(candidates)];
+}
+
+function ToolkitIcon(props: {
+  toolkitSlug: string;
+  toolkitName: string;
+  logoUrl?: string | null;
+}) {
+  const sources = iconCandidateUrls(props.toolkitSlug, props.logoUrl);
+  const [index, setIndex] = useState(0);
+  const src = sources[index] ?? null;
+  const initials = (props.toolkitName || props.toolkitSlug).trim().slice(0, 2).toUpperCase();
+
+  if (!src) {
+    return (
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-[10px] font-bold text-slate-200">
+        {initials}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/35">
+      <img
+        src={src}
+        alt={`${props.toolkitName} icon`}
+        className="h-5 w-5 object-contain"
+        loading="lazy"
+        onError={() => setIndex((current) => current + 1)}
+      />
+    </div>
+  );
+}
 
 function resolveAppUrl(toolkitSlug: string, toolkitAppUrl?: string | null) {
   const candidate = (toolkitAppUrl?.trim() || TOOLKIT_APP_FALLBACKS[toolkitSlug] || "").trim();
@@ -82,6 +187,27 @@ function titleCase(input: string) {
     .split(/[-_]/g)
     .map((part) => (part.length > 0 ? part[0].toUpperCase() + part.slice(1) : part))
     .join(" ");
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<{
+  payload: T | null;
+  rawText: string;
+}> {
+  const rawText = await response.text();
+  if (!rawText) {
+    return { payload: null, rawText: "" };
+  }
+  try {
+    return {
+      payload: JSON.parse(rawText) as T,
+      rawText
+    };
+  } catch {
+    return {
+      payload: null,
+      rawText
+    };
+  }
 }
 
 export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsoleProps) {
@@ -125,14 +251,19 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
           }
         );
 
-        const toolkitsPayload = (await toolkitsResponse.json()) as {
+        const { payload: toolkitsPayload, rawText: toolkitsRawText } = await parseJsonResponse<{
           ok?: boolean;
           enabled?: boolean;
           toolkits?: ToolkitItem[];
           message?: string;
-        };
-        if (!toolkitsResponse.ok || !toolkitsPayload.ok) {
-          throw new Error(toolkitsPayload.message ?? "Failed loading available apps.");
+        }>(toolkitsResponse);
+        if (!toolkitsResponse.ok || !toolkitsPayload?.ok) {
+          throw new Error(
+            toolkitsPayload?.message ??
+              (toolkitsRawText
+                ? `Failed loading available apps (${toolkitsResponse.status}): ${toolkitsRawText.slice(0, 180)}`
+                : "Failed loading available apps.")
+          );
         }
 
         setEnabled(Boolean(toolkitsPayload.enabled));
@@ -157,14 +288,19 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
             headers: authHeaders
           }
         );
-        const connectionsPayload = (await connectionsResponse.json()) as {
+        const { payload: connectionsPayload, rawText: connectionsRawText } = await parseJsonResponse<{
           ok?: boolean;
           connections?: ConnectionItem[];
           message?: string;
-        };
+        }>(connectionsResponse);
 
-        if (!connectionsResponse.ok || !connectionsPayload.ok) {
-          throw new Error(connectionsPayload.message ?? "Failed loading your connections.");
+        if (!connectionsResponse.ok || !connectionsPayload?.ok) {
+          throw new Error(
+            connectionsPayload?.message ??
+              (connectionsRawText
+                ? `Failed loading your connections (${connectionsResponse.status}): ${connectionsRawText.slice(0, 180)}`
+                : "Failed loading your connections.")
+          );
         }
 
         setConnections(connectionsPayload.connections ?? []);
@@ -198,7 +334,7 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
 
       setActionToolkit(toolkit);
       try {
-        const returnTo = `${window.location.origin}/app?tab=settings&settingsLane=integrations`;
+        const returnTo = `${window.location.origin}/app?tab=hub&hubScope=TOOLS`;
         const response = await fetch("/api/integrations/composio/connect", {
           method: "POST",
           headers: {
@@ -212,13 +348,18 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           connectUrl?: string;
           message?: string;
-        };
-        if (!response.ok || !payload.ok || !payload.connectUrl) {
-          throw new Error(payload.message ?? "Unable to start connect flow.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload.connectUrl) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Unable to start connect flow (${response.status}): ${rawText.slice(0, 180)}`
+                : "Unable to start connect flow.")
+          );
         }
 
         window.location.assign(payload.connectUrl);
@@ -248,9 +389,14 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
           headers: authHeaders
         }
       );
-      const payload = (await response.json()) as { ok?: boolean; message?: string };
-      if (!response.ok || !payload.ok) {
-        throw new Error(payload.message ?? "Disconnect failed.");
+      const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+        response
+      );
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText ? `Disconnect failed (${response.status}): ${rawText.slice(0, 180)}` : "Disconnect failed.")
+        );
       }
       setDisconnectTarget(null);
       await loadIntegrations(true);
@@ -375,11 +521,18 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
                   return (
                     <article key={toolkit.slug} className="rounded-2xl border border-white/10 bg-black/30 p-3">
                       <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-semibold text-white">{toolkit.name}</p>
-                          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
-                            {toolkit.slug}
-                          </p>
+                        <div className="flex min-w-0 items-start gap-3">
+                          <ToolkitIcon
+                            toolkitSlug={toolkit.slug}
+                            toolkitName={toolkit.name}
+                            logoUrl={toolkit.logoUrl}
+                          />
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-white">{toolkit.name}</p>
+                            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
+                              {toolkit.slug}
+                            </p>
+                          </div>
                         </div>
                         <span
                           className={`rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] ${statusClasses(
@@ -446,14 +599,21 @@ export function IntegrationsConsole({ orgId, themeStyle }: IntegrationsConsolePr
                     key={`${connection.connectionId}:${connection.updatedAt}`}
                     className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/30 px-3 py-2"
                   >
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white">
-                        {titleCase(connection.toolkit)}
-                      </p>
-                      <p className="text-[10px] text-slate-500">
-                        id: {connection.connectionId} | Updated:{" "}
-                        {new Date(connection.updatedAt).toLocaleString()}
-                      </p>
+                    <div className="flex min-w-0 items-center gap-2">
+                      <ToolkitIcon
+                        toolkitSlug={connection.toolkit}
+                        toolkitName={titleCase(connection.toolkit)}
+                        logoUrl={toolkitBySlug.get(connection.toolkit)?.logoUrl ?? null}
+                      />
+                      <div className="min-w-0">
+                        <p className="truncate text-xs font-semibold uppercase tracking-[0.14em] text-white">
+                          {titleCase(connection.toolkit)}
+                        </p>
+                        <p className="text-[10px] text-slate-500">
+                          id: {connection.connectionId} | Updated:{" "}
+                          {new Date(connection.updatedAt).toLocaleString()}
+                        </p>
+                      </div>
                     </div>
                     <div className="flex items-center gap-2">
                       <span

@@ -5,6 +5,7 @@ import {
   getOrganizationalOutputFiles,
   updateCompanyDataFile
 } from "@/lib/hub/organization-hub";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 export async function GET(request: NextRequest) {
   const orgId = request.nextUrl.searchParams.get("orgId")?.trim();
@@ -16,6 +17,11 @@ export async function GET(request: NextRequest) {
       },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   try {
@@ -64,6 +70,11 @@ export async function PUT(request: NextRequest) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   if (typeof content !== "string" || content.trim().length === 0) {
     return NextResponse.json(
       {
@@ -95,4 +106,3 @@ export async function PUT(request: NextRequest) {
     );
   }
 }
-

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ComposioServiceCore } from "../lib/integrations/composio/service-core.ts";
+import { ComposioServiceCore, inferRequestedToolkits } from "../lib/integrations/composio/service-core.ts";
 
 interface InMemoryConnection {
   id: string;
@@ -165,7 +165,7 @@ test("createConnection stores pending connection and returns connect URL", async
     userId: "user-1",
     orgId: "org-1",
     toolkit: "gmail",
-    returnTo: "/app?tab=settings&settingsLane=integrations"
+    returnTo: "/app?tab=hub&hubScope=TOOLS"
   });
 
   assert.equal(result.connectUrl, "https://connect.example.com/authorize");
@@ -321,11 +321,23 @@ test("createConnection uses custom auth config when toolkit OAuth credentials ar
     userId: "user-1",
     orgId: "org-1",
     toolkit: "gmail",
-    returnTo: "/app?tab=settings&settingsLane=integrations"
+    returnTo: "/app?tab=hub&hubScope=TOOLS"
   });
 
   assert.equal(createdAuthConfigs.length, 1);
   assert.equal(createdAuthConfigs[0]?.toolkit, "gmail");
   assert.equal(createdAuthConfigs[0]?.options?.type, "use_custom_auth");
   assert.equal(linkedWithAuthConfigIds[0], "ac_custom_001");
+});
+
+test("inferRequestedToolkits detects compact/spaced toolkit names and intent aliases", () => {
+  const inferred = inferRequestedToolkits(
+    "Schedule a Google Calendar invite, start a Zoom video call, and sync CRM notes in Quick Books.",
+    ["googlecalendar", "zoom", "hubspot", "salesforce", "quickbooks"]
+  );
+
+  assert.deepEqual(
+    [...inferred].sort(),
+    ["googlecalendar", "hubspot", "quickbooks", "salesforce", "zoom"].sort()
+  );
 });

@@ -37,88 +37,110 @@ export async function GET(
   request: NextRequest,
   context: { params: Promise<{ planId: string }> }
 ) {
-  const params = await context.params;
-  const planId = params.planId?.trim() ?? "";
-  const orgId = request.nextUrl.searchParams.get("orgId")?.trim() ?? "";
+  try {
+    const params = await context.params;
+    const planId = params.planId?.trim() ?? "";
+    const orgId = request.nextUrl.searchParams.get("orgId")?.trim() ?? "";
 
-  if (!planId || !orgId) {
+    if (!planId || !orgId) {
+      return NextResponse.json(
+        { ok: false, message: "orgId and planId are required." },
+        { status: 400 }
+      );
+    }
+
+    const access = await requireOrgAccess({ request, orgId });
+    if (!access.ok) {
+      return access.response;
+    }
+
+    const plan = await getPlan(orgId, planId);
+    if (!plan) {
+      return NextResponse.json({ ok: false, message: "Plan not found." }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      plan
+    });
+  } catch (error) {
+    console.error("[api/plans/:planId][GET] unexpected error", error);
     return NextResponse.json(
-      { ok: false, message: "orgId and planId are required." },
-      { status: 400 }
+      {
+        ok: false,
+        message: "Failed to load plan."
+      },
+      { status: 500 }
     );
   }
-
-  const access = await requireOrgAccess({ request, orgId });
-  if (!access.ok) {
-    return access.response;
-  }
-
-  const plan = await getPlan(orgId, planId);
-  if (!plan) {
-    return NextResponse.json({ ok: false, message: "Plan not found." }, { status: 404 });
-  }
-
-  return NextResponse.json({
-    ok: true,
-    plan
-  });
 }
 
 export async function PATCH(
   request: NextRequest,
   context: { params: Promise<{ planId: string }> }
 ) {
-  const params = await context.params;
-  const planId = params.planId?.trim() ?? "";
+  try {
+    const params = await context.params;
+    const planId = params.planId?.trim() ?? "";
 
-  const body = (await request.json().catch(() => null)) as
-    | {
-        orgId?: string;
-        title?: string;
-        summary?: string;
-        direction?: string;
-        directionId?: string | null;
-        humanPlan?: string;
-        primaryPlan?: Record<string, unknown>;
-        fallbackPlan?: Record<string, unknown>;
-        status?: PlanStatus;
-        source?: PlanSource;
-        ownerEmail?: string | null;
-      }
-    | null;
+    const body = (await request.json().catch(() => null)) as
+      | {
+          orgId?: string;
+          title?: string;
+          summary?: string;
+          direction?: string;
+          directionId?: string | null;
+          humanPlan?: string;
+          primaryPlan?: Record<string, unknown>;
+          fallbackPlan?: Record<string, unknown>;
+          status?: PlanStatus;
+          source?: PlanSource;
+          ownerEmail?: string | null;
+        }
+      | null;
 
-  const orgId = asTrimmed(body?.orgId);
-  if (!planId || !orgId) {
+    const orgId = asTrimmed(body?.orgId);
+    if (!planId || !orgId) {
+      return NextResponse.json(
+        { ok: false, message: "orgId and planId are required." },
+        { status: 400 }
+      );
+    }
+
+    const access = await requireOrgAccess({ request, orgId });
+    if (!access.ok) {
+      return access.response;
+    }
+
+    const updated = await updatePlan(orgId, planId, {
+      ...(body?.title !== undefined ? { title: asTrimmed(body.title) } : {}),
+      ...(body?.summary !== undefined ? { summary: asTrimmed(body.summary) } : {}),
+      ...(body?.direction !== undefined ? { direction: asTrimmed(body.direction) } : {}),
+      ...(body?.directionId !== undefined ? { directionId: body.directionId } : {}),
+      ...(body?.humanPlan !== undefined ? { humanPlan: body.humanPlan } : {}),
+      ...(body?.primaryPlan !== undefined ? { primaryPlan: asObject(body.primaryPlan) } : {}),
+      ...(body?.fallbackPlan !== undefined ? { fallbackPlan: asObject(body.fallbackPlan) } : {}),
+      ...(parseStatus(body?.status) ? { status: parseStatus(body?.status) } : {}),
+      ...(parseSource(body?.source) ? { source: parseSource(body?.source) } : {}),
+      ...(body?.ownerEmail !== undefined ? { ownerEmail: body.ownerEmail } : {})
+    });
+
+    if (!updated) {
+      return NextResponse.json({ ok: false, message: "Plan not found." }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      plan: updated
+    });
+  } catch (error) {
+    console.error("[api/plans/:planId][PATCH] unexpected error", error);
     return NextResponse.json(
-      { ok: false, message: "orgId and planId are required." },
-      { status: 400 }
+      {
+        ok: false,
+        message: "Failed to update plan."
+      },
+      { status: 500 }
     );
   }
-
-  const access = await requireOrgAccess({ request, orgId });
-  if (!access.ok) {
-    return access.response;
-  }
-
-  const updated = await updatePlan(orgId, planId, {
-    ...(body?.title !== undefined ? { title: asTrimmed(body.title) } : {}),
-    ...(body?.summary !== undefined ? { summary: asTrimmed(body.summary) } : {}),
-    ...(body?.direction !== undefined ? { direction: asTrimmed(body.direction) } : {}),
-    ...(body?.directionId !== undefined ? { directionId: body.directionId } : {}),
-    ...(body?.humanPlan !== undefined ? { humanPlan: body.humanPlan } : {}),
-    ...(body?.primaryPlan !== undefined ? { primaryPlan: asObject(body.primaryPlan) } : {}),
-    ...(body?.fallbackPlan !== undefined ? { fallbackPlan: asObject(body.fallbackPlan) } : {}),
-    ...(parseStatus(body?.status) ? { status: parseStatus(body?.status) } : {}),
-    ...(parseSource(body?.source) ? { source: parseSource(body?.source) } : {}),
-    ...(body?.ownerEmail !== undefined ? { ownerEmail: body.ownerEmail } : {})
-  });
-
-  if (!updated) {
-    return NextResponse.json({ ok: false, message: "Plan not found." }, { status: 404 });
-  }
-
-  return NextResponse.json({
-    ok: true,
-    plan: updated
-  });
 }

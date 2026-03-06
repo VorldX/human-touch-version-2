@@ -3,12 +3,12 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 
-import { IntegrationsConsole } from "@/components/settings/integrations-console";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
-type Lane = "webhooks" | "identity" | "integrations" | "rails" | "orchestration";
+type Lane = "webhooks" | "identity" | "rails" | "orchestration";
 type RuntimeMode = "BYOK" | "PLATFORM_MANAGED";
 type ServicePlan = "STARTER" | "GROWTH" | "ENTERPRISE";
+type ExecutionMode = "ECO" | "BALANCED" | "TURBO";
 
 interface WebhookItem {
   id: string;
@@ -44,6 +44,7 @@ interface IdentityAgent {
 
 interface OrganizationLlmSettings {
   mode: RuntimeMode;
+  executionMode: ExecutionMode;
   provider: string;
   model: string;
   fallbackProvider: string;
@@ -94,6 +95,7 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
   const [agents, setAgents] = useState<IdentityAgent[]>([]);
   const [llmSettings, setLlmSettings] = useState<OrganizationLlmSettings>({
     mode: "BYOK",
+    executionMode: "BALANCED",
     provider: "OpenAI",
     model: "gpt-4o-mini",
     fallbackProvider: "Anthropic",
@@ -157,6 +159,7 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           ok?: boolean;
           message?: string;
           settings?: OrganizationLlmSettings;
+          executionMode?: ExecutionMode;
         };
         const creditsPayload = (await creditsRes.json()) as {
           ok?: boolean;
@@ -175,7 +178,10 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
         setRails(railsPayload.rails ?? []);
         setAccounts(identityPayload.accounts ?? []);
         setAgents(identityPayload.agents ?? []);
-        setLlmSettings(llmPayload.settings);
+        setLlmSettings({
+          ...llmPayload.settings,
+          executionMode: llmPayload.executionMode ?? llmPayload.settings.executionMode ?? "BALANCED"
+        });
         setCreditsWallet(creditsPayload.wallet);
         setPrimaryProviderApiKey("");
         setFallbackProviderApiKey("");
@@ -318,6 +324,7 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           body: JSON.stringify({
             orgId,
             mode: llmSettings.mode,
+            executionMode: llmSettings.executionMode,
             provider: llmSettings.provider,
             model: llmSettings.model,
             fallbackProvider: llmSettings.fallbackProvider,
@@ -329,11 +336,19 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
               : {})
           })
         });
-        const payload = (await response.json()) as { ok?: boolean; message?: string; settings?: OrganizationLlmSettings };
+        const payload = (await response.json()) as {
+          ok?: boolean;
+          message?: string;
+          settings?: OrganizationLlmSettings;
+          executionMode?: ExecutionMode;
+        };
         if (!response.ok || !payload.ok || !payload.settings) {
           throw new Error(payload.message ?? "Save failed.");
         }
-        setLlmSettings(payload.settings);
+        setLlmSettings({
+          ...payload.settings,
+          executionMode: payload.executionMode ?? payload.settings.executionMode ?? llmSettings.executionMode
+        });
         setPrimaryProviderApiKey("");
         setFallbackProviderApiKey("");
       } catch (requestError) {
@@ -399,8 +414,8 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
 
   return (
     <div className="mx-auto max-w-[1280px] space-y-6">
-      <div className="flex items-center justify-between border-b border-white/10 pb-4">
-        <h2 className="font-display text-4xl font-black uppercase tracking-tight">Settings</h2>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+        <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Settings</h2>
         <button
           onClick={() => void loadSettings(true)}
           className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200"
@@ -410,7 +425,7 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
       </div>
 
       <div className="flex flex-wrap gap-2">
-        {(["webhooks", "identity", "integrations", "rails", "orchestration"] as Lane[]).map((item) => (
+        {(["webhooks", "identity", "rails", "orchestration"] as Lane[]).map((item) => (
           <button
             key={item}
             onClick={() => setLane(item)}
@@ -464,8 +479,6 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
             </div>
           ))}
         </div>
-      ) : lane === "integrations" ? (
-        <IntegrationsConsole orgId={orgId} themeStyle={{ border: themeStyle.border }} />
       ) : lane === "rails" ? (
         <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
           <form onSubmit={createRail} className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
@@ -488,7 +501,7 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
       ) : (
         <div className={`vx-panel space-y-4 rounded-3xl p-4 ${themeStyle.border}`}>
           <form onSubmit={saveOrchestration} className="space-y-3">
-            <div className="grid gap-2 md:grid-cols-2">
+            <div className="grid gap-2 md:grid-cols-3">
               <label className="text-xs text-slate-300">
                 Mode
                 <select
@@ -526,6 +539,23 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
                   <option value="STARTER">STARTER</option>
                   <option value="GROWTH">GROWTH</option>
                   <option value="ENTERPRISE">ENTERPRISE</option>
+                </select>
+              </label>
+              <label className="text-xs text-slate-300">
+                Execution Mode
+                <select
+                  value={llmSettings.executionMode}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({
+                      ...prev,
+                      executionMode: event.target.value as ExecutionMode
+                    }))
+                  }
+                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                >
+                  <option value="ECO">ECO</option>
+                  <option value="BALANCED">BALANCED</option>
+                  <option value="TURBO">TURBO</option>
                 </select>
               </label>
             </div>

@@ -433,9 +433,9 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-5">
-      <div className="flex items-center justify-between border-b border-white/10 pb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Direction</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Direction</h2>
           <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500">
             Direction Console
           </p>
@@ -449,7 +449,7 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         </button>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
+      <div className="grid gap-4 2xl:grid-cols-[360px_1fr]">
         <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
           <form onSubmit={createDirection} className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
             <input
@@ -577,7 +577,7 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
                 </span>
               </div>
 
-              <div className="grid gap-3 xl:grid-cols-[1fr_1fr]">
+              <div className="grid gap-3 2xl:grid-cols-[1fr_1fr]">
                 <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
                   <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Links</p>
                   <div className="grid grid-cols-[1fr_1fr_auto] gap-2">

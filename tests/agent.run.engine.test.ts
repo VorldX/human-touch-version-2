@@ -126,6 +126,50 @@ test("send flow sends only after confirm=true", async () => {
   assert.match(response.assistant_message, /Email sent/i);
 });
 
+test("send flow does not send when confirm=true but draft fields are missing", async () => {
+  let sendInvoked = false;
+  const response = await runAgentEngine(
+    {
+      prompt: "Send congratulations email",
+      input: {
+        recipient_email: "test@example.com"
+      },
+      confirm: true
+    },
+    {
+      plan: async () => ({
+        intent: "send_email",
+        needs: [],
+        args: {
+          recipient_email: "test@example.com"
+        },
+        requires_confirmation: true,
+        assistant_message: "Please confirm."
+      }),
+      writeEmail: async () => ({
+        subject: "Congratulations",
+        body: "Wishing you the best."
+      }),
+      executeGmailAction: async () => {
+        sendInvoked = true;
+        return {
+          ok: true,
+          toolkit: "gmail",
+          action: "SEND_EMAIL",
+          toolSlug: "GMAIL_SEND_EMAIL",
+          data: {},
+          logId: null,
+          attempts: 1
+        };
+      }
+    }
+  );
+
+  assert.equal(sendInvoked, false);
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(Boolean(response.draft?.subject), true);
+});
+
 test("summarize flow returns completed summary", async () => {
   const response = await runAgentEngine(
     {
@@ -186,7 +230,7 @@ test("integration-not-connected error is normalized for UI", async () => {
           message: "Gmail not connected.",
           toolkit: "gmail",
           action: "SUMMARIZE_EMAILS",
-          connectUrl: "/app?tab=settings&settingsLane=integrations&toolkit=gmail"
+          connectUrl: "/app?tab=hub&hubScope=TOOLS&toolkit=gmail"
         }
       })
     }
@@ -194,7 +238,7 @@ test("integration-not-connected error is normalized for UI", async () => {
 
   assert.equal(response.status, "error");
   assert.equal(response.error?.code, "INTEGRATION_NOT_CONNECTED");
-  assert.equal(response.error?.details?.connectUrl, "/app?tab=settings&settingsLane=integrations&toolkit=gmail");
+  assert.equal(response.error?.details?.connectUrl, "/app?tab=hub&hubScope=TOOLS&toolkit=gmail");
 });
 
 test("planner fallback infers send intent when planner fails", async () => {

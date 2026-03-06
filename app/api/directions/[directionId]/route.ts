@@ -8,6 +8,7 @@ import {
   type DirectionSource,
   type DirectionStatus
 } from "@/lib/direction/directions";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface RouteContext {
   params: Promise<{
@@ -42,6 +43,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
       { ok: false, message: "orgId and directionId are required." },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const direction = await getDirection(orgId, directionId);
@@ -80,6 +86,11 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       { ok: false, message: "orgId and directionId are required." },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const org = await prisma.organization.findUnique({
@@ -128,6 +139,11 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const deleted = await deleteDirection(orgId, directionId);
   if (!deleted) {
     return NextResponse.json({ ok: false, message: "Direction not found." }, { status: 404 });
@@ -137,4 +153,3 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     ok: true
   });
 }
-

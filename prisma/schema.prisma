@@ -115,68 +115,106 @@ enum PolicyDecision {
   DENY
 }
 
+enum AgentRole {
+  MAIN
+  MANAGER
+  WORKER
+}
+
+enum AgentStatus {
+  ACTIVE
+  BLOCKED
+  PAUSED
+  WAITING_HUMAN
+  COMPLETED
+  FAILED
+  ARCHIVED
+}
+
+enum OrgExecutionMode {
+  ECO
+  BALANCED
+  TURBO
+}
+
+enum AgentDecisionType {
+  EXECUTE_SELF
+  DELEGATE_EXISTING
+  DELEGATE_NEW
+  ASK_HUMAN
+  HALT_BUDGET
+  HALT_POLICY
+  HALT_TOOL_GAP
+}
+
 model User {
-  id                    String            @id @default(cuid())
-  username              String
-  email                 String            @unique
-  activeOrgId           String?
-  sovereignIdentityHash String?
-  activeOrg             Organization?     @relation("ActiveOrganization", fields: [activeOrgId], references: [id], onDelete: SetNull)
-  linkedAccounts        LinkedAccount[]
-  integrations          UserIntegration[]
-  orgMemberships        OrgMember[]
-  approvals             FlowApproval[]
-  complianceActions     ComplianceAudit[] @relation("HumanActorAudits")
-  memoryEntries         MemoryEntry[]
-  createdAt             DateTime          @default(now())
-  updatedAt             DateTime          @updatedAt
+  id                          String               @id @default(cuid())
+  username                    String
+  email                       String               @unique
+  activeOrgId                 String?
+  sovereignIdentityHash       String?
+  activeOrg                   Organization?        @relation("ActiveOrganization", fields: [activeOrgId], references: [id], onDelete: SetNull)
+  linkedAccounts              LinkedAccount[]
+  integrations                UserIntegration[]
+  orgMemberships              OrgMember[]
+  approvals                   FlowApproval[]
+  complianceActions           ComplianceAudit[]    @relation("HumanActorAudits")
+  resolvedApprovalCheckpoints ApprovalCheckpoint[] @relation("ApprovalResolvedByUser")
+  memoryEntries               MemoryEntry[]
+  createdAt                   DateTime             @default(now())
+  updatedAt                   DateTime             @updatedAt
 
   @@index([activeOrgId])
 }
 
 model LinkedAccount {
-  id                  String        @id @default(cuid())
-  userId              String
-  provider            OAuthProvider
-  providerAccountId   String
-  accessTokenEnc      String
-  accessTokenIv       String
-  accessTokenAuthTag  String
-  accessTokenKeyVer   Int           @default(1)
-  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  capabilityGrants    CapabilityGrant[]
-  createdAt           DateTime      @default(now())
-  updatedAt           DateTime      @updatedAt
+  id                 String            @id @default(cuid())
+  userId             String
+  provider           OAuthProvider
+  providerAccountId  String
+  accessTokenEnc     String
+  accessTokenIv      String
+  accessTokenAuthTag String
+  accessTokenKeyVer  Int               @default(1)
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  capabilityGrants   CapabilityGrant[]
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
 
   @@unique([provider, providerAccountId])
   @@index([userId])
 }
 
 model Organization {
-  id               String            @id @default(cuid())
-  name             String
-  description      String?
-  theme            OrganizationTheme @default(APEX)
-  monthlyBudget    Decimal           @db.Decimal(18, 2)
-  currentSpend     Decimal           @default(0) @db.Decimal(18, 2)
-  monthlyBtuCap    Int               @default(0)
-  currentBtuBurn   Int               @default(0)
-  activeUsers      User[]            @relation("ActiveOrganization")
-  members          OrgMember[]
-  personnel        Personnel[]
-  flows            Flow[]
-  files            File[]
-  logs             Log[]
-  webhooks         Webhook[]
-  sovereignRails   SovereignRailConfig[]
-  complianceAudits ComplianceAudit[]
-  memoryEntries    MemoryEntry[]
-  spendEvents      SpendEvent[]
-  policyLogs       PolicyLog[]
-  capabilityGrants CapabilityGrant[]
-  hubFileLocks      HubFileLock[]
-  createdAt        DateTime          @default(now())
-  updatedAt        DateTime          @updatedAt
+  id                  String                @id @default(cuid())
+  name                String
+  description         String?
+  theme               OrganizationTheme     @default(APEX)
+  executionMode       OrgExecutionMode      @default(BALANCED)
+  monthlyBudget       Decimal               @db.Decimal(18, 2)
+  currentSpend        Decimal               @default(0) @db.Decimal(18, 2)
+  monthlyBtuCap       Int                   @default(0)
+  currentBtuBurn      Int                   @default(0)
+  activeUsers         User[]                @relation("ActiveOrganization")
+  members             OrgMember[]
+  personnel           Personnel[]
+  flows               Flow[]
+  files               File[]
+  logs                Log[]
+  webhooks            Webhook[]
+  sovereignRails      SovereignRailConfig[]
+  complianceAudits    ComplianceAudit[]
+  memoryEntries       MemoryEntry[]
+  spendEvents         SpendEvent[]
+  policyLogs          PolicyLog[]
+  agents              Agent[]
+  agentRuns           AgentRun[]
+  delegations         AgentDelegation[]
+  approvalCheckpoints ApprovalCheckpoint[]
+  capabilityGrants    CapabilityGrant[]
+  hubFileLocks        HubFileLock[]
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
 }
 
 model OrgMember {
@@ -192,60 +230,65 @@ model OrgMember {
 }
 
 model Personnel {
-  id                 String          @id @default(cuid())
-  orgId              String
-  type               PersonnelType
-  name               String
-  role               String
-  expertise          String?
-  brainConfig        Json?
-  fallbackBrainConfig Json?
-  brainKeyEnc        String?
-  brainKeyIv         String?
-  brainKeyAuthTag    String?
-  brainKeyKeyVer     Int?            @default(1)
+  id                      String            @id @default(cuid())
+  orgId                   String
+  type                    PersonnelType
+  name                    String
+  role                    String
+  expertise               String?
+  brainConfig             Json?
+  fallbackBrainConfig     Json?
+  brainKeyEnc             String?
+  brainKeyIv              String?
+  brainKeyAuthTag         String?
+  brainKeyKeyVer          Int?              @default(1)
   fallbackBrainKeyEnc     String?
   fallbackBrainKeyIv      String?
   fallbackBrainKeyAuthTag String?
-  fallbackBrainKeyKeyVer  Int?       @default(1)
-  salary             Decimal?        @db.Decimal(18, 2)
-  cost               Decimal?        @db.Decimal(18, 4)
-  rentRate           Decimal?        @db.Decimal(18, 4)
-  pricingModel       PricingModel?
-  autonomyScore      Float           @default(0)
-  isRented           Boolean         @default(false)
-  status             PersonnelStatus @default(IDLE)
-  assignedOAuthIds   String[]        @default([])
-  org                Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  tasks              Task[]          @relation("PersonnelTasks")
-  memoryEntries      MemoryEntry[]
-  capabilityGrants   CapabilityGrant[]
-  fileLocks          HubFileLock[]
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
+  fallbackBrainKeyKeyVer  Int?              @default(1)
+  salary                  Decimal?          @db.Decimal(18, 2)
+  cost                    Decimal?          @db.Decimal(18, 4)
+  rentRate                Decimal?          @db.Decimal(18, 4)
+  pricingModel            PricingModel?
+  autonomyScore           Float             @default(0)
+  isRented                Boolean           @default(false)
+  status                  PersonnelStatus   @default(IDLE)
+  assignedOAuthIds        String[]          @default([])
+  org                     Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  tasks                   Task[]            @relation("PersonnelTasks")
+  agentProfiles           Agent[]           @relation("AgentBackedPersonnel")
+  memoryEntries           MemoryEntry[]
+  capabilityGrants        CapabilityGrant[]
+  fileLocks               HubFileLock[]
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
 
   @@index([orgId, type])
 }
 
 model Flow {
-  id                String        @id @default(cuid())
-  orgId             String
-  prompt            String
-  status            FlowStatus    @default(DRAFT)
-  progress          Float         @default(0)
-  predictedBurn     Int           @default(0)
-  requiredSignatures Int          @default(1)
-  parentFlowId      String?
-  org               Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  parentFlow        Flow?         @relation("FlowBranching", fields: [parentFlowId], references: [id], onDelete: SetNull)
-  branches          Flow[]        @relation("FlowBranching")
-  approvals         FlowApproval[]
-  tasks             Task[]
-  complianceAudits  ComplianceAudit[]
-  memoryEntries     MemoryEntry[]
-  spendEvents       SpendEvent[]
-  createdAt         DateTime      @default(now())
-  updatedAt         DateTime      @updatedAt
+  id                  String               @id @default(cuid())
+  orgId               String
+  prompt              String
+  status              FlowStatus           @default(DRAFT)
+  progress            Float                @default(0)
+  predictedBurn       Int                  @default(0)
+  requiredSignatures  Int                  @default(1)
+  parentFlowId        String?
+  org                 Organization         @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  parentFlow          Flow?                @relation("FlowBranching", fields: [parentFlowId], references: [id], onDelete: SetNull)
+  branches            Flow[]               @relation("FlowBranching")
+  approvals           FlowApproval[]
+  tasks               Task[]
+  agents              Agent[]              @relation("FlowAgents")
+  agentRuns           AgentRun[]
+  delegations         AgentDelegation[]
+  approvalCheckpoints ApprovalCheckpoint[]
+  complianceAudits    ComplianceAudit[]
+  memoryEntries       MemoryEntry[]
+  spendEvents         SpendEvent[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 
   @@index([orgId, status])
   @@index([parentFlowId])
@@ -264,23 +307,26 @@ model FlowApproval {
 }
 
 model Task {
-  id                       String      @id @default(cuid())
-  flowId                   String
-  agentId                  String?
-  prompt                   String
-  status                   TaskStatus  @default(QUEUED)
-  requiredFiles            String[]    @default([])
-  isPausedForInput         Boolean     @default(false)
-  humanInterventionReason  String?
-  executionTrace           Json?
-  verifiableProof          String?
-  flow                     Flow        @relation(fields: [flowId], references: [id], onDelete: Cascade)
-  agent                    Personnel?  @relation("PersonnelTasks", fields: [agentId], references: [id], onDelete: SetNull)
-  memoryEntries            MemoryEntry[]
-  spendEvents              SpendEvent[]
-  fileLocks                HubFileLock[]
-  createdAt                DateTime    @default(now())
-  updatedAt                DateTime    @updatedAt
+  id                      String               @id @default(cuid())
+  flowId                  String
+  agentId                 String?
+  prompt                  String
+  status                  TaskStatus           @default(QUEUED)
+  requiredFiles           String[]             @default([])
+  isPausedForInput        Boolean              @default(false)
+  humanInterventionReason String?
+  executionTrace          Json?
+  verifiableProof         String?
+  flow                    Flow                 @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  agent                   Personnel?           @relation("PersonnelTasks", fields: [agentId], references: [id], onDelete: SetNull)
+  agentRuns               AgentRun[]
+  delegations             AgentDelegation[]
+  approvalCheckpoints     ApprovalCheckpoint[]
+  memoryEntries           MemoryEntry[]
+  spendEvents             SpendEvent[]
+  fileLocks               HubFileLock[]
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
 
   @@index([flowId, status])
   @@index([agentId])
@@ -369,16 +415,16 @@ model SovereignRailConfig {
 }
 
 model ComplianceAudit {
-  id            String        @id @default(cuid())
-  orgId         String
-  flowId        String?
-  humanActorId  String?
-  actionType    String
-  timestamp     DateTime      @default(now())
+  id             String       @id @default(cuid())
+  orgId          String
+  flowId         String?
+  humanActorId   String?
+  actionType     String
+  timestamp      DateTime     @default(now())
   complianceHash String
-  org           Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  flow          Flow?         @relation(fields: [flowId], references: [id], onDelete: SetNull)
-  humanActor    User?         @relation("HumanActorAudits", fields: [humanActorId], references: [id], onDelete: SetNull)
+  org            Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  flow           Flow?        @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  humanActor     User?        @relation("HumanActorAudits", fields: [humanActorId], references: [id], onDelete: SetNull)
 
   @@index([orgId, timestamp(sort: Desc)])
   @@index([flowId])
@@ -386,26 +432,28 @@ model ComplianceAudit {
 }
 
 model MemoryEntry {
-  id          String                       @id @default(cuid())
-  orgId       String
-  flowId      String?
-  taskId      String?
-  agentId     String?
-  userId      String?
-  tier        MemoryTier
-  key         String
-  value       Json?
-  embedding   Unsupported("vector(1536)")?
-  ttlSeconds  Int?
-  expiresAt   DateTime?
-  redactedAt  DateTime?
-  createdAt   DateTime                     @default(now())
-  updatedAt   DateTime                     @updatedAt
-  org         Organization                 @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  flow        Flow?                        @relation(fields: [flowId], references: [id], onDelete: SetNull)
-  task        Task?                        @relation(fields: [taskId], references: [id], onDelete: SetNull)
-  agent       Personnel?                   @relation(fields: [agentId], references: [id], onDelete: SetNull)
-  user        User?                        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  id         String                       @id @default(cuid())
+  orgId      String
+  flowId     String?
+  taskId     String?
+  agentId    String?
+  agentRunId String?
+  userId     String?
+  tier       MemoryTier
+  key        String
+  value      Json?
+  embedding  Unsupported("vector(1536)")?
+  ttlSeconds Int?
+  expiresAt  DateTime?
+  redactedAt DateTime?
+  createdAt  DateTime                     @default(now())
+  updatedAt  DateTime                     @updatedAt
+  org        Organization                 @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  flow       Flow?                        @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  task       Task?                        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  agent      Personnel?                   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  agentRun   AgentRun?                    @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  user       User?                        @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([orgId, tier])
   @@index([expiresAt])
@@ -413,6 +461,7 @@ model MemoryEntry {
   @@index([flowId])
   @@index([taskId])
   @@index([agentId])
+  @@index([agentRunId])
   @@index([userId])
 }
 
@@ -444,27 +493,170 @@ model PolicyLog {
   reason      String?
   meta        Json?
   timestamp   DateTime       @default(now())
-  org         Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  org         Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId, timestamp(sort: Desc)])
   @@index([subjectType, subjectId])
 }
 
 model CapabilityGrant {
-  id              String       @id @default(cuid())
+  id              String        @id @default(cuid())
   orgId           String
   agentId         String
   linkedAccountId String
   scopes          Json
-  createdAt       DateTime     @default(now())
+  createdAt       DateTime      @default(now())
   revokedAt       DateTime?
-  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  agent           Personnel    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  org             Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  agent           Personnel     @relation(fields: [agentId], references: [id], onDelete: Cascade)
   linkedAccount   LinkedAccount @relation(fields: [linkedAccountId], references: [id], onDelete: Cascade)
 
   @@index([orgId, agentId])
   @@index([linkedAccountId])
   @@index([revokedAt])
+}
+
+model Agent {
+  id                  String               @id @default(cuid())
+  orgId               String
+  personnelId         String?
+  missionFlowId       String?
+  parentAgentId       String?
+  createdByRunId      String?
+  role                AgentRole
+  status              AgentStatus          @default(ACTIVE)
+  name                String
+  goal                String?
+  instructions        Json?
+  allowedTools        String[]             @default([])
+  memoryScope         Json?
+  budgetScope         Json?
+  approvalPolicy      Json?
+  metadata            Json?
+  org                 Organization         @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  personnel           Personnel?           @relation("AgentBackedPersonnel", fields: [personnelId], references: [id], onDelete: SetNull)
+  missionFlow         Flow?                @relation("FlowAgents", fields: [missionFlowId], references: [id], onDelete: SetNull)
+  parentAgent         Agent?               @relation("AgentLineage", fields: [parentAgentId], references: [id], onDelete: SetNull)
+  childAgents         Agent[]              @relation("AgentLineage")
+  createdByRun        AgentRun?            @relation("AgentCreatedByRun", fields: [createdByRunId], references: [id], onDelete: SetNull)
+  runs                AgentRun[]           @relation("AgentRuns")
+  delegationsFrom     AgentDelegation[]    @relation("DelegationFromAgent")
+  delegationsTo       AgentDelegation[]    @relation("DelegationToAgent")
+  approvalCheckpoints ApprovalCheckpoint[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@index([orgId, role, status])
+  @@index([personnelId])
+  @@index([missionFlowId])
+  @@index([parentAgentId])
+}
+
+model AgentRun {
+  id                   String               @id @default(cuid())
+  orgId                String
+  agentId              String
+  flowId               String?
+  taskId               String?
+  parentRunId          String?
+  status               AgentStatus          @default(ACTIVE)
+  goal                 String?
+  prompt               String?
+  instructionsSnapshot Json?
+  contextPack          Json?
+  decisionType         AgentDecisionType?
+  decisionReason       String?
+  executionMode        OrgExecutionMode?
+  estimatedCost        Decimal?             @db.Decimal(18, 4)
+  actualCost           Decimal?             @db.Decimal(18, 4)
+  budgetBefore         Decimal?             @db.Decimal(18, 4)
+  budgetAfter          Decimal?             @db.Decimal(18, 4)
+  tokenInput           Int?
+  tokenOutput          Int?
+  modelProvider        String?
+  modelName            String?
+  startedAt            DateTime             @default(now())
+  completedAt          DateTime?
+  metadata             Json?
+  org                  Organization         @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  agent                Agent                @relation("AgentRuns", fields: [agentId], references: [id], onDelete: Cascade)
+  flow                 Flow?                @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  task                 Task?                @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  parentRun            AgentRun?            @relation("AgentRunLineage", fields: [parentRunId], references: [id], onDelete: SetNull)
+  childRuns            AgentRun[]           @relation("AgentRunLineage")
+  createdAgents        Agent[]              @relation("AgentCreatedByRun")
+  delegationsFrom      AgentDelegation[]    @relation("DelegationFromRun")
+  delegationsTo        AgentDelegation[]    @relation("DelegationToRun")
+  approvalCheckpoints  ApprovalCheckpoint[]
+  memoryEntries        MemoryEntry[]
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  @@index([orgId, flowId, taskId])
+  @@index([agentId, status])
+  @@index([parentRunId])
+  @@index([startedAt])
+}
+
+model AgentDelegation {
+  id           String            @id @default(cuid())
+  orgId        String
+  flowId       String?
+  taskId       String?
+  fromAgentId  String
+  toAgentId    String
+  fromRunId    String?
+  toRunId      String?
+  decisionType AgentDecisionType
+  reason       String?
+  status       String            @default("issued")
+  metadata     Json?
+  org          Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  flow         Flow?             @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  task         Task?             @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  fromAgent    Agent             @relation("DelegationFromAgent", fields: [fromAgentId], references: [id], onDelete: Cascade)
+  toAgent      Agent             @relation("DelegationToAgent", fields: [toAgentId], references: [id], onDelete: Cascade)
+  fromRun      AgentRun?         @relation("DelegationFromRun", fields: [fromRunId], references: [id], onDelete: SetNull)
+  toRun        AgentRun?         @relation("DelegationToRun", fields: [toRunId], references: [id], onDelete: SetNull)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@index([orgId, flowId, taskId])
+  @@index([fromAgentId, toAgentId])
+  @@index([fromRunId, toRunId])
+  @@index([createdAt])
+}
+
+model ApprovalCheckpoint {
+  id               String       @id @default(cuid())
+  orgId            String
+  flowId           String?
+  taskId           String?
+  agentId          String?
+  agentRunId       String?
+  status           String       @default("PENDING")
+  reason           String
+  approvalPolicy   Json?
+  requestedAt      DateTime     @default(now())
+  resolvedAt       DateTime?
+  resolvedByUserId String?
+  resolutionNote   String?
+  metadata         Json?
+  org              Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  flow             Flow?        @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  task             Task?        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  agent            Agent?       @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  agentRun         AgentRun?    @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  resolvedByUser   User?        @relation("ApprovalResolvedByUser", fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([orgId, status, requestedAt])
+  @@index([flowId])
+  @@index([taskId])
+  @@index([agentId])
+  @@index([agentRunId])
+  @@index([resolvedByUserId])
 }
 
 model UserIntegration {

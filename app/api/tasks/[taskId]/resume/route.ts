@@ -11,6 +11,7 @@ import { requireOrgAccess } from "@/lib/security/org-access";
 interface ResumeTaskRequest {
   orgId?: string;
   fileUrl?: string;
+  fileUrls?: string[];
   overridePrompt?: string;
   humanActorId?: string;
   note?: string;
@@ -96,6 +97,11 @@ export async function POST(request: NextRequest, context: RouteContext) {
   }
 
   const fileUrl = body.fileUrl?.trim();
+  const fileUrlsFromBody = Array.isArray(body.fileUrls)
+    ? body.fileUrls
+        .map((value) => (typeof value === "string" ? value.trim() : ""))
+        .filter((value) => value.length > 0)
+    : [];
   const overridePrompt = body.overridePrompt?.trim();
   const requestedHumanActorId = body.humanActorId?.trim() || "";
   const note = body.note?.trim();
@@ -113,8 +119,11 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const humanActorId = access.actor.userId;
 
   const requiredFiles = [...task.requiredFiles];
-  if (fileUrl && !requiredFiles.includes(fileUrl)) {
-    requiredFiles.push(fileUrl);
+  const incomingFiles = [...new Set([...(fileUrl ? [fileUrl] : []), ...fileUrlsFromBody])];
+  for (const incoming of incomingFiles) {
+    if (!requiredFiles.includes(incoming)) {
+      requiredFiles.push(incoming);
+    }
   }
 
   const actionType = "HUMAN_TOUCH_RESUME";
@@ -124,6 +133,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     flowId: task.flowId,
     taskId: task.id,
     fileUrl: fileUrl ?? null,
+    fileUrls: incomingFiles,
     overridePrompt: overridePrompt ?? null,
     note: note ?? null,
     actor: humanActorId
@@ -135,7 +145,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
       data: {
         prompt: overridePrompt ?? task.prompt,
         requiredFiles,
-        status: TaskStatus.RUNNING,
+        status: TaskStatus.QUEUED,
         isPausedForInput: false,
         humanInterventionReason: note ?? null
       }
@@ -153,7 +163,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
         orgId,
         type: LogType.USER,
         actor: humanActorId ?? "CARBON_NODE",
-        message: `Task ${task.id} resumed via Human Touch${fileUrl ? ` (file: ${fileUrl})` : ""}.`
+        message: `Task ${task.id} resumed via Human Touch${incomingFiles.length > 0 ? ` (files: ${incomingFiles.join(", ")})` : ""}.`
       }
     });
 
@@ -175,6 +185,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     flowId: task.flowId,
     taskId: task.id,
     fileUrl: fileUrl ?? null,
+    fileUrls: incomingFiles,
     overridePrompt: overridePrompt ?? null,
     note: note ?? null
   });
@@ -195,6 +206,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
             flowId: task.flowId,
             taskId: task.id,
             fileUrl: fileUrl ?? null,
+            fileUrls: incomingFiles,
             overridePrompt: overridePrompt ?? null,
             note: note ?? null
           }
@@ -214,12 +226,12 @@ export async function POST(request: NextRequest, context: RouteContext) {
   await publishRealtimeEvent({
     orgId,
     event: "task.resumed",
-    payload: {
-      taskId: task.id,
-      flowId: task.flowId,
-      status: TaskStatus.RUNNING
-    }
-  });
+      payload: {
+        taskId: task.id,
+        flowId: task.flowId,
+        status: TaskStatus.QUEUED
+      }
+    });
 
   await publishRealtimeEvent({
     orgId,

@@ -18,10 +18,12 @@ import {
   LayoutDashboard,
   LayoutGrid,
   Loader2,
+  Link2,
   LogOut,
   Menu,
   Mic,
   MicOff,
+  Paperclip,
   PlusCircle,
   RefreshCw,
   Search,
@@ -102,9 +104,9 @@ const PRESENCE_POOL = [
 ];
 
 const DIRECTION_MODELS = [
+  { id: "gemini:gemini-2.5-flash", label: "Gemini (2.5 Flash)" },
   { id: "openai:gpt-4o-mini", label: "ChatGPT (gpt-4o-mini)" },
-  { id: "anthropic:claude-3-5-sonnet", label: "Claude (3.5 Sonnet)" },
-  { id: "gemini:gemini-1.5-pro", label: "Gemini (1.5 Pro)" }
+  { id: "anthropic:claude-3-5-sonnet", label: "Claude (3.5 Sonnet)" }
 ] as const;
 
 function initials(name: string) {
@@ -195,6 +197,187 @@ interface UserJoinRequest {
   decisionNote: string | null;
 }
 
+interface OrgListResponse {
+  ok?: boolean;
+  message?: string;
+  activeOrgId?: string | null;
+  orgs?: Array<{
+    id: string;
+    name: string;
+    role: string;
+    theme: AppTheme;
+  }>;
+}
+
+interface HumanInputRequest {
+  taskId: string;
+  flowId: string | null;
+  reason: string;
+}
+
+interface PendingEmailApproval {
+  prompt: string;
+  draft: {
+    to: string;
+    subject: string;
+    body: string;
+  };
+}
+
+interface PendingToolkitApproval {
+  requestId: string;
+  prompt: string;
+  toolkits: string[];
+}
+
+interface PendingPlanLaunchApproval {
+  prompt: string;
+  toolkits: string[];
+  reason: string;
+}
+
+interface PendingChatPlanRoute {
+  prompt: string;
+  reason: string;
+  toolkitHints: string[];
+}
+
+interface DirectionIntentRouting {
+  route: "CHAT_RESPONSE" | "PLAN_REQUIRED";
+  reason: string;
+  toolkitHints?: string[];
+  squadRoleHints?: string[];
+}
+
+function normalizeHumanInputReason(reason: string | null | undefined) {
+  if (typeof reason !== "string") {
+    return "";
+  }
+  const lines = reason
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/^#+\s*/, "")
+        .replace(/\*\*/g, "")
+        .replace(/`/g, "")
+        .trim()
+    )
+    .filter(Boolean);
+  return lines.join("\n").trim();
+}
+
+function summarizeHumanInputReason(reason: string | null | undefined) {
+  const normalized = normalizeHumanInputReason(reason);
+  if (!normalized) {
+    return {
+      heading: "Please provide the required input.",
+      items: [] as string[]
+    };
+  }
+
+  const explicitMatch =
+    normalized.match(/missing required input\s*:\s*([\s\S]+)/i) ??
+    normalized.match(/missing data\s*:\s*([\s\S]+)/i);
+  const sourceText = explicitMatch?.[1]?.trim() || normalized;
+
+  const chunks = sourceText
+    .replace(/\s+/g, " ")
+    .split(/\n|[|;]+/g)
+    .flatMap((segment) => segment.split(/\.\s+/g))
+    .map((segment) =>
+      segment
+        .replace(/^(?:[-*]|\d+[\).\-\s]+)\s*/, "")
+        .replace(/^human touch intervention required:?/i, "")
+        .replace(/^please provide(?: the following)?:?/i, "")
+        .replace(/^it is (?:assumed|required) that\s*/i, "")
+        .replace(/^this plan assumes\s*/i, "")
+        .replace(/^for actual execution,?\s*/i, "")
+        .replace(/^for continued execution,?\s*/i, "")
+        .trim()
+        .replace(/:$/, "")
+    )
+    .filter(Boolean);
+
+  const shouldKeepChunk = (value: string) =>
+    /\b(id|email|url|name|file|upload|workspace|page|database|recipient|subject|body|content|permission|required|missing|provide)\b/i.test(
+      value
+    );
+
+  const items: string[] = [];
+  const seen = new Set<string>();
+
+  for (const chunk of chunks) {
+    let candidate = chunk;
+    const labeled = chunk.match(/^([^:]{2,60}):\s*(.+)$/);
+    if (labeled && shouldKeepChunk(labeled[1])) {
+      candidate = labeled[1].trim();
+    }
+
+    if (!shouldKeepChunk(candidate)) {
+      continue;
+    }
+
+    candidate = candidate
+      .replace(/^the\s+/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!candidate) {
+      continue;
+    }
+
+    if (candidate.length > 110) {
+      candidate = `${candidate.slice(0, 107).trim()}...`;
+    }
+
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push(candidate);
+    if (items.length >= 4) {
+      break;
+    }
+  }
+
+  if (items.length === 0) {
+    return {
+      heading: "System needs this input to continue:",
+      items: [normalized.length > 180 ? `${normalized.slice(0, 177)}...` : normalized]
+    };
+  }
+
+  return {
+    heading: "Please provide:",
+    items
+  };
+}
+
+function isApprovalReply(value: string) {
+  const normalized = value.trim().toLowerCase();
+  return /^(approve|approved|confirm|confirmed|yes|send|go ahead|ok send|okay send)$/i.test(
+    normalized
+  );
+}
+
+function isRejectReply(value: string) {
+  const normalized = value.trim().toLowerCase();
+  return /^(reject|rejected|cancel|no|dont send|don't send|stop)$/i.test(normalized);
+}
+
+function formatDraftForChat(draft: { to: string; subject: string; body: string }) {
+  return [
+    "Draft Email (Approval Required)",
+    `To: ${draft.to}`,
+    `Subject: ${draft.subject}`,
+    "",
+    draft.body,
+    "",
+    "Reply \"approve\" to send this email, or reply with edits."
+  ].join("\n");
+}
+
 type ControlMode = "MINDSTORM" | "DIRECTION";
 type ControlConversationDetail = "REASONING_MIN" | "DIRECTION_GIVEN";
 
@@ -246,6 +429,19 @@ interface DirectionPlanningResult {
   directionGiven: string;
   primaryPlan: DirectionExecutionPlan;
   fallbackPlan: DirectionExecutionPlan;
+  requiredToolkits?: string[];
+  autoSquad?: {
+    triggered?: boolean;
+    domain?: string;
+    requestedRoles?: string[];
+    created?: Array<{
+      id: string;
+      name: string;
+      role: string;
+    }>;
+  };
+  directionRecord?: { id?: string };
+  planRecord?: { id?: string };
 }
 
 function toDatetimeLocalValue(iso: string) {
@@ -280,13 +476,101 @@ function isGmailDirectionPrompt(value: string) {
 
 function inferToolkitsFromDirectionPrompt(value: string) {
   const prompt = value.toLowerCase();
+  const compactPrompt = prompt.replace(/[^a-z0-9]/g, "");
   const requested = new Set<string>();
+  const toolkitAliases: Record<string, string[]> = {
+    gmail: ["gmail", "email", "mailbox", "inbox"],
+    slack: ["slack", "channel", "workspace", "direct message", "dm"],
+    notion: ["notion", "wiki", "knowledge base", "docs", "documentation"],
+    github: ["github", "repository", "repo", "pull request", "commit", "issue"],
+    googlecalendar: ["googlecalendar", "google calendar", "calendar", "schedule", "availability"],
+    googledrive: ["googledrive", "google drive", "drive"],
+    googledocs: ["googledocs", "google docs", "document"],
+    googlesheets: ["googlesheets", "google sheets", "spreadsheet", "sheet"],
+    outlook: ["outlook"],
+    microsoftteams: ["microsoftteams", "microsoft teams", "teams"],
+    jira: ["jira", "ticket", "backlog", "sprint"],
+    trello: ["trello", "board", "card"],
+    asana: ["asana"],
+    monday: ["monday", "monday.com"],
+    linear: ["linear"],
+    shopify: ["shopify", "storefront"],
+    stripe: ["stripe", "payment"],
+    salesforce: ["salesforce", "crm", "opportunity", "pipeline"],
+    hubspot: ["hubspot", "crm", "lead"],
+    pipedrive: ["pipedrive"],
+    quickbooks: ["quickbooks", "quick books", "accounting"],
+    zendesk: ["zendesk", "support ticket"],
+    whatsapp: ["whatsapp"],
+    twitter: ["twitter", "x.com"],
+    linkedin: ["linkedin"],
+    youtube: ["youtube"],
+    zoom: ["zoom", "video call", "video meeting", "webinar", "meeting link"],
+    intercom: ["intercom"],
+    typeform: ["typeform", "form", "survey"]
+  };
 
-  if (/\b(gmail|email|inbox)\b/.test(prompt)) requested.add("gmail");
-  if (/\b(slack|channel|workspace)\b/.test(prompt)) requested.add("slack");
-  if (/\b(notion|database|workspace page|wiki)\b/.test(prompt)) requested.add("notion");
+  for (const [toolkit, aliases] of Object.entries(toolkitAliases)) {
+    const matched = aliases.some((alias) => {
+      const normalizedAlias = alias.trim().toLowerCase();
+      if (!normalizedAlias) return false;
+      const compactAlias = normalizedAlias.replace(/[^a-z0-9]/g, "");
+      return prompt.includes(normalizedAlias) || (compactAlias && compactPrompt.includes(compactAlias));
+    });
+    if (matched) {
+      requested.add(toolkit);
+    }
+  }
 
   return [...requested];
+}
+
+function normalizeToolkitAlias(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return "";
+
+  const aliasMap: Record<string, string> = {
+    crm: "hubspot",
+    "google calendar": "googlecalendar",
+    calendar: "googlecalendar",
+    "google drive": "googledrive",
+    drive: "googledrive",
+    teams: "microsoftteams",
+    "microsoft teams": "microsoftteams",
+    docs: "googledocs"
+  };
+
+  return aliasMap[normalized] ?? normalized.replace(/[\s-]+/g, "");
+}
+
+function buildToolkitApprovalRequestId(prompt: string, toolkits: string[]) {
+  const normalizedPrompt = prompt.trim().toLowerCase();
+  const normalizedToolkits = [...new Set(toolkits.map((item) => item.trim().toLowerCase()))].sort();
+  return `${normalizedPrompt}::${normalizedToolkits.join(",")}`;
+}
+
+function formatToolkitList(toolkits: string[]) {
+  return [...new Set(toolkits.map((item) => item.trim().toLowerCase()))].join(", ");
+}
+
+function collectPlanToolkits(plan: DirectionExecutionPlan | null | undefined) {
+  if (!plan) return [] as string[];
+  const set = new Set<string>();
+  for (const workflow of plan.workflows ?? []) {
+    for (const task of workflow.tasks ?? []) {
+      for (const tool of task.tools ?? []) {
+        const normalized = tool.trim().toLowerCase();
+        if (normalized) {
+          set.add(normalized);
+        }
+      }
+    }
+  }
+  return [...set];
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function openCenteredPopup(url: string, name: string) {
@@ -337,10 +621,12 @@ export function VorldXShell() {
   const toggleGhostMode = useVorldXStore((state) => state.toggleGhostMode);
   const activeUsers = useVorldXStore((state) => state.activeUsers);
   const setStoreActiveUsers = useVorldXStore((state) => state.setActiveUsers);
+  const pushNotification = useVorldXStore((state) => state.pushNotification);
 
   const [activeTab, setActiveTab] =
     useState<(typeof NAV_ITEMS)[number]["id"]>("control");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -348,7 +634,7 @@ export function VorldXShell() {
   const [directionPrompt, setDirectionPrompt] = useState("");
   const [directionTurns, setDirectionTurns] = useState<DirectionTurn[]>([]);
   const [directionModelId, setDirectionModelId] =
-    useState<(typeof DIRECTION_MODELS)[number]["id"]>("openai:gpt-4o-mini");
+    useState<(typeof DIRECTION_MODELS)[number]["id"]>("gemini:gemini-2.5-flash");
   const [directionChatInFlight, setDirectionChatInFlight] = useState(false);
   const [missionSchedules, setMissionSchedules] = useState<MissionSchedule[]>([]);
   const [schedulesLoading, setSchedulesLoading] = useState(false);
@@ -392,17 +678,76 @@ export function VorldXShell() {
   const [launchInFlight, setLaunchInFlight] = useState(false);
   const [killSwitchInFlight, setKillSwitchInFlight] = useState(false);
   const [signOutInFlight, setSignOutInFlight] = useState(false);
+  const [pendingChatPlanRoute, setPendingChatPlanRoute] = useState<PendingChatPlanRoute | null>(
+    null
+  );
+  const [pendingPlanLaunchApproval, setPendingPlanLaunchApproval] =
+    useState<PendingPlanLaunchApproval | null>(null);
+  const [pendingEmailApproval, setPendingEmailApproval] = useState<PendingEmailApproval | null>(
+    null
+  );
+  const [pendingToolkitApproval, setPendingToolkitApproval] = useState<PendingToolkitApproval | null>(
+    null
+  );
+  const [approvedToolkitRequestId, setApprovedToolkitRequestId] = useState<string | null>(null);
+  const [toolkitConnectInFlight, setToolkitConnectInFlight] = useState(false);
   const [controlMessage, setControlMessage] = useState<ControlMessage | null>(null);
   const [agentRunResult, setAgentRunResult] = useState<AgentRunResponse | null>(null);
   const [agentRunInputValues, setAgentRunInputValues] = useState<Record<string, string>>({});
   const [agentRunPromptSnapshot, setAgentRunPromptSnapshot] = useState("");
+  const [agentRunInputSourceUrl, setAgentRunInputSourceUrl] = useState("");
+  const [agentRunInputFile, setAgentRunInputFile] = useState<File | null>(null);
+  const [agentRunInputSubmitting, setAgentRunInputSubmitting] = useState(false);
+  const [pendingHumanInput, setPendingHumanInput] = useState<HumanInputRequest | null>(null);
+  const [humanInputMessage, setHumanInputMessage] = useState("");
+  const [humanInputSourceUrl, setHumanInputSourceUrl] = useState("");
+  const [humanInputFile, setHumanInputFile] = useState<File | null>(null);
+  const [humanInputOverridePrompt, setHumanInputOverridePrompt] = useState("");
+  const [humanInputSubmitting, setHumanInputSubmitting] = useState(false);
   const [realtimeSessionId] = useState(
     () => `shell-${Math.random().toString(36).slice(2, 10)}`
+  );
+  const authHeaders = useMemo(
+    () =>
+      user
+        ? {
+            "x-user-id": user.uid,
+            "x-user-email": user.email
+          }
+        : null,
+    [user]
+  );
+  const humanInputSummary = useMemo(
+    () => summarizeHumanInputReason(pendingHumanInput?.reason),
+    [pendingHumanInput?.reason]
   );
 
   const closeSearch = () => {
     setTimeout(() => setSearchOpen(false), 120);
   };
+
+  const promptForHumanInput = useCallback((request: HumanInputRequest) => {
+    const reason = normalizeHumanInputReason(request.reason) || "Human input required by agent.";
+    setPendingHumanInput((current) => {
+      if (current?.taskId === request.taskId) {
+        return current;
+      }
+      return {
+        taskId: request.taskId,
+        flowId: request.flowId,
+        reason
+      };
+    });
+    setControlMessage({
+      tone: "warning",
+      text: `Task ${request.taskId.slice(0, 8)} paused for human input.`
+    });
+  }, []);
+
+  const handleTabChange = useCallback((tab: (typeof NAV_ITEMS)[number]["id"]) => {
+    setActiveTab(tab);
+    setIsMobileNavOpen(false);
+  }, []);
 
   const handleSignOut = useCallback(async () => {
     setSignOutInFlight(true);
@@ -416,6 +761,7 @@ export function VorldXShell() {
 
   const openAddOrganization = useCallback(() => {
     setShowOrgSwitcher(false);
+    setIsMobileNavOpen(false);
     setSetupPanel("onboarding");
   }, []);
 
@@ -425,18 +771,23 @@ export function VorldXShell() {
       const response = await fetch("/api/squad/join-requests", {
         cache: "no-store"
       });
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
         requests?: UserJoinRequest[];
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok) {
-        throw new Error(payload.message ?? "Failed loading join requests.");
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed loading join requests (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed loading join requests.")
+        );
       }
 
       setJoinRequestError(null);
-      setUserJoinRequests(payload.requests ?? []);
+      setUserJoinRequests(payload?.requests ?? []);
     } catch (error) {
       setJoinRequestError(
         error instanceof Error ? error.message : "Failed loading join requests."
@@ -462,19 +813,24 @@ export function VorldXShell() {
           cache: "no-store"
         }
       );
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
         canReview?: boolean;
         requests?: PermissionRequestItem[];
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok) {
-        throw new Error(payload.message ?? "Failed loading permission requests.");
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed loading permission requests (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed loading permission requests.")
+        );
       }
 
-      setPermissionRequests(payload.requests ?? []);
-      setCanReviewPermissionRequests(Boolean(payload.canReview));
+      setPermissionRequests(payload?.requests ?? []);
+      setCanReviewPermissionRequests(Boolean(payload?.canReview));
     } catch (error) {
       setControlMessage({
         tone: "error",
@@ -507,13 +863,18 @@ export function VorldXShell() {
         })
       });
 
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok) {
-        throw new Error(payload.message ?? "Failed to submit request.");
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed to submit request (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed to submit request.")
+        );
       }
 
       setJoinRequestError(null);
@@ -558,21 +919,14 @@ export function VorldXShell() {
           cache: "no-store",
           credentials: "include"
         });
-        const payload = (await response.json()) as {
-          ok?: boolean;
-          message?: string;
-          activeOrgId?: string | null;
-          orgs?: Array<{
-            id: string;
-            name: string;
-            role: string;
-            theme: AppTheme;
-          }>;
-        };
+        const { payload, rawText } = await parseJsonBody<OrgListResponse>(response);
 
-        if (!response.ok || !payload.ok) {
+        if (!response.ok || !payload?.ok) {
           throw new Error(
-            payload.message ?? `Unable to load organizations (${response.status}).`
+            payload?.message ??
+              (rawText
+                ? `Unable to load organizations (${response.status}): ${rawText.slice(0, 180)}`
+                : `Unable to load organizations (${response.status}).`)
           );
         }
 
@@ -585,6 +939,7 @@ export function VorldXShell() {
 
         if (serverOrgs.length === 0) {
           setCurrentOrg(null);
+          setOrgBootstrapStatus("ready");
           return;
         }
 
@@ -628,6 +983,53 @@ export function VorldXShell() {
   const hasOrganization = Boolean(resolvedOrg);
   const themeStyle = THEME_STYLES[theme];
   const requestedSettingsLane = searchParams.get("settingsLane");
+  const requestedHubScope = searchParams.get("hubScope");
+
+  const ensureOrgAccessReady = useCallback(async () => {
+    if (!resolvedOrg?.id) {
+      return false;
+    }
+
+    const response = await fetch("/api/orgs", {
+      cache: "no-store",
+      credentials: "include"
+    });
+    const { payload, rawText } = await parseJsonBody<OrgListResponse>(response);
+
+    if (!response.ok || !payload?.ok) {
+      throw new Error(
+        payload?.message ??
+          (rawText
+            ? `Unable to verify organization access (${response.status}): ${rawText.slice(0, 180)}`
+            : `Unable to verify organization access (${response.status}).`)
+      );
+    }
+
+    const serverOrgs = payload.orgs ?? [];
+    if (serverOrgs.length === 0) {
+      setOrgs([]);
+      setCurrentOrg(null);
+      setControlMessage({
+        tone: "warning",
+        text: "No organization access found. Join or create an organization first."
+      });
+      return false;
+    }
+
+    setOrgs(serverOrgs);
+    if (serverOrgs.some((item) => item.id === resolvedOrg.id)) {
+      return true;
+    }
+
+    const fallbackOrg =
+      serverOrgs.find((item) => item.id === payload.activeOrgId) ?? serverOrgs[0] ?? null;
+    setCurrentOrg(fallbackOrg);
+    setControlMessage({
+      tone: "warning",
+      text: `Switched to ${fallbackOrg?.name ?? "an accessible organization"}. Send direction again.`
+    });
+    return false;
+  }, [resolvedOrg?.id, setCurrentOrg, setOrgs]);
 
   useEffect(() => {
     if (!resolvedOrg?.id) {
@@ -646,6 +1048,7 @@ export function VorldXShell() {
     const requestedTab = searchParams.get("tab");
     if (requestedTab && NAV_ITEMS.some((item) => item.id === requestedTab)) {
       setActiveTab(requestedTab as (typeof NAV_ITEMS)[number]["id"]);
+      setIsMobileNavOpen(false);
     }
   }, [searchParams]);
 
@@ -668,6 +1071,20 @@ export function VorldXShell() {
     setAgentRunResult(null);
     setAgentRunInputValues({});
     setAgentRunPromptSnapshot("");
+    setPendingHumanInput(null);
+    setHumanInputMessage("");
+    setHumanInputSourceUrl("");
+    setHumanInputFile(null);
+    setHumanInputOverridePrompt("");
+    setPendingChatPlanRoute(null);
+    setPendingPlanLaunchApproval(null);
+    setPendingEmailApproval(null);
+    setPendingToolkitApproval(null);
+    setApprovedToolkitRequestId(null);
+    setToolkitConnectInFlight(false);
+    setAgentRunInputSourceUrl("");
+    setAgentRunInputFile(null);
+    setAgentRunInputSubmitting(false);
     setControlMessage(null);
   }, [resolvedOrg?.id]);
 
@@ -799,14 +1216,70 @@ export function VorldXShell() {
       setSignatureApprovals(0);
     };
 
+    const handleTaskPaused = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload =
+        envelope?.payload && typeof envelope.payload === "object"
+          ? (envelope.payload as Record<string, unknown>)
+          : {};
+      const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
+      if (!taskId) {
+        return;
+      }
+
+      const integrationError =
+        payload.integrationError && typeof payload.integrationError === "object"
+          ? (payload.integrationError as Record<string, unknown>)
+          : null;
+
+      const reasonFromPayload =
+        typeof payload.reason === "string" && payload.reason.trim().length > 0
+          ? payload.reason.trim()
+          : "";
+      const reasonFromIntegration =
+        integrationError?.code === "INTEGRATION_NOT_CONNECTED" &&
+        typeof integrationError.toolkit === "string" &&
+        integrationError.toolkit.trim().length > 0
+          ? `Connect ${integrationError.toolkit.trim().toLowerCase()} integration before resume.`
+          : "";
+      const reason = reasonFromPayload || reasonFromIntegration || "Human input required by agent.";
+      const flowId = typeof payload.flowId === "string" ? payload.flowId.trim() : "";
+      promptForHumanInput({
+        taskId,
+        flowId: flowId || null,
+        reason
+      });
+    };
+
+    const handleTaskResumed = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload =
+        envelope?.payload && typeof envelope.payload === "object"
+          ? (envelope.payload as Record<string, unknown>)
+          : {};
+      const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
+      if (!taskId) {
+        return;
+      }
+      setPendingHumanInput((current) => (current?.taskId === taskId ? null : current));
+    };
+
     socket.on("signature.captured", handleSignatureCaptured);
     socket.on("kill-switch.triggered", handleKillSwitch);
+    socket.on("task.paused", handleTaskPaused);
+    socket.on("task.resumed", handleTaskResumed);
 
     return () => {
       socket.off("signature.captured", handleSignatureCaptured);
       socket.off("kill-switch.triggered", handleKillSwitch);
+      socket.off("task.paused", handleTaskPaused);
+      socket.off("task.resumed", handleTaskResumed);
     };
-  }, [realtimeSessionId, requiredSignatures, resolvedOrg?.id]);
+  }, [promptForHumanInput, realtimeSessionId, requiredSignatures, resolvedOrg?.id]);
 
   const searchResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -827,7 +1300,7 @@ export function VorldXShell() {
       {
         id: "action-control",
         label: "Go to Control Deck",
-        action: () => setActiveTab("control")
+        action: () => handleTabChange("control")
       },
       {
         id: "action-ghost",
@@ -837,7 +1310,7 @@ export function VorldXShell() {
     ].filter((item) => item.label.toLowerCase().includes(q));
 
     return { tabs, orgMatches, actions };
-  }, [openAddOrganization, orgs, searchQuery, toggleGhostMode]);
+  }, [handleTabChange, openAddOrganization, orgs, searchQuery, toggleGhostMode]);
 
   const loadMissionSchedules = useCallback(
     async (silent?: boolean) => {
@@ -855,17 +1328,22 @@ export function VorldXShell() {
           `/api/schedules/missions?orgId=${encodeURIComponent(resolvedOrg.id)}`,
           { cache: "no-store" }
         );
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonBody<{
           ok?: boolean;
           message?: string;
           schedules?: MissionSchedule[];
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed loading mission schedules.");
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading mission schedules (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading mission schedules.")
+          );
         }
 
-        setMissionSchedules(payload.schedules ?? []);
+        setMissionSchedules(payload?.schedules ?? []);
       } catch (error) {
         setControlMessage({
           tone: "error",
@@ -889,6 +1367,192 @@ export function VorldXShell() {
     }, 20000);
     return () => clearInterval(interval);
   }, [loadMissionSchedules, resolvedOrg?.id]);
+
+  const uploadHumanInputToHub = useCallback(
+    async (input: { file?: File; sourceUrl?: string; name?: string }) => {
+      if (!resolvedOrg?.id) {
+        throw new Error("Organization is required to upload input.");
+      }
+
+      const hasFile = input.file instanceof File;
+      const hasSourceUrl = typeof input.sourceUrl === "string" && input.sourceUrl.trim().length > 0;
+      if (!hasFile && !hasSourceUrl) {
+        throw new Error("Provide a file or source URL.");
+      }
+
+      let response: Response;
+      if (hasFile && input.file) {
+        const formData = new FormData();
+        formData.set("orgId", resolvedOrg.id);
+        formData.set("type", "INPUT");
+        formData.set("name", input.name?.trim() || input.file.name || "human-input.txt");
+        formData.set("isAmnesiaProtected", "false");
+        formData.set("file", input.file);
+        response = await fetch("/api/hub/files", {
+          method: "POST",
+          credentials: "include",
+          body: formData
+        });
+      } else {
+        response = await fetch("/api/hub/files", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId: resolvedOrg.id,
+            type: "INPUT",
+            name: input.name?.trim() || "human-input-link",
+            sourceUrl: input.sourceUrl?.trim(),
+            isAmnesiaProtected: false
+          })
+        });
+      }
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            ok?: boolean;
+            message?: string;
+            file?: {
+              id?: string;
+              url?: string;
+            };
+          }
+        | null;
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.message ?? "Failed to store input in Hub.");
+      }
+
+      const ref = payload.file?.id?.trim() || payload.file?.url?.trim() || "";
+      if (!ref) {
+        throw new Error("Hub file reference missing in upload response.");
+      }
+      return ref;
+    },
+    [resolvedOrg?.id]
+  );
+
+  const handleSubmitHumanInput = useCallback(async () => {
+    if (!resolvedOrg?.id || !pendingHumanInput) {
+      return;
+    }
+
+    const message = humanInputMessage.trim();
+    const sourceUrl = humanInputSourceUrl.trim();
+    const overridePrompt = humanInputOverridePrompt.trim();
+    const hasFile = humanInputFile instanceof File;
+    if (!message && !sourceUrl && !hasFile && !overridePrompt) {
+      pushNotification({
+        title: "Human Input Required",
+        message: "Add message, file, source URL, or override prompt before resuming.",
+        type: "warning"
+      });
+      return;
+    }
+
+    setHumanInputSubmitting(true);
+    try {
+      const fileRefs: string[] = [];
+
+      if (hasFile && humanInputFile) {
+        const fileRef = await uploadHumanInputToHub({
+          file: humanInputFile,
+          name: humanInputFile.name
+        });
+        fileRefs.push(fileRef);
+      }
+
+      if (sourceUrl) {
+        const fileRef = await uploadHumanInputToHub({
+          sourceUrl,
+          name: `task-${pendingHumanInput.taskId.slice(0, 8)}-source`
+        });
+        fileRefs.push(fileRef);
+      }
+
+      if (message) {
+        const content = [
+          `Task: ${pendingHumanInput.taskId}`,
+          `SubmittedAt: ${new Date().toISOString()}`,
+          "",
+          message
+        ].join("\n");
+        const file = new File([content], `task-${pendingHumanInput.taskId.slice(0, 8)}-input.txt`, {
+          type: "text/plain"
+        });
+        const fileRef = await uploadHumanInputToHub({
+          file,
+          name: file.name
+        });
+        fileRefs.push(fileRef);
+      }
+
+      const response = await fetch(`/api/tasks/${pendingHumanInput.taskId}/resume`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          orgId: resolvedOrg.id,
+          fileUrls: fileRefs,
+          overridePrompt: overridePrompt || undefined,
+          note: message || pendingHumanInput.reason
+        })
+      });
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            ok?: boolean;
+            message?: string;
+            warning?: string;
+          }
+        | null;
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.message ?? "Failed to resume task with human input.");
+      }
+
+      pushNotification({
+        title: "Input Submitted",
+        message:
+          payload.warning ||
+          `Task ${pendingHumanInput.taskId.slice(0, 8)} resumed. Input stored in Hub.`,
+        type: payload.warning ? "warning" : "success"
+      });
+      setControlMessage({
+        tone: "success",
+        text: `Task ${pendingHumanInput.taskId.slice(0, 8)} resumed with human input.`
+      });
+
+      setPendingHumanInput(null);
+      setHumanInputMessage("");
+      setHumanInputSourceUrl("");
+      setHumanInputFile(null);
+      setHumanInputOverridePrompt("");
+      if (pendingHumanInput.flowId) {
+        handleTabChange("flow");
+      }
+    } catch (error) {
+      pushNotification({
+        title: "Human Input Failed",
+        message: error instanceof Error ? error.message : "Unable to submit human input.",
+        type: "error"
+      });
+    } finally {
+      setHumanInputSubmitting(false);
+    }
+  }, [
+    handleTabChange,
+    humanInputFile,
+    humanInputMessage,
+    humanInputOverridePrompt,
+    humanInputSourceUrl,
+    pendingHumanInput,
+    pushNotification,
+    resolvedOrg?.id,
+    uploadHumanInputToHub
+  ]);
 
   const handleVoiceIntent = useCallback(() => {
     if (typeof window === "undefined") {
@@ -955,21 +1619,28 @@ export function VorldXShell() {
     }
 
     const [provider, model] = directionModelId.split(":");
-    const ownerTurn: DirectionTurn = {
-      id: `owner-${Date.now()}`,
-      role: "owner",
-      content: message
-    };
-    setDirectionTurns((prev) => [...prev, ownerTurn]);
-    if (!rawMessage) {
-      setDirectionPrompt("");
-    }
     setDirectionChatInFlight(true);
     setControlMessage(null);
 
     try {
+      const orgReady = await ensureOrgAccessReady();
+      if (!orgReady) {
+        return;
+      }
+
+      const ownerTurn: DirectionTurn = {
+        id: `owner-${Date.now()}`,
+        role: "owner",
+        content: message
+      };
+      setDirectionTurns((prev) => [...prev, ownerTurn]);
+      if (!rawMessage) {
+        setDirectionPrompt("");
+      }
+
       const response = await fetch("/api/control/direction-chat", {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json"
         },
@@ -985,18 +1656,23 @@ export function VorldXShell() {
         })
       });
 
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
         reply?: string;
         directionCandidate?: string;
+        intentRouting?: DirectionIntentRouting;
         model?: { provider?: string | null; name?: string | null };
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok || !payload.reply) {
+      if (!response.ok || !payload?.ok || !payload.reply) {
         setControlMessage({
           tone: "error",
-          text: payload.message ?? "Organization did not respond."
+          text:
+            payload?.message ??
+            (rawText
+              ? `Organization did not respond (${response.status}): ${rawText.slice(0, 180)}`
+              : "Organization did not respond.")
         });
         return;
       }
@@ -1022,6 +1698,21 @@ export function VorldXShell() {
           text: "Direction candidate updated from organization response."
         });
       }
+
+      if (payload.intentRouting?.route === "PLAN_REQUIRED") {
+        const routedPrompt = payload.directionCandidate?.trim() || message;
+        setPendingChatPlanRoute({
+          prompt: routedPrompt,
+          reason:
+            payload.intentRouting.reason ||
+            "Intent requires planning before workflow launch.",
+          toolkitHints: payload.intentRouting.toolkitHints ?? []
+        });
+        setControlMessage({
+          tone: "success",
+          text: "Intent routed to planning pipeline."
+        });
+      }
     } catch (error) {
       setControlMessage({
         tone: "error",
@@ -1030,10 +1721,21 @@ export function VorldXShell() {
     } finally {
       setDirectionChatInFlight(false);
     }
-  }, [directionModelId, directionPrompt, directionTurns, resolvedOrg?.id]);
+  }, [
+    directionModelId,
+    directionPrompt,
+    directionTurns,
+    ensureOrgAccessReady,
+    resolvedOrg?.id
+  ]);
 
   const handleGenerateDirectionPlans = useCallback(
-    async (rawDirection?: string) => {
+    async (
+      rawDirection?: string,
+      options?: {
+        toolkitHints?: string[];
+      }
+    ) => {
       const direction = (rawDirection ?? intent).trim();
       if (!resolvedOrg?.id) {
         return;
@@ -1046,23 +1748,30 @@ export function VorldXShell() {
         return;
       }
 
-      if (rawDirection?.trim()) {
-        setDirectionTurns((prev) => [
-          ...prev,
-          {
-            id: `owner-direction-${Date.now()}`,
-            role: "owner",
-            content: rawDirection.trim()
-          }
-        ]);
-      }
-
+      setPendingEmailApproval(null);
       setDirectionPlanningInFlight(true);
       setControlMessage(null);
       try {
+        const orgReady = await ensureOrgAccessReady();
+        if (!orgReady) {
+          return;
+        }
+
+        if (rawDirection?.trim()) {
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `owner-direction-${Date.now()}`,
+              role: "owner",
+              content: rawDirection.trim()
+            }
+          ]);
+        }
+
         const [provider, model] = directionModelId.split(":");
         const response = await fetch("/api/control/direction-plan", {
           method: "POST",
+          credentials: "include",
           headers: {
             "Content-Type": "application/json"
           },
@@ -1079,35 +1788,72 @@ export function VorldXShell() {
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonBody<{
           ok?: boolean;
           message?: string;
           analysis?: string;
           directionGiven?: string;
           primaryPlan?: DirectionExecutionPlan;
           fallbackPlan?: DirectionExecutionPlan;
+          requiredToolkits?: string[];
+          autoSquad?: {
+            triggered?: boolean;
+            domain?: string;
+            requestedRoles?: string[];
+            created?: Array<{ id: string; name: string; role: string }>;
+          };
+          directionRecord?: { id?: string };
+          planRecord?: { id?: string };
           requestCount?: number;
           model?: { provider?: string | null; name?: string | null };
-        };
+        }>(response);
 
         if (
           !response.ok ||
-          !payload.ok ||
+          !payload?.ok ||
           !payload.primaryPlan ||
           !payload.fallbackPlan
         ) {
-          throw new Error(payload.message ?? "Failed generating plans.");
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed generating plans (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed generating plans.")
+          );
         }
 
         const refinedDirection = payload.directionGiven?.trim() || direction;
         const analysis = payload.analysis?.trim() ?? "";
+        const planToolkits = [
+          ...new Set(
+            [
+              ...(payload.requiredToolkits ?? []),
+              ...collectPlanToolkits(payload.primaryPlan),
+              ...collectPlanToolkits(payload.fallbackPlan),
+              ...(options?.toolkitHints ?? [])
+            ]
+              .map((item) => normalizeToolkitAlias(item))
+              .filter(Boolean)
+          )
+        ];
         setIntent(refinedDirection);
         setDirectionPlanningResult({
           analysis,
           directionGiven: refinedDirection,
           primaryPlan: payload.primaryPlan,
-          fallbackPlan: payload.fallbackPlan
+          fallbackPlan: payload.fallbackPlan,
+          requiredToolkits: planToolkits,
+          autoSquad: payload.autoSquad,
+          directionRecord: payload.directionRecord,
+          planRecord: payload.planRecord
         });
+        setPendingPlanLaunchApproval({
+          prompt: refinedDirection,
+          toolkits: planToolkits,
+          reason: "Plan ready. User approval required before launching workflow."
+        });
+        setPendingToolkitApproval(null);
+        setApprovedToolkitRequestId(null);
         setControlConversationDetail("DIRECTION_GIVEN");
 
         const modelLabel = [payload.model?.provider, payload.model?.name]
@@ -1125,11 +1871,42 @@ export function VorldXShell() {
           ]);
         }
 
+        const autoSquad = payload.autoSquad;
+        const autoSquadCreated = autoSquad?.created ?? [];
+
+        if (autoSquadCreated.length > 0) {
+          const createdLabel = autoSquadCreated
+            .map((item) => item.role)
+            .join(", ");
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `auto-squad-${Date.now()}`,
+              role: "organization",
+              content: `Auto-squad bootstrap completed (${autoSquad?.domain ?? "general"}): ${createdLabel}.`
+            }
+          ]);
+        } else if (autoSquad?.triggered) {
+          const roleLabel = (autoSquad.requestedRoles ?? []).join(", ");
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `auto-squad-existing-${Date.now()}`,
+              role: "organization",
+              content: roleLabel
+                ? `Squad intent detected (${autoSquad.domain ?? "general"}). Matching agents already exist: ${roleLabel}.`
+                : `Squad intent detected (${autoSquad.domain ?? "general"}). Matching agents already exist.`
+            }
+          ]);
+        }
+
         await loadPermissionRequests();
+        const autoSquadCreatedCount = autoSquadCreated.length;
         setControlMessage({
           tone: "success",
-          text: `Primary and fallback plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}`
+          text: `Plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}${autoSquadCreatedCount > 0 ? ` Auto-squad created ${autoSquadCreatedCount} agents.` : autoSquad?.triggered ? " Auto-squad detected existing matching agents." : ""} Review in Plan section and approve launch.`
         });
+        handleTabChange("plan");
       } catch (error) {
         setControlMessage({
           tone: "error",
@@ -1142,6 +1919,8 @@ export function VorldXShell() {
     [
       directionModelId,
       directionTurns,
+      ensureOrgAccessReady,
+      handleTabChange,
       humanPlanDraft,
       intent,
       loadPermissionRequests,
@@ -1167,12 +1946,17 @@ export function VorldXShell() {
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonBody<{
           ok?: boolean;
           message?: string;
-        };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed updating request.");
+        }>(response);
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed updating request (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed updating request.")
+          );
         }
 
         await loadPermissionRequests();
@@ -1224,14 +2008,19 @@ export function VorldXShell() {
         })
       });
 
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
         schedule?: MissionSchedule;
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok || !payload.schedule) {
-        throw new Error(payload.message ?? "Failed creating schedule.");
+      if (!response.ok || !payload?.ok || !payload.schedule) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed creating schedule (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed creating schedule.")
+        );
       }
 
       setMissionSchedules((prev) => [payload.schedule!, ...prev]);
@@ -1273,16 +2062,21 @@ export function VorldXShell() {
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonBody<{
           ok?: boolean;
           message?: string;
           warning?: string;
           schedule?: MissionSchedule;
           flow?: { id: string; status: string };
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.flow || !payload.schedule) {
-          throw new Error(payload.message ?? "Failed running schedule.");
+        if (!response.ok || !payload?.ok || !payload.flow || !payload.schedule) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed running schedule (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed running schedule.")
+          );
         }
 
         setMissionSchedules((prev) =>
@@ -1325,15 +2119,20 @@ export function VorldXShell() {
         })
       });
 
-      const payload = (await response.json()) as {
+      const { payload, rawText } = await parseJsonBody<{
         ok?: boolean;
         message?: string;
         launchedCount?: number;
         failedCount?: number;
-      };
+      }>(response);
 
-      if (!response.ok || !payload.ok) {
-        throw new Error(payload.message ?? "Failed running due schedules.");
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed running due schedules (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed running due schedules.")
+        );
       }
 
       await loadMissionSchedules(true);
@@ -1347,7 +2146,7 @@ export function VorldXShell() {
             : `Due schedules processed. Launched: ${launchedCount}.`
       });
       if (launchedCount > 0) {
-        setActiveTab("flow");
+        handleTabChange("flow");
       }
     } catch (error) {
       setControlMessage({
@@ -1357,7 +2156,7 @@ export function VorldXShell() {
     } finally {
       setScheduleTickInFlight(false);
     }
-  }, [loadMissionSchedules, resolvedOrg?.id]);
+  }, [handleTabChange, loadMissionSchedules, resolvedOrg?.id]);
 
   const handleToggleSchedule = useCallback(
     async (schedule: MissionSchedule) => {
@@ -1378,14 +2177,19 @@ export function VorldXShell() {
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonBody<{
           ok?: boolean;
           message?: string;
           schedule?: MissionSchedule;
-        };
+        }>(response);
 
-        if (!response.ok || !payload.ok || !payload.schedule) {
-          throw new Error(payload.message ?? "Failed updating schedule.");
+        if (!response.ok || !payload?.ok || !payload.schedule) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed updating schedule (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed updating schedule.")
+          );
         }
 
         setMissionSchedules((prev) =>
@@ -1424,9 +2228,16 @@ export function VorldXShell() {
             method: "DELETE"
           }
         );
-        const payload = (await response.json()) as { ok?: boolean; message?: string };
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message ?? "Failed deleting schedule.");
+        const { payload, rawText } = await parseJsonBody<{ ok?: boolean; message?: string }>(
+          response
+        );
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed deleting schedule (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed deleting schedule.")
+          );
         }
         setMissionSchedules((prev) => prev.filter((item) => item.id !== scheduleId));
       } catch (error) {
@@ -1441,13 +2252,224 @@ export function VorldXShell() {
     [resolvedOrg?.id]
   );
 
-  const handleLaunchMainAgent = useCallback(async () => {
-    const prompt = intent.trim();
+  const getConnectedToolkits = useCallback(async () => {
+    if (!resolvedOrg?.id) {
+      return {
+        enabled: false,
+        active: new Set<string>()
+      };
+    }
+    if (!authHeaders) {
+      throw new Error("Sign in first to use connected tools.");
+    }
+
+    const response = await fetch(
+      `/api/integrations/composio/connections?orgId=${encodeURIComponent(resolvedOrg.id)}`,
+      {
+        method: "GET",
+        cache: "no-store",
+        headers: authHeaders
+      }
+    );
+
+    const payload = (await response.json().catch(() => null)) as
+      | {
+          ok?: boolean;
+          enabled?: boolean;
+          message?: string;
+          connections?: Array<{
+            toolkit?: string;
+            status?: string;
+          }>;
+        }
+      | null;
+
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.message ?? "Failed to load integration connections.");
+    }
+
+    const active = new Set(
+      (payload.connections ?? [])
+        .map((item) => ({
+          toolkit: typeof item.toolkit === "string" ? item.toolkit.trim().toLowerCase() : "",
+          status: typeof item.status === "string" ? item.status.trim().toUpperCase() : ""
+        }))
+        .filter((item) => item.toolkit && item.status === "ACTIVE")
+        .map((item) => item.toolkit)
+    );
+
+    return {
+      enabled: payload.enabled !== false,
+      active
+    };
+  }, [authHeaders, resolvedOrg?.id]);
+
+  const connectToolkitsWithOauth = useCallback(
+    async (missing: string[], prompt: string) => {
+      if (!resolvedOrg?.id || missing.length === 0) {
+        return true;
+      }
+      if (!authHeaders) {
+        setControlMessage({
+          tone: "error",
+          text: "Sign in first to connect required tools."
+        });
+        return false;
+      }
+
+      setToolkitConnectInFlight(true);
+      try {
+        for (const toolkit of missing) {
+          const response = await fetch("/api/integrations/composio/connect", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...authHeaders
+            },
+            body: JSON.stringify({
+              orgId: resolvedOrg.id,
+              toolkit,
+              returnTo: `${window.location.origin}/app?tab=control`
+            })
+          });
+          const payload = (await response.json().catch(() => null)) as
+            | {
+                ok?: boolean;
+                message?: string;
+                connectUrl?: string;
+              }
+            | null;
+
+          if (!response.ok || !payload?.ok || !payload.connectUrl) {
+            throw new Error(payload?.message ?? `Unable to connect ${toolkit}.`);
+          }
+
+          setControlMessage({
+            tone: "warning",
+            text: `Connect ${toolkit} in popup. Main Agent will continue once linked.`
+          });
+          const popup = openCenteredPopup(payload.connectUrl, `integrations-${toolkit}`);
+          if (!popup) {
+            window.location.assign(payload.connectUrl);
+            return false;
+          }
+
+          const timeoutMs = 120000;
+          const startedAt = Date.now();
+          let connected = false;
+
+          while (Date.now() - startedAt < timeoutMs) {
+            await sleep(2500);
+            const current = await getConnectedToolkits();
+            if (current.active.has(toolkit)) {
+              connected = true;
+              break;
+            }
+          }
+
+          if (!connected) {
+            setControlMessage({
+              tone: "warning",
+              text: `Still waiting for ${toolkit} connection. Complete OAuth, then approve again.`
+            });
+            return false;
+          }
+        }
+
+        setControlMessage({
+          tone: "success",
+          text: `Required integrations connected. Continuing task: ${prompt.slice(0, 80)}`
+        });
+        setPendingToolkitApproval(null);
+        setApprovedToolkitRequestId(null);
+        return true;
+      } finally {
+        setToolkitConnectInFlight(false);
+      }
+    },
+    [authHeaders, getConnectedToolkits, resolvedOrg?.id]
+  );
+
+  const ensureRequestedToolkitsReady = useCallback(
+    async (requestedToolkits: string[], prompt: string) => {
+      if (!resolvedOrg?.id || requestedToolkits.length === 0) {
+        setPendingToolkitApproval(null);
+        setApprovedToolkitRequestId(null);
+        return true;
+      }
+
+      const uniqueRequestedToolkits = [...new Set(requestedToolkits.map((item) => item.toLowerCase()))];
+      const firstPass = await getConnectedToolkits();
+      if (!firstPass.enabled) {
+        setControlMessage({
+          tone: "warning",
+          text:
+            "Tool integrations are disabled for this workspace. Enable integrations to execute app actions."
+        });
+        return false;
+      }
+
+      const missing = uniqueRequestedToolkits.filter((toolkit) => !firstPass.active.has(toolkit));
+      if (missing.length === 0) {
+        setPendingToolkitApproval(null);
+        setApprovedToolkitRequestId(null);
+        return true;
+      }
+
+      const requestId = buildToolkitApprovalRequestId(prompt, missing);
+      if (approvedToolkitRequestId !== requestId) {
+        if (pendingToolkitApproval?.requestId !== requestId) {
+          setPendingToolkitApproval({
+            requestId,
+            prompt,
+            toolkits: missing
+          });
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `org-toolkit-approval-${Date.now()}`,
+              role: "organization",
+              content: [
+                `Required tool access: ${formatToolkitList(missing)}.`,
+                "Approve to connect these integrations now, or reject to keep the workflow paused."
+              ].join("\n")
+            }
+          ]);
+        }
+        setControlMessage({
+          tone: "warning",
+          text: `Approval required: connect ${formatToolkitList(missing)} to continue.`
+        });
+        return false;
+      }
+
+      return connectToolkitsWithOauth(missing, prompt);
+    },
+    [
+      approvedToolkitRequestId,
+      connectToolkitsWithOauth,
+      getConnectedToolkits,
+      pendingToolkitApproval?.requestId,
+      resolvedOrg?.id
+    ]
+  );
+
+  const handleLaunchMainAgent = useCallback(async (
+    promptOverride?: string,
+    inputOverride?: Record<string, string>,
+    options?: { confirmEmailDraft?: boolean }
+  ) => {
+    const prompt = (promptOverride ?? intent).trim();
+    const confirmEmailDraft = options?.confirmEmailDraft === true;
     if (!prompt) {
       setControlMessage({
         tone: "error",
         text: "Direction is required before launching the Main Agent."
       });
+      return;
+    }
+
+    if (launchInFlight) {
       return;
     }
 
@@ -1463,6 +2485,17 @@ export function VorldXShell() {
     setControlMessage(null);
 
     try {
+      const orgReady = await ensureOrgAccessReady();
+      if (!orgReady) {
+        return;
+      }
+
+      const requestedToolkits = inferToolkitsFromDirectionPrompt(prompt);
+      const toolkitsReady = await ensureRequestedToolkitsReady(requestedToolkits, prompt);
+      if (!toolkitsReady) {
+        return;
+      }
+
       if (isGmailDirectionPrompt(prompt)) {
         if (!user?.uid || !user.email) {
           setControlMessage({
@@ -1472,23 +2505,43 @@ export function VorldXShell() {
           return;
         }
 
-        const shouldConfirm =
-          agentRunResult?.status === "needs_confirmation" &&
-          agentRunPromptSnapshot === prompt;
+        if (confirmEmailDraft) {
+          if (!pendingEmailApproval) {
+            setControlMessage({
+              tone: "warning",
+              text: "No pending draft found. Generate preview first, then approve."
+            });
+            return;
+          }
+          if (pendingEmailApproval.prompt.trim() !== prompt) {
+            setControlMessage({
+              tone: "warning",
+              text: "Draft approval expired due to prompt change. Regenerate draft first."
+            });
+            return;
+          }
+        }
+
+        const runtimeInput: Record<string, string> = {
+          ...(inputOverride ?? agentRunInputValues),
+          orgId: resolvedOrg?.id ?? ""
+        };
+        if (confirmEmailDraft && pendingEmailApproval) {
+          runtimeInput.recipient_email = pendingEmailApproval.draft.to;
+          runtimeInput.subject = pendingEmailApproval.draft.subject;
+          runtimeInput.body = pendingEmailApproval.draft.body;
+        }
         const response = await fetch("/api/agent/run", {
           method: "POST",
+          credentials: "include",
           headers: {
             "Content-Type": "application/json",
-            "x-user-id": user.uid,
-            "x-user-email": user.email
+            ...(authHeaders ?? {})
           },
           body: JSON.stringify({
             prompt,
-            input: {
-              ...agentRunInputValues,
-              orgId: resolvedOrg?.id
-            },
-            confirm: shouldConfirm,
+            input: runtimeInput,
+            confirm: confirmEmailDraft,
             orgId: resolvedOrg?.id
           })
         });
@@ -1504,6 +2557,10 @@ export function VorldXShell() {
 
         setAgentRunPromptSnapshot(prompt);
         setAgentRunResult(payload);
+        if (payload.status !== "needs_input") {
+          setAgentRunInputSourceUrl("");
+          setAgentRunInputFile(null);
+        }
         if (payload.draft) {
           setAgentRunInputValues((previous) => ({
             ...previous,
@@ -1514,23 +2571,107 @@ export function VorldXShell() {
         }
 
         if (payload.status === "completed") {
+          const recipient =
+            pendingEmailApproval?.draft.to ||
+            (typeof runtimeInput["recipient_email"] === "string"
+              ? runtimeInput["recipient_email"]
+              : "") ||
+            "manager";
+          setPendingEmailApproval(null);
+          setPendingChatPlanRoute({
+            prompt: `Track leave request status for ${recipient} and prepare next action plan.`,
+            reason: "Follow-up execution plan requested after completed email action.",
+            toolkitHints: []
+          });
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `org-email-complete-${Date.now()}`,
+              role: "organization",
+              content: payload.assistant_message || "Email sent successfully."
+            }
+          ]);
           setControlMessage({
             tone: "success",
             text: payload.assistant_message || "Main Agent completed the Gmail action."
           });
         } else if (payload.status === "needs_input") {
+          setPendingEmailApproval(null);
+          const requiredInputLines = (payload.required_inputs ?? [])
+            .map((item) => `- ${item.label}`)
+            .join("\n");
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `org-email-input-${Date.now()}`,
+              role: "organization",
+              content: [
+                payload.assistant_message || "I need more information to continue.",
+                requiredInputLines ? `\nRequired:\n${requiredInputLines}` : ""
+              ]
+                .filter(Boolean)
+                .join("\n")
+            }
+          ]);
           setControlMessage({
             tone: "warning",
             text: payload.assistant_message || "Provide required details and submit again."
           });
         } else if (payload.status === "needs_confirmation") {
+          const draft =
+            payload.draft && payload.draft.to && payload.draft.subject && payload.draft.body
+              ? payload.draft
+              : runtimeInput.recipient_email && runtimeInput.subject && runtimeInput.body
+                ? {
+                    to: runtimeInput.recipient_email,
+                    subject: runtimeInput.subject,
+                    body: runtimeInput.body
+                  }
+                : null;
+          if (draft) {
+            setPendingEmailApproval({
+              prompt,
+              draft
+            });
+            setDirectionTurns((prev) => [
+              ...prev,
+              {
+                id: `org-email-draft-${Date.now()}`,
+                role: "organization",
+                content: [
+                  payload.assistant_message || "Draft ready for your approval.",
+                  "",
+                  formatDraftForChat(draft)
+                ].join("\n")
+              }
+            ]);
+          }
           setControlMessage({
             tone: "warning",
-            text:
-              payload.assistant_message ||
-              "Review draft and click Send Direction To Main Agent again to confirm."
+            text: payload.assistant_message
+              ? `${payload.assistant_message} No email sent yet. Reply "approve" in chat to send.`
+              : "Draft ready. No email has been sent yet. Reply \"approve\" in chat to send."
           });
         } else {
+          setPendingEmailApproval(null);
+          const connectUrl =
+            payload.error?.code === "INTEGRATION_NOT_CONNECTED" &&
+            typeof payload.error?.details?.connectUrl === "string"
+              ? payload.error.details.connectUrl
+              : "";
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `org-email-error-${Date.now()}`,
+              role: "organization",
+              content: [
+                payload.error?.message || payload.assistant_message || "Main Agent run failed.",
+                connectUrl ? `Connect Gmail first: ${connectUrl}` : ""
+              ]
+                .filter(Boolean)
+                .join("\n")
+            }
+          ]);
           setControlMessage({
             tone: "error",
             text: payload.error?.message || payload.assistant_message || "Main Agent run failed."
@@ -1545,17 +2686,20 @@ export function VorldXShell() {
 
       const response = await fetch("/api/flows", {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
           orgId: resolvedOrg?.id,
           prompt,
+          directionId: directionPlanningResult?.directionRecord?.id || undefined,
+          planId: directionPlanningResult?.planRecord?.id || undefined,
           swarmDensity,
           predictedBurn,
           requiredSignatures,
           approvalsProvided: signatureApprovals,
-          requestedToolkits: inferToolkitsFromDirectionPrompt(prompt)
+          requestedToolkits
         })
       });
 
@@ -1563,7 +2707,7 @@ export function VorldXShell() {
         ok?: boolean;
         warning?: string;
         message?: string;
-        flow?: { id: string; status: string };
+        flow?: { id: string; status: string; executionMode?: string };
       }>(response);
 
       if (!payload) {
@@ -1586,9 +2730,9 @@ export function VorldXShell() {
         tone: payload.warning ? "warning" : "success",
         text: payload.warning
           ? `Flow ${payload.flow?.id ?? ""} queued with warning: ${payload.warning}`
-          : `Flow ${payload.flow?.id ?? ""} queued successfully (${payload.flow?.status ?? "QUEUED"}).`
+          : `Flow ${payload.flow?.id ?? ""} queued successfully (${payload.flow?.status ?? "QUEUED"} | ${payload.flow?.executionMode ?? "MULTI_AGENT"}).`
       });
-      setActiveTab("flow");
+      handleTabChange("flow");
     } catch (error) {
       setControlMessage({
         tone: "error",
@@ -1599,9 +2743,15 @@ export function VorldXShell() {
     }
   }, [
     intent,
+    launchInFlight,
     agentRunInputValues,
-    agentRunPromptSnapshot,
-    agentRunResult?.status,
+    pendingEmailApproval,
+    authHeaders,
+    directionPlanningResult?.directionRecord?.id,
+    directionPlanningResult?.planRecord?.id,
+    handleTabChange,
+    ensureOrgAccessReady,
+    ensureRequestedToolkitsReady,
     predictedBurn,
     requiredSignatures,
     resolvedOrg?.id,
@@ -1609,6 +2759,261 @@ export function VorldXShell() {
     swarmDensity,
     user?.uid,
     user?.email
+  ]);
+
+  const handleApprovePlanLaunch = useCallback(async () => {
+    if (!pendingPlanLaunchApproval || launchInFlight || toolkitConnectInFlight) {
+      return;
+    }
+
+    const prompt = pendingPlanLaunchApproval.prompt.trim();
+    const requestedToolkits = [...new Set(pendingPlanLaunchApproval.toolkits)];
+    if (!prompt) {
+      setControlMessage({
+        tone: "warning",
+        text: "Plan approval requires a direction prompt."
+      });
+      return;
+    }
+
+    if (requestedToolkits.length > 0) {
+      const requestId = buildToolkitApprovalRequestId(prompt, requestedToolkits);
+      setPendingToolkitApproval({
+        requestId,
+        prompt,
+        toolkits: requestedToolkits
+      });
+      setPendingPlanLaunchApproval(null);
+      setControlMessage({
+        tone: "warning",
+        text: `Tool approval required before launch: ${formatToolkitList(requestedToolkits)}.`
+      });
+      setDirectionTurns((prev) => [
+        ...prev,
+        {
+          id: `org-plan-toolkit-approval-${Date.now()}`,
+          role: "organization",
+          content: `Before launch, approve tools: ${formatToolkitList(requestedToolkits)}.`
+        }
+      ]);
+      return;
+    }
+
+    setIntent(prompt);
+    setPendingPlanLaunchApproval(null);
+    await handleLaunchMainAgent(prompt);
+  }, [
+    handleLaunchMainAgent,
+    launchInFlight,
+    pendingPlanLaunchApproval,
+    toolkitConnectInFlight
+  ]);
+
+  const handleRejectPlanLaunch = useCallback(() => {
+    if (!pendingPlanLaunchApproval) {
+      return;
+    }
+    setPendingPlanLaunchApproval(null);
+    setControlMessage({
+      tone: "warning",
+      text: "Plan launch rejected. You can revise the plan and approve later."
+    });
+  }, [pendingPlanLaunchApproval]);
+
+  const handleApproveToolkitAccess = useCallback(async () => {
+    if (!pendingToolkitApproval || launchInFlight || toolkitConnectInFlight) {
+      return;
+    }
+    setApprovedToolkitRequestId(pendingToolkitApproval.requestId);
+    setIntent(pendingToolkitApproval.prompt);
+    await handleLaunchMainAgent(pendingToolkitApproval.prompt);
+  }, [
+    handleLaunchMainAgent,
+    launchInFlight,
+    pendingToolkitApproval,
+    toolkitConnectInFlight
+  ]);
+
+  const handleRejectToolkitAccess = useCallback(() => {
+    if (!pendingToolkitApproval) {
+      return;
+    }
+    const toolkitLabel = formatToolkitList(pendingToolkitApproval.toolkits);
+    setPendingToolkitApproval(null);
+    setApprovedToolkitRequestId(null);
+    setDirectionTurns((prev) => [
+      ...prev,
+      {
+        id: `org-toolkit-reject-${Date.now()}`,
+        role: "organization",
+        content: `Tool access rejected for ${toolkitLabel}. Workflow remains paused until approval.`
+      }
+    ]);
+    setControlMessage({
+      tone: "warning",
+      text: `Tool access rejected for ${toolkitLabel}.`
+    });
+  }, [pendingToolkitApproval]);
+
+  const handleApproveEmailDraft = useCallback(async () => {
+    if (!pendingEmailApproval || launchInFlight) {
+      return;
+    }
+    setIntent(pendingEmailApproval.prompt);
+    await handleLaunchMainAgent(pendingEmailApproval.prompt, undefined, {
+      confirmEmailDraft: true
+    });
+  }, [handleLaunchMainAgent, launchInFlight, pendingEmailApproval]);
+
+  const handleRejectEmailDraft = useCallback(() => {
+    if (!pendingEmailApproval) {
+      return;
+    }
+    setPendingEmailApproval(null);
+    setDirectionTurns((prev) => [
+      ...prev,
+      {
+        id: `org-email-cancel-${Date.now()}`,
+        role: "organization",
+        content: "Draft canceled. Share updated instructions when you want a new draft."
+      }
+    ]);
+    setControlMessage({
+      tone: "warning",
+      text: "Draft rejected. No email was sent."
+    });
+  }, [pendingEmailApproval]);
+
+  const handleRejectAgentInput = useCallback(() => {
+    setAgentRunResult(null);
+    setAgentRunInputValues({});
+    setAgentRunInputSourceUrl("");
+    setAgentRunInputFile(null);
+    setAgentRunInputSubmitting(false);
+    setControlMessage({
+      tone: "warning",
+      text: "Missing-input request rejected. Task paused until you provide required details."
+    });
+  }, []);
+
+  const handleSubmitAgentInputs = useCallback(async () => {
+    if (agentRunInputSubmitting) {
+      return;
+    }
+    if (agentRunResult?.status !== "needs_input") {
+      return;
+    }
+    const requiredInputs = agentRunResult.required_inputs ?? [];
+    const missingField = requiredInputs.find((item) => {
+      const value = (agentRunInputValues[item.key] ?? "").trim();
+      return value.length === 0;
+    });
+    if (missingField) {
+      setControlMessage({
+        tone: "warning",
+        text: `Missing required field: ${missingField.label}.`
+      });
+      return;
+    }
+
+    const prompt = (agentRunPromptSnapshot || intent).trim();
+    if (!prompt) {
+      setControlMessage({
+        tone: "error",
+        text: "Direction prompt is missing. Send direction again."
+      });
+      return;
+    }
+
+    setAgentRunInputSubmitting(true);
+    try {
+      const runtimeInput = { ...agentRunInputValues };
+      const uploadedRefs: string[] = [];
+      const sourceUrl = agentRunInputSourceUrl.trim();
+
+      if (sourceUrl) {
+        const sourceRef = await uploadHumanInputToHub({
+          sourceUrl,
+          name: `agent-input-source-${Date.now()}`
+        });
+        uploadedRefs.push(sourceRef);
+      }
+
+      if (agentRunInputFile instanceof File) {
+        const fileRef = await uploadHumanInputToHub({
+          file: agentRunInputFile,
+          name: agentRunInputFile.name
+        });
+        uploadedRefs.push(fileRef);
+      }
+
+      if (uploadedRefs.length > 0) {
+        const existingContext = (runtimeInput.context ?? "").trim();
+        runtimeInput.context = [
+          existingContext,
+          `Additional Hub context refs: ${uploadedRefs.join(", ")}`
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }
+
+      setAgentRunInputValues(runtimeInput);
+      setAgentRunInputSourceUrl("");
+      setAgentRunInputFile(null);
+      await handleLaunchMainAgent(prompt, runtimeInput);
+    } catch (error) {
+      setControlMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to submit required input."
+      });
+    } finally {
+      setAgentRunInputSubmitting(false);
+    }
+  }, [
+    agentRunInputFile,
+    agentRunInputSourceUrl,
+    agentRunInputSubmitting,
+    agentRunInputValues,
+    agentRunPromptSnapshot,
+    agentRunResult,
+    handleLaunchMainAgent,
+    intent,
+    uploadHumanInputToHub
+  ]);
+
+  useEffect(() => {
+    if (!pendingChatPlanRoute) {
+      return;
+    }
+    if (directionPlanningInFlight || launchInFlight) {
+      return;
+    }
+
+    let cancelled = false;
+    const pending = pendingChatPlanRoute;
+
+    const run = async () => {
+      try {
+        await handleGenerateDirectionPlans(pending.prompt, {
+          toolkitHints: pending.toolkitHints
+        });
+      } finally {
+        if (!cancelled) {
+          setPendingChatPlanRoute((current) => (current === pending ? null : current));
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    directionPlanningInFlight,
+    handleGenerateDirectionPlans,
+    launchInFlight,
+    pendingChatPlanRoute
   ]);
 
   const handleGlobalKillSwitch = useCallback(async () => {
@@ -1627,6 +3032,7 @@ export function VorldXShell() {
     try {
       const response = await fetch("/api/kill-switch", {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json"
         },
@@ -1679,15 +3085,25 @@ export function VorldXShell() {
     agentRunResult?.error?.code === "INTEGRATION_NOT_CONNECTED"
       ? (typeof agentRunResult.error?.details?.connectUrl === "string"
           ? agentRunResult.error?.details?.connectUrl
-          : "") || "/app?tab=settings&settingsLane=integrations&toolkit=gmail"
+          : "") || "/app?tab=hub&hubScope=TOOLS&toolkit=gmail"
       : "";
 
   return (
     <div className="vx-shell relative min-h-screen bg-vx-bg text-slate-100 transition-all duration-500">
-      <div className="flex h-screen overflow-hidden">
+      <div className="flex h-[100dvh] overflow-hidden">
+        {isMobileNavOpen ? (
+          <button
+            type="button"
+            aria-label="Close navigation"
+            onClick={() => setIsMobileNavOpen(false)}
+            className="fixed inset-0 z-40 bg-black/70 md:hidden"
+          />
+        ) : null}
         <aside
-          className={`flex h-full shrink-0 flex-col border-r border-white/10 bg-[#05070a]/95 backdrop-blur-2xl transition-all duration-500 ${
-            isSidebarCollapsed ? "w-24" : "w-80"
+          className={`fixed inset-y-0 left-0 z-50 flex h-full w-[84vw] max-w-80 shrink-0 flex-col border-r border-white/10 bg-[#05070a]/95 backdrop-blur-2xl transition-transform duration-300 md:relative md:inset-auto md:z-auto md:w-auto md:max-w-none md:translate-x-0 ${
+            isMobileNavOpen ? "translate-x-0" : "-translate-x-full"
+          } ${
+            isSidebarCollapsed ? "md:w-24" : "md:w-80"
           }`}
         >
           <div className="flex h-24 items-center gap-4 border-b border-white/10 px-6">
@@ -1710,7 +3126,7 @@ export function VorldXShell() {
             {NAV_ITEMS.map((item) => (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => handleTabChange(item.id)}
                 className={`flex w-full items-center rounded-2xl px-4 py-3 text-left transition ${
                   activeTab === item.id
                     ? `vx-panel ${themeStyle.border}`
@@ -1735,7 +3151,7 @@ export function VorldXShell() {
                   <p className="truncate px-2 pt-1 text-xs text-slate-200">{user?.email ?? "session user"}</p>
                   <div className="mt-2 grid grid-cols-2 gap-2">
                     <button
-                      onClick={() => setActiveTab("settings")}
+                      onClick={() => handleTabChange("settings")}
                       className="inline-flex items-center justify-center gap-1 rounded-xl border border-white/20 bg-white/5 px-2 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-200 transition hover:bg-white/10"
                     >
                       <UserCog size={12} />
@@ -1754,7 +3170,7 @@ export function VorldXShell() {
               ) : (
                 <div className="flex flex-col gap-2">
                   <button
-                    onClick={() => setActiveTab("settings")}
+                    onClick={() => handleTabChange("settings")}
                     className="flex items-center justify-center rounded-xl border border-white/20 bg-white/5 p-2 text-slate-200 transition hover:bg-white/10"
                     title="Account Settings"
                   >
@@ -1773,7 +3189,7 @@ export function VorldXShell() {
             </div>
           </div>
 
-          <div className="border-t border-white/10 p-4">
+          <div className="hidden border-t border-white/10 p-4 md:block">
             <button
               onClick={() => setIsSidebarCollapsed((prev) => !prev)}
               className="flex w-full items-center justify-center rounded-2xl bg-white/5 p-3 text-slate-300 transition hover:bg-white/10"
@@ -1783,11 +3199,14 @@ export function VorldXShell() {
           </div>
         </aside>
 
-        <main className="relative flex h-full flex-1 flex-col overflow-hidden">
-          <header className="relative z-30 flex h-24 shrink-0 items-center justify-between border-b border-white/10 bg-[#05070a]/50 px-5 backdrop-blur-xl md:px-10">
+        <main className="relative flex h-full min-w-0 flex-1 flex-col overflow-hidden">
+          <header className="relative z-30 flex min-h-24 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#05070a]/50 px-4 py-3 backdrop-blur-xl md:h-24 md:flex-nowrap md:px-10 md:py-0">
             <div
               className="group flex cursor-pointer items-center gap-3"
-              onClick={() => setShowOrgSwitcher((prev) => !prev)}
+              onClick={() => {
+                setShowOrgSwitcher((prev) => !prev);
+                setShowRequestCenter(false);
+              }}
             >
               <Shield size={20} className={themeStyle.accent} />
               <div>
@@ -1822,7 +3241,7 @@ export function VorldXShell() {
                       <button
                         key={item.id}
                         onMouseDown={() => {
-                          setActiveTab(item.id);
+                          handleTabChange(item.id);
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
@@ -1838,6 +3257,7 @@ export function VorldXShell() {
                         key={org.id}
                         onMouseDown={() => {
                           setCurrentOrg(org);
+                          setIsMobileNavOpen(false);
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
@@ -1894,12 +3314,13 @@ export function VorldXShell() {
                 <button
                   onClick={() => {
                     setShowRequestCenter((prev) => !prev);
+                    setShowOrgSwitcher(false);
                     void loadPermissionRequests();
                   }}
                   className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10"
                 >
                   <Bell size={14} />
-                  Requests
+                  <span className="hidden sm:inline">Requests</span>
                   {pendingPermissionRequestCount > 0 ? (
                     <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">
                       {pendingPermissionRequestCount}
@@ -1917,7 +3338,9 @@ export function VorldXShell() {
                 }`}
               >
                 {isGhostModeActive ? <Ghost size={14} /> : <UserCheck size={14} />}
-                {isGhostModeActive ? "Ghost Protocol Active" : "Ghost Protocol"}
+                <span className="hidden sm:inline">
+                  {isGhostModeActive ? "Ghost Protocol Active" : "Ghost Protocol"}
+                </span>
               </button>
 
               <div className="hidden items-center gap-2 md:flex">
@@ -1939,13 +3362,17 @@ export function VorldXShell() {
                 </span>
               </div>
 
-              <button className="md:hidden">
-                <Menu size={20} />
+              <button
+                onClick={() => setIsMobileNavOpen((prev) => !prev)}
+                className="md:hidden"
+                aria-label="Toggle navigation"
+              >
+                {isMobileNavOpen ? <X size={20} /> : <Menu size={20} />}
               </button>
             </div>
 
             {showOrgSwitcher && (
-              <div className="absolute left-6 top-20 z-50 w-72 rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-10">
+              <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-10 md:right-auto md:top-20 md:w-72">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
                     Organizations
@@ -1965,6 +3392,7 @@ export function VorldXShell() {
                       onClick={() => {
                         setCurrentOrg(org);
                         setShowOrgSwitcher(false);
+                        setIsMobileNavOpen(false);
                       }}
                       className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition ${
                         resolvedOrg?.id === org.id
@@ -1998,7 +3426,7 @@ export function VorldXShell() {
             )}
 
             {showRequestCenter && resolvedOrg && (
-              <div className="absolute right-6 top-20 z-50 w-[420px] rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10">
+              <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-auto md:right-10 md:top-20 md:w-[420px]">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <div>
                     <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
@@ -2093,13 +3521,13 @@ export function VorldXShell() {
           </header>
 
           <section
-            className={`vx-scrollbar relative flex-1 px-5 py-8 md:px-10 md:py-10 ${
+            className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-4 py-6 md:px-10 md:py-10 ${
               resolvedOrg && activeTab === "control"
                 ? "min-h-0 overflow-hidden py-4 md:py-6"
                 : "overflow-y-auto"
             }`}
           >
-            {orgBootstrapStatus === "loading" ? (
+            {orgBootstrapStatus === "loading" && !resolvedOrg ? (
               <WorkspaceBootstrapState themeStyle={themeStyle} />
             ) : orgBootstrapStatus === "failed" && !resolvedOrg ? (
               <WorkspaceBootstrapError
@@ -2132,6 +3560,15 @@ export function VorldXShell() {
                 directionChatInFlight={directionChatInFlight}
                 directionPlanningInFlight={directionPlanningInFlight}
                 message={controlMessage}
+                agentRunResult={agentRunResult}
+                agentRunInputValues={agentRunInputValues}
+                pendingPlanLaunchApproval={pendingPlanLaunchApproval}
+                pendingEmailApproval={pendingEmailApproval}
+                pendingToolkitApproval={pendingToolkitApproval}
+                agentInputSourceUrl={agentRunInputSourceUrl}
+                agentInputFile={agentRunInputFile}
+                agentInputSubmitting={agentRunInputSubmitting}
+                agentActionBusy={launchInFlight || toolkitConnectInFlight}
                 onModeChange={setControlMode}
                 onConversationDetailChange={setControlConversationDetail}
                 onDirectionGivenChange={(value) => {
@@ -2142,7 +3579,29 @@ export function VorldXShell() {
                   ) {
                     setAgentRunResult(null);
                     setAgentRunInputValues({});
+                    setAgentRunInputSourceUrl("");
+                    setAgentRunInputFile(null);
                   }
+                }}
+                onAgentInputValueChange={(key, value) =>
+                  setAgentRunInputValues((prev) => ({
+                    ...prev,
+                    [key]: value
+                  }))
+                }
+                onAgentInputSourceUrlChange={setAgentRunInputSourceUrl}
+                onAgentInputFileChange={setAgentRunInputFile}
+                onSubmitAgentInputs={() => void handleSubmitAgentInputs()}
+                onRejectAgentInput={handleRejectAgentInput}
+                onApprovePlanLaunch={() => void handleApprovePlanLaunch()}
+                onRejectPlanLaunch={handleRejectPlanLaunch}
+                onApproveEmailDraft={() => void handleApproveEmailDraft()}
+                onRejectEmailDraft={handleRejectEmailDraft}
+                onApproveToolkitAccess={() => void handleApproveToolkitAccess()}
+                onRejectToolkitAccess={handleRejectToolkitAccess}
+                onOpenTools={() => {
+                  router.replace("/app?tab=hub&hubScope=TOOLS");
+                  handleTabChange("hub");
                 }}
                 onDirectionModelChange={setDirectionModelId}
                 onEngageWithMode={(nextMode) => {
@@ -2160,8 +3619,132 @@ export function VorldXShell() {
                     await handleDirectionChat(message);
                     return;
                   }
-                  setIntent(message);
-                  await handleGenerateDirectionPlans(message);
+                  const trimmed = message.trim();
+                  if (!trimmed) {
+                    return;
+                  }
+
+                  if (pendingPlanLaunchApproval) {
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `owner-plan-approval-${Date.now()}`,
+                        role: "owner",
+                        content: trimmed
+                      }
+                    ]);
+
+                    if (isApprovalReply(trimmed)) {
+                      await handleApprovePlanLaunch();
+                      return;
+                    }
+
+                    if (isRejectReply(trimmed)) {
+                      handleRejectPlanLaunch();
+                      return;
+                    }
+
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `org-plan-approval-hint-${Date.now()}`,
+                        role: "organization",
+                        content:
+                          "Reply with \"approve\" to launch this plan, or \"reject\" to keep it in planning."
+                      }
+                    ]);
+                    return;
+                  }
+
+                  if (pendingToolkitApproval) {
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `owner-toolkit-approval-${Date.now()}`,
+                        role: "owner",
+                        content: trimmed
+                      }
+                    ]);
+
+                    if (isApprovalReply(trimmed)) {
+                      await handleApproveToolkitAccess();
+                      return;
+                    }
+
+                    if (isRejectReply(trimmed)) {
+                      handleRejectToolkitAccess();
+                      return;
+                    }
+
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `org-toolkit-approval-hint-${Date.now()}`,
+                        role: "organization",
+                        content:
+                          "Reply with \"approve\" to grant tool access, or \"reject\" to keep the task paused."
+                      }
+                    ]);
+                    return;
+                  }
+
+                  if (pendingEmailApproval) {
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `owner-email-approval-${Date.now()}`,
+                        role: "owner",
+                        content: trimmed
+                      }
+                    ]);
+
+                    if (isApprovalReply(trimmed)) {
+                      setIntent(pendingEmailApproval.prompt);
+                      await handleLaunchMainAgent(
+                        pendingEmailApproval.prompt,
+                        undefined,
+                        {
+                          confirmEmailDraft: true
+                        }
+                      );
+                      return;
+                    }
+
+                    if (isRejectReply(trimmed)) {
+                      handleRejectEmailDraft();
+                      return;
+                    }
+
+                    const revisedPrompt = `${pendingEmailApproval.prompt}\n\nAdditional edits from user: ${trimmed}`;
+                    setPendingEmailApproval(null);
+                    setIntent(revisedPrompt);
+                    await handleLaunchMainAgent(revisedPrompt);
+                    return;
+                  }
+
+                  if (isGmailDirectionPrompt(trimmed)) {
+                    setDirectionTurns((prev) => [
+                      ...prev,
+                      {
+                        id: `owner-email-${Date.now()}`,
+                        role: "owner",
+                        content: trimmed
+                      }
+                    ]);
+                    setIntent(trimmed);
+                    await handleLaunchMainAgent(trimmed);
+                    return;
+                  }
+
+                  setPendingToolkitApproval(null);
+                  setApprovedToolkitRequestId(null);
+                  setPendingEmailApproval(null);
+                  setAgentRunResult(null);
+                  setAgentRunInputValues({});
+                  setAgentRunInputSourceUrl("");
+                  setAgentRunInputFile(null);
+                  setIntent(trimmed);
+                  await handleDirectionChat(trimmed);
                 }}
                 onVoiceIntent={handleVoiceIntent}
                 isRecordingIntent={isRecordingIntent}
@@ -2175,6 +3758,7 @@ export function VorldXShell() {
                   accentSoft: themeStyle.accentSoft,
                   border: themeStyle.border
                 }}
+                onTaskNeedsInput={promptForHumanInput}
               />
             ) : activeTab === "direction" ? (
               <DirectionConsole
@@ -2202,6 +3786,16 @@ export function VorldXShell() {
                   accentSoft: themeStyle.accentSoft,
                   border: themeStyle.border
                 }}
+                initialScope={
+                  requestedHubScope === "ORGANIZATIONAL" ||
+                  requestedHubScope === "DIRECTIONAL" ||
+                  requestedHubScope === "WORKFLOW" ||
+                  requestedHubScope === "DNA" ||
+                  requestedHubScope === "STORAGE" ||
+                  requestedHubScope === "TOOLS"
+                    ? requestedHubScope
+                    : undefined
+                }
               />
             ) : activeTab === "squad" ? (
               <SquadConsole
@@ -2241,7 +3835,6 @@ export function VorldXShell() {
                 initialLane={
                   requestedSettingsLane === "webhooks" ||
                   requestedSettingsLane === "identity" ||
-                  requestedSettingsLane === "integrations" ||
                   requestedSettingsLane === "rails" ||
                   requestedSettingsLane === "orchestration"
                     ? requestedSettingsLane
@@ -2264,6 +3857,117 @@ export function VorldXShell() {
           <div className="vx-ghost-overlay pointer-events-none fixed inset-0 z-50" />
           <div className="vx-ghost-vignette pointer-events-none fixed inset-0 z-50" />
         </>
+      )}
+
+      {pendingHumanInput && (
+        <div className="fixed inset-0 z-[82] flex items-center justify-center bg-black/75 p-4">
+          <div className="vx-scrollbar w-full max-w-2xl overflow-y-auto rounded-[28px] border border-white/15 bg-[#0d1117] p-5 md:p-6">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-amber-300">
+                  Human Input Required
+                </p>
+                <p className="mt-1 text-[11px] uppercase tracking-[0.14em] text-slate-500">
+                  Task {pendingHumanInput.taskId}
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  if (!humanInputSubmitting) {
+                    setPendingHumanInput(null);
+                  }
+                }}
+                disabled={humanInputSubmitting}
+                className="rounded-full border border-white/20 p-2 text-slate-300 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
+                  {humanInputSummary.heading}
+                </p>
+                <ul className="mt-2 space-y-1 text-[12px] text-amber-100">
+                  {humanInputSummary.items.map((item) => (
+                    <li key={item} className="whitespace-pre-wrap break-words">
+                      - {item}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                Message Input
+                <textarea
+                  value={humanInputMessage}
+                  onChange={(event) => setHumanInputMessage(event.target.value)}
+                  placeholder="Add human guidance for this task..."
+                  className="mt-1 h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </label>
+
+              <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                Optional Source URL
+                <input
+                  value={humanInputSourceUrl}
+                  onChange={(event) => setHumanInputSourceUrl(event.target.value)}
+                  placeholder="https://docs.example.com/context"
+                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </label>
+
+              <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                Optional File Upload
+                <div className="mt-1 flex items-center gap-2 rounded-xl border border-white/10 bg-black/40 px-3 py-2">
+                  <Paperclip size={14} className="text-slate-500" />
+                  <input
+                    type="file"
+                    onChange={(event) => setHumanInputFile(event.target.files?.[0] ?? null)}
+                    className="w-full text-sm text-slate-200 file:mr-3 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1 file:text-xs file:text-slate-200"
+                  />
+                </div>
+              </label>
+
+              <label className="block text-xs uppercase tracking-[0.14em] text-slate-400">
+                Optional Prompt Override
+                <textarea
+                  value={humanInputOverridePrompt}
+                  onChange={(event) => setHumanInputOverridePrompt(event.target.value)}
+                  placeholder="If needed, rewrite task prompt before resume..."
+                  className="mt-1 h-20 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                />
+              </label>
+
+              <p className="text-[11px] text-slate-500">
+                Submitted message/files are stored in Hub INPUT and attached to this task context.
+              </p>
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                <button
+                  onClick={() => {
+                    if (!humanInputSubmitting) {
+                      setPendingHumanInput(null);
+                    }
+                  }}
+                  disabled={humanInputSubmitting}
+                  className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-200 transition hover:bg-white/10 disabled:opacity-60"
+                >
+                  Later
+                </button>
+                <button
+                  onClick={() => void handleSubmitHumanInput()}
+                  disabled={humanInputSubmitting}
+                  className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                >
+                  {humanInputSubmitting ? <Loader2 size={13} className="animate-spin" /> : null}
+                  Submit Input & Resume
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {setupPanel === "chooser" && (
@@ -2471,9 +4175,30 @@ function ControlDeckSurface({
   directionPlanningInFlight,
   planningResult,
   message,
+  agentRunResult,
+  agentRunInputValues,
+  pendingPlanLaunchApproval,
+  pendingEmailApproval,
+  pendingToolkitApproval,
+  agentInputSourceUrl,
+  agentInputFile,
+  agentInputSubmitting,
+  agentActionBusy,
   onModeChange,
   onConversationDetailChange,
   onDirectionGivenChange,
+  onAgentInputValueChange,
+  onAgentInputSourceUrlChange,
+  onAgentInputFileChange,
+  onSubmitAgentInputs,
+  onRejectAgentInput,
+  onApprovePlanLaunch,
+  onRejectPlanLaunch,
+  onApproveEmailDraft,
+  onRejectEmailDraft,
+  onApproveToolkitAccess,
+  onRejectToolkitAccess,
+  onOpenTools,
   onDirectionModelChange,
   onEngageWithMode,
   onSendMessage,
@@ -2492,9 +4217,30 @@ function ControlDeckSurface({
   directionPlanningInFlight: boolean;
   planningResult: DirectionPlanningResult | null;
   message: ControlMessage | null;
+  agentRunResult: AgentRunResponse | null;
+  agentRunInputValues: Record<string, string>;
+  pendingPlanLaunchApproval: PendingPlanLaunchApproval | null;
+  pendingEmailApproval: PendingEmailApproval | null;
+  pendingToolkitApproval: PendingToolkitApproval | null;
+  agentInputSourceUrl: string;
+  agentInputFile: File | null;
+  agentInputSubmitting: boolean;
+  agentActionBusy: boolean;
   onModeChange: (value: ControlMode) => void;
   onConversationDetailChange: (value: ControlConversationDetail) => void;
   onDirectionGivenChange: (value: string) => void;
+  onAgentInputValueChange: (key: string, value: string) => void;
+  onAgentInputSourceUrlChange: (value: string) => void;
+  onAgentInputFileChange: (file: File | null) => void;
+  onSubmitAgentInputs: () => void;
+  onRejectAgentInput: () => void;
+  onApprovePlanLaunch: () => void;
+  onRejectPlanLaunch: () => void;
+  onApproveEmailDraft: () => void;
+  onRejectEmailDraft: () => void;
+  onApproveToolkitAccess: () => void;
+  onRejectToolkitAccess: () => void;
+  onOpenTools: () => void;
   onDirectionModelChange: (value: (typeof DIRECTION_MODELS)[number]["id"]) => void;
   onEngageWithMode: (value: ControlMode) => void;
   onSendMessage: (message: string, mode: ControlMode) => Promise<void>;
@@ -2505,8 +4251,20 @@ function ControlDeckSurface({
   const [sending, setSending] = useState(false);
   const hasConversation = turns.length > 0;
   const hasDirectionDraft = directionGiven.trim().length > 0;
-  const isBusy = directionChatInFlight || directionPlanningInFlight || sending;
+  const isBusy =
+    directionChatInFlight ||
+    directionPlanningInFlight ||
+    sending ||
+    agentActionBusy ||
+    agentInputSubmitting;
   const showLanding = !hasConversation && !hasDirectionDraft;
+  const requiredInputs = agentRunResult?.status === "needs_input" ? agentRunResult.required_inputs ?? [] : [];
+  const hasActionCards =
+    Boolean(planningResult?.analysis) ||
+    Boolean(pendingPlanLaunchApproval) ||
+    Boolean(pendingToolkitApproval) ||
+    Boolean(pendingEmailApproval) ||
+    agentRunResult?.status === "needs_input";
   const placeholder =
     mode === "MINDSTORM"
       ? "Ask anything about ideas, planning, or execution..."
@@ -2538,14 +4296,14 @@ function ControlDeckSurface({
   }, [composer, engaged, isBusy, mode, onDirectionGivenChange, onEngageWithMode, onSendMessage]);
 
   const composerBar = (
-    <div className="rounded-[30px] border border-white/10 bg-white/[0.04] p-2 backdrop-blur-xl">
-      <div className="flex items-center gap-2">
+    <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-1.5 backdrop-blur-xl sm:rounded-[30px] sm:p-2">
+      <div className="flex items-end gap-1.5 sm:gap-2">
         <button
           type="button"
-          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 sm:h-9 sm:w-9"
           title="Tools"
         >
-          <PlusCircle size={18} />
+          <PlusCircle size={16} />
         </button>
 
         <textarea
@@ -2558,40 +4316,40 @@ function ControlDeckSurface({
               void handleSend();
             }
           }}
-          className="h-10 flex-1 resize-none bg-transparent px-2 py-2 text-base text-slate-100 outline-none placeholder:text-slate-500"
+          className="h-10 min-w-0 flex-1 resize-none bg-transparent px-1.5 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 sm:px-2 sm:text-base"
         />
 
         <button
           onClick={onVoiceIntent}
           disabled={isRecordingIntent || mode !== "MINDSTORM"}
-          className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 disabled:opacity-50"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 disabled:opacity-50 sm:h-9 sm:w-9"
           title={isRecordingIntent ? "Listening..." : "Voice Input"}
         >
-          {isRecordingIntent ? <MicOff size={18} /> : <Mic size={18} />}
+          {isRecordingIntent ? <MicOff size={16} /> : <Mic size={16} />}
         </button>
 
         <button
           onClick={() => void handleSend()}
           disabled={isBusy || !composer.trim()}
-          className="inline-flex h-10 w-10 items-center justify-center rounded-full bg-white text-black transition hover:bg-slate-200 disabled:opacity-60"
+          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-black transition hover:bg-slate-200 disabled:opacity-60 sm:h-10 sm:w-10"
           title={mode === "MINDSTORM" ? "Send Message" : "Generate Plan"}
         >
-          {isBusy ? <Loader2 size={18} className="animate-spin" /> : <ArrowUpRight size={18} />}
+          {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUpRight size={16} />}
         </button>
       </div>
     </div>
   );
 
   return (
-    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-2 sm:gap-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-3">
         <p className="text-sm text-slate-300">Talk to your organization</p>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex rounded-full border border-white/10 bg-black/25 p-1">
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+          <div className="inline-flex w-full max-w-full flex-wrap rounded-full border border-white/10 bg-black/25 p-1 sm:w-auto">
             <button
               onClick={() => onModeChange("MINDSTORM")}
-              className={`rounded-full px-5 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+              className={`flex-1 rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition sm:flex-none sm:px-5 sm:text-[11px] sm:tracking-[0.16em] ${
                 mode === "MINDSTORM"
                   ? "bg-white text-black"
                   : "text-slate-300 hover:bg-white/10"
@@ -2601,7 +4359,7 @@ function ControlDeckSurface({
             </button>
             <button
               onClick={() => onModeChange("DIRECTION")}
-              className={`rounded-full px-5 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+              className={`flex-1 rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition sm:flex-none sm:px-5 sm:text-[11px] sm:tracking-[0.16em] ${
                 mode === "DIRECTION"
                   ? "bg-white text-black"
                   : "text-slate-300 hover:bg-white/10"
@@ -2616,7 +4374,7 @@ function ControlDeckSurface({
             onChange={(event) =>
               onDirectionModelChange(event.target.value as (typeof DIRECTION_MODELS)[number]["id"])
             }
-            className="rounded-full border border-white/10 bg-black/35 px-4 py-2 text-sm text-slate-100 outline-none"
+            className="w-full rounded-full border border-white/10 bg-black/35 px-4 py-2 text-sm text-slate-100 outline-none sm:min-w-[210px] sm:w-auto"
           >
             {directionModels.map((option) => (
               <option key={option.id} value={option.id}>
@@ -2624,10 +4382,19 @@ function ControlDeckSurface({
               </option>
             ))}
           </select>
+
+          <button
+            type="button"
+            onClick={onOpenTools}
+            className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.14em] text-cyan-200 transition hover:bg-cyan-500/20"
+          >
+            <Link2 size={14} />
+            Connect Tools
+          </button>
         </div>
       </div>
 
-      <div className={`vx-panel flex min-h-0 flex-1 flex-col rounded-[28px] p-4 ${themeStyle.border}`}>
+      <div className={`vx-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] p-3 sm:rounded-[28px] sm:p-4 ${themeStyle.border}`}>
         {showLanding ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-3">
             <h2 className="text-center text-3xl font-medium text-slate-100 md:text-5xl">
@@ -2644,7 +4411,7 @@ function ControlDeckSurface({
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <div className="inline-flex w-fit rounded-full border border-white/10 bg-black/25 p-1">
+            <div className="inline-flex max-w-full flex-wrap rounded-full border border-white/10 bg-black/25 p-1">
               <button
                 onClick={() => onConversationDetailChange("REASONING_MIN")}
                 className={`rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
@@ -2680,17 +4447,202 @@ function ControlDeckSurface({
               </div>
             ) : null}
 
-            {planningResult?.analysis ? (
-              <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm text-blue-200">
-                {planningResult.analysis}
+            {hasActionCards ? (
+              <div className="vx-scrollbar max-h-[38vh] space-y-2 overflow-y-auto pr-0 sm:pr-1">
+                {planningResult?.analysis ? (
+                  <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-xs leading-relaxed text-blue-200 sm:text-sm">
+                    {planningResult.analysis}
+                  </div>
+                ) : null}
+
+                {pendingPlanLaunchApproval ? (
+                  <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/10 p-3">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-cyan-300">
+                      Plan Approval Required
+                    </p>
+                    <p className="mt-2 text-xs text-cyan-100 sm:text-sm">
+                      Review completed plan before workflow launch.
+                    </p>
+                    <p className="mt-1 text-[11px] text-cyan-200/85 sm:text-xs">
+                      {pendingPlanLaunchApproval.reason}
+                    </p>
+                    {pendingPlanLaunchApproval.toolkits.length > 0 ? (
+                      <p className="mt-2 text-[11px] text-cyan-100/90">
+                        Required tools: {formatToolkitList(pendingPlanLaunchApproval.toolkits)}
+                      </p>
+                    ) : null}
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={onApprovePlanLaunch}
+                        disabled={isBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                      >
+                        Approve Launch
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectPlanLaunch}
+                        disabled={isBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {pendingToolkitApproval ? (
+                  <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
+                      Tool Access Approval
+                    </p>
+                    <p className="mt-2 text-xs text-amber-100 sm:text-sm">
+                      Required tools: {formatToolkitList(pendingToolkitApproval.toolkits)}
+                    </p>
+                    <p className="mt-1 text-[11px] text-amber-200/85 sm:text-xs">
+                      Approve to connect integrations and continue execution, or reject to keep it paused.
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={onApproveToolkitAccess}
+                        disabled={isBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectToolkitAccess}
+                        disabled={isBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {pendingEmailApproval ? (
+                  <div className="rounded-xl border border-white/15 bg-white/[0.03] p-3">
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300">
+                      Draft Approval Required
+                    </p>
+                    <p className="mt-2 truncate text-xs text-slate-200">To: {pendingEmailApproval.draft.to}</p>
+                    <p className="truncate text-xs text-slate-300">
+                      Subject: {pendingEmailApproval.draft.subject}
+                    </p>
+                    <div className="mt-2 max-h-32 overflow-y-auto rounded-lg border border-white/10 bg-black/30 px-2.5 py-2">
+                      <p className="whitespace-pre-wrap break-words text-xs text-slate-200">
+                        {pendingEmailApproval.draft.body}
+                      </p>
+                    </div>
+                    <p className="mt-1 text-[11px] text-emerald-200/85">
+                      No email is sent until you press Approve.
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={onApproveEmailDraft}
+                        disabled={isBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectEmailDraft}
+                        disabled={isBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {agentRunResult?.status === "needs_input" ? (
+                  <div className="space-y-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
+                        Missing Input Required
+                      </p>
+                      <p className="mt-1 whitespace-pre-wrap text-xs text-amber-100">
+                        {agentRunResult.assistant_message || "Provide missing details to continue."}
+                      </p>
+                    </div>
+
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {requiredInputs.map((field) => (
+                        <label key={field.key} className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                          {field.label}
+                          <input
+                            type={field.type === "number" ? "number" : field.type === "email" ? "email" : "text"}
+                            value={agentRunInputValues[field.key] ?? ""}
+                            onChange={(event) => onAgentInputValueChange(field.key, event.target.value)}
+                            placeholder={field.placeholder}
+                            className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm normal-case tracking-normal text-slate-100 outline-none"
+                          />
+                        </label>
+                      ))}
+                    </div>
+
+                    <label className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                      Optional Source URL
+                      <input
+                        value={agentInputSourceUrl}
+                        onChange={(event) => onAgentInputSourceUrlChange(event.target.value)}
+                        placeholder="https://docs.example.com/context"
+                        className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm normal-case tracking-normal text-slate-100 outline-none"
+                      />
+                    </label>
+
+                    <label className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                      Optional File Upload
+                      <div className="mt-1 flex min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-black/40 px-3 py-2">
+                        <Paperclip size={14} className="shrink-0 text-slate-500" />
+                        <input
+                          type="file"
+                          onChange={(event) => onAgentInputFileChange(event.target.files?.[0] ?? null)}
+                          className="min-w-0 w-full text-sm normal-case tracking-normal text-slate-200 file:mr-3 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1 file:text-xs file:text-slate-200"
+                        />
+                      </div>
+                      {agentInputFile ? (
+                        <p className="mt-1 text-[11px] normal-case tracking-normal text-amber-100">
+                          Selected: {agentInputFile.name}
+                        </p>
+                      ) : null}
+                    </label>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={onSubmitAgentInputs}
+                        disabled={isBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                      >
+                        Approve & Continue
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectAgentInput}
+                        disabled={isBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
-            <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto pr-0 sm:pr-1">
               {turns.map((turn) => (
                 <div
                   key={turn.id}
-                  className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
+                  className={`max-w-full rounded-2xl px-3 py-2.5 text-sm sm:max-w-[85%] sm:px-4 sm:py-3 ${
                     turn.role === "owner"
                       ? "ml-auto bg-white/[0.08] text-slate-100"
                       : "mr-auto bg-white/[0.04] text-slate-200"
@@ -2700,12 +4652,12 @@ function ControlDeckSurface({
                     {turn.role === "owner" ? "You" : "Organization"}
                     {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
                   </p>
-                  <p className="mt-1 whitespace-pre-wrap">{turn.content}</p>
+                  <p className="mt-1 whitespace-pre-wrap break-words">{turn.content}</p>
                 </div>
               ))}
             </div>
 
-            <div className="mx-auto w-full max-w-4xl">{composerBar}</div>
+            <div className="mx-auto w-full max-w-4xl pt-1">{composerBar}</div>
           </div>
         )}
 
@@ -2793,7 +4745,7 @@ function NoOrganizationExplore({
   return (
     <div className="mx-auto max-w-4xl space-y-6">
       <div className={`vx-panel space-y-4 rounded-[34px] p-6 ${themeStyle.border}`}>
-        <h2 className="font-display text-4xl font-black uppercase tracking-tight">
+        <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">
           Explore {tabLabel}
         </h2>
         <p className="text-sm text-slate-300">
@@ -2866,8 +4818,8 @@ function SectionPlaceholder({
 
   return (
     <div className="mx-auto max-w-6xl space-y-8">
-      <div className="flex items-end justify-between border-b border-white/10 pb-6">
-        <h2 className="font-display text-4xl font-black uppercase tracking-tight">
+      <div className="flex flex-wrap items-end justify-between gap-3 border-b border-white/10 pb-6">
+        <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">
           {NAV_ITEMS.find((tab) => tab.id === activeTab)?.label ?? "Workspace"}
         </h2>
         <span className={`rounded-full px-4 py-2 text-[10px] uppercase tracking-[0.3em] ${themeStyle.accentSoft}`}>

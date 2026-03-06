@@ -26,6 +26,7 @@ interface HubConsoleProps {
     accentSoft: string;
     border: string;
   };
+  initialScope?: HubScope;
 }
 
 interface OrganizationalInput {
@@ -96,10 +97,10 @@ function StatChip({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
+export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
 
-  const [scope, setScope] = useState<HubScope>("ORGANIZATIONAL");
+  const [scope, setScope] = useState<HubScope>(initialScope ?? "ORGANIZATIONAL");
   const [refreshing, setRefreshing] = useState(false);
 
   const [orgInput, setOrgInput] = useState<OrganizationalInput | null>(null);
@@ -239,6 +240,13 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
       setRefreshing(false);
     }
   }, [loadDna, loadOrganizational, loadWorkflowHub, scope]);
+
+  useEffect(() => {
+    if (!initialScope) {
+      return;
+    }
+    setScope(initialScope);
+  }, [initialScope]);
 
   useEffect(() => {
     if (scope === "ORGANIZATIONAL") {
@@ -417,7 +425,7 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
     <div className="mx-auto max-w-[1380px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Hub</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Hub</h2>
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             Organizational / Directional / Workflow / DNA / Storage / Tools
           </p>
@@ -455,8 +463,8 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
       </div>
 
       {scope === "ORGANIZATIONAL" && (
-        <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
-          <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+        <div className="grid gap-4 2xl:grid-cols-[1.1fr_0.9fr]">
+          <div className={`vx-panel min-w-0 space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
             <div className="flex items-center justify-between">
               <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
                 Organizational Input
@@ -501,7 +509,7 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
             )}
           </div>
 
-          <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+          <div className={`vx-panel min-w-0 space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
               Organizational Output
             </p>
@@ -515,11 +523,11 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
                 No workflow outputs yet.
               </p>
             ) : (
-              <div className="space-y-3">
+              <div className="min-w-0 space-y-3">
                 {orgOutput.map((file) => (
-                  <div key={file.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                  <div key={file.id} className="min-w-0 rounded-2xl border border-white/10 bg-black/25 p-3">
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm font-semibold text-slate-100">{file.name}</p>
+                      <p className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-100">{file.name}</p>
                       <a
                         href={file.url}
                         target="_blank"
@@ -529,10 +537,10 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
                         Open
                       </a>
                     </div>
-                    <p className="mt-1 text-[10px] uppercase tracking-[0.16em] text-slate-500">
+                    <p className="mt-1 break-all text-[10px] uppercase tracking-[0.16em] text-slate-500">
                       {formatFileSize(file.size)} | Flow {file.sourceFlowId ?? "N/A"} | Task {file.sourceTaskId ?? "N/A"}
                     </p>
-                    <pre className="mt-2 max-h-28 overflow-auto rounded-xl border border-white/10 bg-black/40 p-2 text-xs text-slate-300">
+                    <pre className="mt-2 max-h-28 w-full max-w-full overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-xl border border-white/10 bg-black/40 p-2 text-xs text-slate-300">
                       {file.outputPreview ?? "No preview available."}
                     </pre>
                   </div>
@@ -635,7 +643,7 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
                     )}
 
                     {item.output?.preview && (
-                      <pre className="mt-2 max-h-24 overflow-auto rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-2 text-xs text-slate-100">
+                      <pre className="mt-2 max-h-24 w-full max-w-full overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-2 text-xs text-slate-100">
                         {item.output.fileName}: {item.output.preview}
                       </pre>
                     )}
@@ -648,7 +656,7 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
       )}
 
       {scope === "DNA" && (
-        <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+        <div className="grid gap-4 2xl:grid-cols-[1.2fr_0.8fr]">
           <div className={`vx-panel rounded-3xl p-4 ${themeStyle.border}`}>
             {dnaError && (
               <div className="mb-3 rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
@@ -757,7 +765,7 @@ export function HubConsole({ orgId, themeStyle }: HubConsoleProps) {
                     {dnaPreview.proof ? <span className="block pt-1">Proof: {dnaPreview.proof}</span> : null}
                   </div>
                 ) : (
-                  <pre className="mt-2 max-h-44 overflow-auto rounded-xl border border-white/10 bg-black/40 p-2 text-xs text-slate-300">
+                  <pre className="mt-2 max-h-44 w-full max-w-full overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-xl border border-white/10 bg-black/40 p-2 text-xs text-slate-300">
                     {dnaPreview.contentPreview || "No preview available."}
                   </pre>
                 )}

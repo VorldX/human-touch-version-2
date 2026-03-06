@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Loader2, PlugZap, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 
+import { IntegrationsConsole } from "@/components/settings/integrations-console";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
 type ToolName = "GOOGLE_DRIVE" | "S3_COMPATIBLE" | "MANAGED_VAULT";
@@ -42,6 +43,7 @@ interface ToolsHubProps {
 
 export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
+  const [toolSurface, setToolSurface] = useState<"INTEGRATIONS" | "STORAGE">("INTEGRATIONS");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [tools, setTools] = useState<StorageTool[]>([]);
@@ -98,10 +100,13 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
   );
 
   useEffect(() => {
+    if (toolSurface !== "STORAGE") {
+      return;
+    }
     void loadTools();
     const timer = setInterval(() => void loadTools(true), 15000);
     return () => clearInterval(timer);
-  }, [loadTools]);
+  }, [loadTools, toolSurface]);
 
   const createConnector = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -201,37 +206,68 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">Organizational Tools</p>
+        {toolSurface === "STORAGE" ? (
+          <button
+            onClick={() => void loadTools(true)}
+            className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300"
+          >
+            {refreshing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            Refresh
+          </button>
+        ) : null}
+      </div>
+
+      <div className="inline-flex rounded-full border border-white/10 bg-black/25 p-1">
         <button
-          onClick={() => void loadTools(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300"
+          type="button"
+          onClick={() => setToolSurface("INTEGRATIONS")}
+          className={`rounded-full px-4 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] ${
+            toolSurface === "INTEGRATIONS"
+              ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+              : "text-slate-300"
+          }`}
         >
-          {refreshing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-          Refresh
+          App Integrations
+        </button>
+        <button
+          type="button"
+          onClick={() => setToolSurface("STORAGE")}
+          className={`rounded-full px-4 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] ${
+            toolSurface === "STORAGE"
+              ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+              : "text-slate-300"
+          }`}
+        >
+          Storage Tools
         </button>
       </div>
 
-      <div className={`vx-panel rounded-2xl p-3 ${themeStyle.border}`}>
-        {loading ? (
-          <div className="inline-flex items-center gap-2 text-sm text-slate-400">
-            <Loader2 size={14} className="animate-spin" />
-            Loading tools...
+      {toolSurface === "INTEGRATIONS" ? (
+        <IntegrationsConsole orgId={orgId} themeStyle={{ border: themeStyle.border }} />
+      ) : (
+        <>
+          <div className={`vx-panel rounded-2xl p-3 ${themeStyle.border}`}>
+            {loading ? (
+              <div className="inline-flex items-center gap-2 text-sm text-slate-400">
+                <Loader2 size={14} className="animate-spin" />
+                Loading tools...
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {tools.map((tool) => (
+                  <article key={tool.key} className="rounded-xl border border-white/10 bg-black/25 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white">{tool.label}</p>
+                    <p className="text-xs text-slate-400">{tool.description}</p>
+                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                      {tool.enabled ? "CONNECTED" : "NOT CONNECTED"}
+                    </p>
+                  </article>
+                ))}
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="space-y-2">
-            {tools.map((tool) => (
-              <article key={tool.key} className="rounded-xl border border-white/10 bg-black/25 p-3">
-                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white">{tool.label}</p>
-                <p className="text-xs text-slate-400">{tool.description}</p>
-                <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                  {tool.enabled ? "CONNECTED" : "NOT CONNECTED"}
-                </p>
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
 
-      <form onSubmit={createConnector} className={`vx-panel space-y-2 rounded-2xl p-3 ${themeStyle.border}`}>
+          <form onSubmit={createConnector} className={`vx-panel space-y-2 rounded-2xl p-3 ${themeStyle.border}`}>
         <p className="inline-flex items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-500">
           <PlugZap size={12} />
           Add Connector
@@ -291,9 +327,9 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
             </article>
           ))}
         </div>
-      </form>
+          </form>
 
-      <form onSubmit={createGrant} className={`vx-panel space-y-2 rounded-2xl p-3 ${themeStyle.border}`}>
+          <form onSubmit={createGrant} className={`vx-panel space-y-2 rounded-2xl p-3 ${themeStyle.border}`}>
         <p className="inline-flex items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-500">
           <ShieldCheck size={12} />
           Tool Grants
@@ -360,7 +396,9 @@ export function ToolsHub({ orgId, themeStyle }: ToolsHubProps) {
             </article>
           ))}
         </div>
-      </form>
+          </form>
+        </>
+      )}
     </div>
   );
 }

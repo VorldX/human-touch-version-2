@@ -117,7 +117,7 @@ export function CollaborationConsole({ orgId, themeStyle }: CollaborationConsole
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Collaboration</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Collaboration</h2>
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             Digital Labor Marketplace
           </p>
@@ -163,7 +163,7 @@ export function CollaborationConsole({ orgId, themeStyle }: CollaborationConsole
         </div>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4 2xl:grid-cols-2">
         <AssetPanel
           title="Listed Assets"
           subtitle="Available for external contracts"

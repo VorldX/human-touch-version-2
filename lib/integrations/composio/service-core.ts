@@ -627,12 +627,12 @@ export class ComposioServiceCore {
   > {
     const rawState = asString(input.params.get("state"));
     if (!rawState) {
-      return { ok: false, reason: "missing_state", returnTo: "/app?tab=settings&settingsLane=integrations" };
+      return { ok: false, reason: "missing_state", returnTo: "/app?tab=hub&hubScope=TOOLS" };
     }
 
     const state = this.verifyStateToken(rawState);
     if (!state) {
-      return { ok: false, reason: "invalid_state", returnTo: "/app?tab=settings&settingsLane=integrations" };
+      return { ok: false, reason: "invalid_state", returnTo: "/app?tab=hub&hubScope=TOOLS" };
     }
 
     const toolkit = normalizeToolkit(state.toolkit);
@@ -808,13 +808,51 @@ export class ComposioServiceCore {
 
 export function inferRequestedToolkits(prompt: string, allowlistedToolkits: string[]) {
   const normalizedPrompt = prompt.toLowerCase();
+  const compactPrompt = normalizedPrompt.replace(/[^a-z0-9]/g, "");
   const allowlist = allowlistedToolkits.map(normalizeToolkit);
   const requested = new Set<string>();
 
   for (const toolkit of allowlist) {
-    if (normalizedPrompt.includes(toolkit)) {
+    const compactToolkit = toolkit.replace(/[^a-z0-9]/g, "");
+    if (normalizedPrompt.includes(toolkit) || (compactToolkit && compactPrompt.includes(compactToolkit))) {
       requested.add(toolkit);
     }
+  }
+
+  // High-signal intent mapping so natural language ("send email") can still trigger toolkit routing.
+  if (
+    allowlist.includes("gmail") &&
+    /\b(gmail|email|inbox|recipient|subject|send mail|compose mail)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add("gmail");
+  }
+
+  if (
+    allowlist.includes("zoom") &&
+    /\b(zoom|video call|video meeting|webinar|meeting link)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add("zoom");
+  }
+
+  if (
+    allowlist.includes("googlecalendar") &&
+    /\b(calendar|schedule|availability|meeting invite)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add("googlecalendar");
+  }
+
+  if (
+    allowlist.includes("hubspot") &&
+    /\b(crm|hubspot|lead|pipeline)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add("hubspot");
+  }
+
+  if (
+    allowlist.includes("salesforce") &&
+    /\b(crm|salesforce|lead|opportunity)\b/i.test(normalizedPrompt)
+  ) {
+    requested.add("salesforce");
   }
 
   const markerMatch = normalizedPrompt.match(/\btoolkits?\s*[:=]\s*([a-z0-9,_\-\s]+)/i);

@@ -7,6 +7,7 @@ import {
   type DirectionSource,
   type DirectionStatus
 } from "@/lib/direction/directions";
+import { requireOrgAccess } from "@/lib/security/org-access";
 
 function asTrimmed(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -38,6 +39,11 @@ export async function GET(request: NextRequest) {
       { ok: false, message: "orgId query param is required." },
       { status: 400 }
     );
+  }
+
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
   }
 
   const org = await prisma.organization.findUnique({
@@ -89,6 +95,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const access = await requireOrgAccess({ request, orgId });
+  if (!access.ok) {
+    return access.response;
+  }
+
   const org = await prisma.organization.findUnique({
     where: { id: orgId },
     select: { id: true }
@@ -103,8 +114,8 @@ export async function POST(request: NextRequest) {
     direction,
     ...(parseStatus(body?.status) ? { status: parseStatus(body?.status) } : {}),
     ...(parseSource(body?.source) ? { source: parseSource(body?.source) } : {}),
-    ...(body?.ownerUserId !== undefined ? { ownerUserId: body.ownerUserId } : {}),
-    ...(body?.ownerEmail !== undefined ? { ownerEmail: body.ownerEmail } : {}),
+    ...(body?.ownerUserId !== undefined ? { ownerUserId: body.ownerUserId } : { ownerUserId: access.actor.userId }),
+    ...(body?.ownerEmail !== undefined ? { ownerEmail: body.ownerEmail } : { ownerEmail: access.actor.email }),
     ...(body?.ownerName !== undefined ? { ownerName: body.ownerName } : {}),
     ...(Array.isArray(body?.tags) ? { tags: parseTags(body?.tags) } : {}),
     ...(typeof body?.impactScore === "number" ? { impactScore: body.impactScore } : {})
@@ -118,4 +129,3 @@ export async function POST(request: NextRequest) {
     { status: 201 }
   );
 }
-

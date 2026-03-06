@@ -15,7 +15,37 @@ import {
 } from "@/lib/integrations/composio/service-core";
 import { createComposioOAuthState, verifyComposioOAuthState } from "@/lib/integrations/composio/oauth-state";
 
-const DEFAULT_ALLOWLIST = ["gmail", "slack", "notion"] as const;
+const DEFAULT_ALLOWLIST = [
+  "gmail",
+  "slack",
+  "notion",
+  "github",
+  "googlecalendar",
+  "googledrive",
+  "googledocs",
+  "googlesheets",
+  "outlook",
+  "microsoftteams",
+  "jira",
+  "trello",
+  "asana",
+  "monday",
+  "linear",
+  "shopify",
+  "stripe",
+  "salesforce",
+  "hubspot",
+  "pipedrive",
+  "quickbooks",
+  "zendesk",
+  "whatsapp",
+  "twitter",
+  "linkedin",
+  "youtube",
+  "zoom",
+  "intercom",
+  "typeform"
+] as const;
 type UserIntegrationRow = NonNullable<
   Awaited<ReturnType<typeof prisma.userIntegration.findFirst>>
 >;
@@ -96,14 +126,14 @@ export function composioAllowlistedToolkits() {
 }
 
 export function defaultIntegrationsReturnPath() {
-  return "/app?tab=settings&settingsLane=integrations";
+  return "/app?tab=hub&hubScope=TOOLS";
 }
 
 export function buildIntegrationConnectPath(toolkit?: string) {
   const url = new URL("http://localhost");
   url.pathname = "/app";
-  url.searchParams.set("tab", "settings");
-  url.searchParams.set("settingsLane", "integrations");
+  url.searchParams.set("tab", "hub");
+  url.searchParams.set("hubScope", "TOOLS");
   if (toolkit) {
     url.searchParams.set("toolkit", toolkit);
   }

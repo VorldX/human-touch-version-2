@@ -285,7 +285,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Memory</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Memory</h2>
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             System Ledger + Archived Missions
           </p>
@@ -317,7 +317,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4 2xl:grid-cols-2">
         <StreamPanel
           title="Machine Stream"
           subtitle="Autonomous runtime events"
@@ -359,7 +359,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
             No archived workflows found.
           </p>
         ) : (
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
             {archivedFlows.map((flow) => (
               <div key={flow.id} className="rounded-2xl border border-white/10 bg-black/30 p-3">
                 <p className="line-clamp-2 text-sm text-slate-100">{flow.prompt}</p>
@@ -393,7 +393,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
 
       {auditModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="vx-panel vx-scrollbar h-[90vh] w-full max-w-5xl overflow-y-auto rounded-[34px] border border-white/15 p-6">
+          <div className="vx-panel vx-scrollbar h-[90dvh] w-full max-w-5xl overflow-y-auto rounded-[34px] border border-white/15 p-6">
             <div className="mb-4 flex items-start justify-between border-b border-white/10 pb-3">
               <div>
                 <h3 className="font-display text-2xl font-black uppercase tracking-tight">

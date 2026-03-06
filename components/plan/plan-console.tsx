@@ -56,6 +56,27 @@ function parseJsonObject(raw: string, label: string) {
   }
 }
 
+async function parseJsonResponse<T>(response: Response): Promise<{
+  payload: T | null;
+  rawText: string;
+}> {
+  const rawText = await response.text();
+  if (!rawText) {
+    return { payload: null, rawText: "" };
+  }
+  try {
+    return {
+      payload: JSON.parse(rawText) as T,
+      rawText
+    };
+  } catch {
+    return {
+      payload: null,
+      rawText
+    };
+  }
+}
+
 export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
 
@@ -88,13 +109,16 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
         const response = await fetch(`/api/plans?orgId=${encodeURIComponent(orgId)}`, {
           cache: "no-store"
         });
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           plans?: PlanRecord[];
-        };
-        if (!response.ok || !payload.ok || !payload.plans) {
-          throw new Error(payload.message ?? "Failed loading plans.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload.plans) {
+          throw new Error(
+            payload?.message ??
+              (rawText ? `Failed loading plans (${response.status}): ${rawText.slice(0, 180)}` : "Failed loading plans.")
+          );
         }
         setPlans(payload.plans);
         setError(null);
@@ -159,13 +183,16 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
           })
         });
 
-        const payload = (await response.json()) as {
+        const { payload, rawText } = await parseJsonResponse<{
           ok?: boolean;
           message?: string;
           plan?: PlanRecord;
-        };
-        if (!response.ok || !payload.ok || !payload.plan) {
-          throw new Error(payload.message ?? "Save failed.");
+        }>(response);
+        if (!response.ok || !payload?.ok || !payload.plan) {
+          throw new Error(
+            payload?.message ??
+              (rawText ? `Save failed (${response.status}): ${rawText.slice(0, 180)}` : "Save failed.")
+          );
         }
 
         notify({
@@ -201,9 +228,9 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-5">
-      <div className="flex items-center justify-between border-b border-white/10 pb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-4xl font-black uppercase tracking-tight">Plan</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Plan</h2>
           <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500">
             Human + AI Editable Plans
           </p>
@@ -223,7 +250,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
         </div>
       )}
 
-      <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
+      <div className="grid gap-4 2xl:grid-cols-[360px_1fr]">
         <div className={`vx-panel space-y-2 rounded-3xl p-4 ${themeStyle.border}`}>
           <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-300">Plan History</p>
           {loading ? (
