@@ -10,7 +10,6 @@ import {
   PlayCircle,
   RefreshCw,
   ShieldAlert,
-  Sparkles,
   TerminalSquare,
   X
 } from "lucide-react";
@@ -706,14 +705,12 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
     <div className="mx-auto max-w-[1400px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Work Flow</h2>
-          <p className="text-[10px] uppercase tracking-[0.32em] text-slate-500">
-            Kanban + Deep Dive Console
-          </p>
+          <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Workflow</h2>
+          <p className="text-xs text-slate-500">Kanban + deep dive console</p>
         </div>
         <button
           onClick={() => void loadFlows()}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200"
+          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
         >
           <RefreshCw size={13} />
           Refresh
@@ -726,8 +723,8 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
         {lanes.map((lane) => (
           <div key={lane.id} className={`vx-panel min-h-[420px] rounded-3xl p-4 ${themeStyle.border}`}>
             <div className="mb-3 flex items-center justify-between">
-              <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">{lane.title}</p>
-              <span className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-slate-300">
+              <p className="text-sm font-semibold text-slate-200">{lane.title}</p>
+              <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-slate-300">
                 {lane.flows.length}
               </span>
             </div>
@@ -737,7 +734,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                   <Loader2 size={14} className="animate-spin" /> Loading...
                 </div>
               ) : lane.flows.length === 0 ? (
-                <p className="text-xs uppercase tracking-[0.16em] text-slate-500">Empty lane</p>
+                <p className="text-xs text-slate-500">Empty lane</p>
               ) : (
                 lane.flows.map((flow) => (
                   <button
@@ -752,7 +749,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                     <div className="mt-2 h-1.5 rounded-full bg-white/10">
                       <div className="h-1.5 rounded-full bg-emerald-400" style={{ width: `${Math.max(4, flow.progress)}%` }} />
                     </div>
-                    <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-[0.16em] text-slate-400">
+                    <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
                       <span>{flow.status}</span>
                       <span>{new Date(flow.updatedAt).toLocaleTimeString()}</span>
                     </div>
@@ -768,28 +765,28 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="vx-panel flex h-[90dvh] w-full max-w-7xl flex-col overflow-hidden rounded-[34px] border border-white/15">
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
-              <h3 className="font-display text-2xl font-black uppercase">Deep Dive Console</h3>
+              <h3 className="font-display text-2xl font-black">Deep Dive Console</h3>
               <button onClick={() => setFlowId(null)} className="rounded-full border border-white/20 p-2">
                 <X size={16} />
               </button>
             </div>
 
             <div className="flex items-center gap-2 border-b border-white/10 px-6 py-3">
-              {[{ id: "agent", icon: Bot }, { id: "human", icon: TerminalSquare }, { id: "autopsy", icon: GitBranchPlus }].map((tab) => (
+              {[{ id: "agent", label: "Agent", icon: Bot }, { id: "human", label: "Human", icon: TerminalSquare }, { id: "autopsy", label: "Autopsy", icon: GitBranchPlus }].map((tab) => (
                 <button
                   key={tab.id}
                   onClick={() => setDetailTab(tab.id as "agent" | "human" | "autopsy")}
-                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] ${
+                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold ${
                     detailTab === tab.id
                       ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                       : "border-white/20 bg-white/5 text-slate-300"
                   }`}
                 >
                   <tab.icon size={14} />
-                  {tab.id}
+                  {tab.label}
                 </button>
               ))}
-              <span className="ml-auto inline-flex items-center gap-1 text-[10px] uppercase tracking-[0.2em] text-amber-300">
+              <span className="ml-auto inline-flex items-center gap-1 text-xs text-amber-300">
                 <ShieldAlert size={12} />
                 {detail?.tasks.filter((t) => t.isPausedForInput || t.status === "PAUSED").length ?? 0} paused
               </span>
@@ -814,79 +811,134 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                         {detail.tasks.map((task) => {
                           const integrationError = parseIntegrationError(task.executionTrace);
                           const runtime = parseAgentRuntime(task.executionTrace);
+                          const isSelected = task.id === taskId;
                           const runtimeLabel = runtime?.logicalRole
                             ? `${runtime.logicalRole} | ${runtime.logicalAgentId?.slice(0, 8) ?? "logical"}`
                             : null;
                           return (
-                            <div key={task.id} className="rounded-xl border border-white/10 bg-black/30 px-3 py-2">
+                            <div
+                              key={task.id}
+                              className={`rounded-xl border px-3 py-2 ${
+                                isSelected
+                                  ? "border-cyan-500/40 bg-cyan-500/8"
+                                  : "border-white/10 bg-black/30"
+                              }`}
+                            >
                               <div className="flex flex-wrap items-center gap-2">
-                              <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase ${badgeClass(task.status)}`}>{task.status}</span>
-                              <span className="text-xs text-slate-200">{runtimeLabel ?? (task.agent ? `${task.agent.name} | ${task.agent.role}` : "Unassigned")}</span>
-                              {runtime?.decisionType ? (
-                                <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-cyan-300">
-                                  {runtime.decisionType}
+                                <span className={`rounded-full border px-2 py-0.5 text-xs ${badgeClass(task.status)}`}>
+                                  {task.status}
                                 </span>
-                              ) : null}
-                              {runtime?.executionMode ? (
-                                <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-indigo-200">
-                                  {runtime.executionMode}
+                                <span className="text-xs text-slate-200">
+                                  {runtimeLabel ?? (task.agent ? `${task.agent.name} | ${task.agent.role}` : "Unassigned")}
                                 </span>
-                              ) : null}
-                              {runtime?.parentAgentId ? (
-                                <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-violet-200">
-                                  Parent {shortId(runtime.parentAgentId)}
-                                </span>
-                              ) : null}
-                              {typeof runtime?.estimatedSelfCostUsd === "number" ? (
-                                <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-emerald-200">
-                                  Est Self {formatUsd(runtime.estimatedSelfCostUsd)}
-                                </span>
-                              ) : null}
-                              {typeof runtime?.budgetSnapshot?.remainingBudgetUsd === "number" ? (
-                                <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-200">
-                                  Rem {formatUsd(runtime.budgetSnapshot.remainingBudgetUsd)}
-                                </span>
-                              ) : null}
-                              <span className="text-xs text-slate-400">{task.prompt}</span>
+                                <button
+                                  onClick={() => setTaskId(task.id)}
+                                  className={`ml-auto rounded-full border px-2 py-0.5 text-xs ${
+                                    isSelected
+                                      ? "border-cyan-500/45 bg-cyan-500/10 text-cyan-200"
+                                      : "border-white/20 text-slate-300"
+                                  }`}
+                                >
+                                  {isSelected ? "Selected" : "Inspect"}
+                                </button>
+                              </div>
+                              <p className="mt-1 text-xs text-slate-400">{task.prompt}</p>
+
                               {integrationError ? (
-                                <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-300">
+                                <span className="mt-1 inline-flex rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">
                                   {integrationError.toolkit} not connected
                                 </span>
                               ) : null}
-                              <button onClick={() => setTaskId(task.id)} className="ml-auto rounded-full border border-white/20 px-2 py-0.5 text-[10px] uppercase">Inspect</button>
-                              {integrationError ? (
-                                <button
-                                  onClick={() => openIntegrationSetup(integrationError)}
-                                  className="inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[10px] uppercase text-cyan-300"
-                                >
-                                  <Link2 size={12} />
-                                  Connect {integrationError.toolkit}
-                                </button>
+
+                              {isSelected ? (
+                                <div className="mt-2 space-y-2">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    {runtime?.decisionType ? (
+                                      <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-300">
+                                        {runtime.decisionType}
+                                      </span>
+                                    ) : null}
+                                    {runtime?.executionMode ? (
+                                      <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-xs text-indigo-200">
+                                        {runtime.executionMode}
+                                      </span>
+                                    ) : null}
+                                    {runtime?.parentAgentId ? (
+                                      <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-xs text-violet-200">
+                                        Parent {shortId(runtime.parentAgentId)}
+                                      </span>
+                                    ) : null}
+                                    {typeof runtime?.estimatedSelfCostUsd === "number" ? (
+                                      <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-200">
+                                        Est Self {formatUsd(runtime.estimatedSelfCostUsd)}
+                                      </span>
+                                    ) : null}
+                                    {typeof runtime?.budgetSnapshot?.remainingBudgetUsd === "number" ? (
+                                      <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-200">
+                                        Rem {formatUsd(runtime.budgetSnapshot.remainingBudgetUsd)}
+                                      </span>
+                                    ) : null}
+                                  </div>
+
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {integrationError ? (
+                                      <button
+                                        onClick={() => openIntegrationSetup(integrationError)}
+                                        className="inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-300"
+                                      >
+                                        <Link2 size={12} />
+                                        Connect {integrationError.toolkit}
+                                      </button>
+                                    ) : null}
+                                    {task.status === "PAUSED" || task.isPausedForInput ? (
+                                      <button
+                                        onClick={() => void runAction(task.id, "resume")}
+                                        className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300"
+                                      >
+                                        {actionKey === `resume:${task.id}` ? (
+                                          <Loader2 size={12} className="animate-spin" />
+                                        ) : (
+                                          <PlayCircle size={12} />
+                                        )}{" "}
+                                        Resume
+                                      </button>
+                                    ) : (
+                                      <button
+                                        onClick={() => void runAction(task.id, "pause")}
+                                        className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300"
+                                      >
+                                        {actionKey === `pause:${task.id}` ? (
+                                          <Loader2 size={12} className="animate-spin" />
+                                        ) : (
+                                          <PauseCircle size={12} />
+                                        )}{" "}
+                                        Pause
+                                      </button>
+                                    )}
+                                    {(task.status === "COMPLETED" ||
+                                      task.status === "FAILED" ||
+                                      task.status === "ABORTED") && (
+                                      <button
+                                        onClick={() => void runAction(task.id, "rewind")}
+                                        className="inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-300"
+                                      >
+                                        {actionKey === `rewind:${task.id}` ? (
+                                          <Loader2 size={12} className="animate-spin" />
+                                        ) : (
+                                          <GitBranchPlus size={12} />
+                                        )}{" "}
+                                        Rewind & Fork Here
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
                               ) : null}
-                              {task.status === "PAUSED" || task.isPausedForInput ? (
-                                <button onClick={() => void runAction(task.id, "resume")} className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] uppercase text-emerald-300">
-                                  {actionKey === `resume:${task.id}` ? <Loader2 size={12} className="animate-spin" /> : <PlayCircle size={12} />} Resume
-                                </button>
-                              ) : (
-                                <button onClick={() => void runAction(task.id, "pause")} className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase text-amber-300">
-                                  {actionKey === `pause:${task.id}` ? <Loader2 size={12} className="animate-spin" /> : <PauseCircle size={12} />} Pause
-                                </button>
-                              )}
-                              {(task.status === "COMPLETED" || task.status === "FAILED" || task.status === "ABORTED") && (
-                                <button onClick={() => void runAction(task.id, "rewind")} className="inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[10px] uppercase text-cyan-300">
-                                  {actionKey === `rewind:${task.id}` ? <Loader2 size={12} className="animate-spin" /> : <GitBranchPlus size={12} />} Rewind & Fork Here
-                                </button>
-                              )}
-                              </div>
+
                               {runtime?.decisionReason ? (
-                                <p className="mt-1 text-[11px] text-slate-400">
-                                  Decision: {runtime.decisionReason}
-                                </p>
+                                <p className="mt-1 text-[11px] text-slate-400">Decision: {runtime.decisionReason}</p>
                               ) : null}
                               {task.humanInterventionReason ? (
-                                <p className="mt-1 text-[11px] text-amber-200">
-                                  Human Touch: {task.humanInterventionReason}
-                                </p>
+                                <p className="mt-1 text-[11px] text-amber-200">Human Touch: {task.humanInterventionReason}</p>
                               ) : null}
                             </div>
                           );
@@ -898,7 +950,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                   {detailTab === "human" && (
                     <div className="grid gap-4 lg:grid-cols-2">
                       <div className="space-y-3 rounded-2xl border border-white/10 bg-black/25 p-3">
-                        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Human Touch Terminal</p>
+                        <p className="text-xs font-medium text-slate-500">Human intervention terminal</p>
                         <select value={taskId} onChange={(e) => setTaskId(e.target.value)} className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm">
                           {detail.tasks.map((task) => (
                             <option key={task.id} value={task.id}>
@@ -913,7 +965,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                             </p>
                             <button
                               onClick={() => openIntegrationSetup(selectedTaskIntegrationError)}
-                              className="mt-2 inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-[10px] uppercase tracking-[0.14em] text-cyan-200"
+                              className="mt-2 inline-flex items-center gap-1 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-200"
                             >
                               <Link2 size={12} />
                               Connect {selectedTaskIntegrationError.toolkit}
@@ -924,17 +976,17 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                         <textarea value={overridePrompt} onChange={(e) => setOverridePrompt(e.target.value)} placeholder="Override prompt / logic rewrite" className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm" />
                         <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Human note" className="h-20 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm" />
                         <div className="flex gap-2">
-                          <button onClick={() => taskId && void runAction(taskId, "resume")} className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-[10px] uppercase text-emerald-300">Resume</button>
-                          <button onClick={() => taskId && void runAction(taskId, "pause")} className="rounded-full border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-[10px] uppercase text-amber-300">Pause</button>
+                          <button onClick={() => taskId && void runAction(taskId, "resume")} className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-300">Resume</button>
+                          <button onClick={() => taskId && void runAction(taskId, "pause")} className="rounded-full border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-xs font-semibold text-amber-300">Pause</button>
                         </div>
                       </div>
                       <div className="space-y-3 rounded-2xl border border-white/10 bg-black/25 p-3">
-                        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Temporal Branching</p>
+                        <p className="text-xs font-medium text-slate-500">Temporal branching</p>
                         <textarea value={rewindPrompt} onChange={(e) => setRewindPrompt(e.target.value)} placeholder="Branch prompt override" className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm" />
                         {detail.tasks.filter((t) => t.status === "COMPLETED" || t.status === "FAILED" || t.status === "ABORTED").map((t) => (
                           <div key={t.id} className="flex items-center justify-between rounded-xl border border-white/10 bg-black/30 px-3 py-2">
                             <span className="text-xs text-slate-200">{t.id.slice(0, 10)} | {t.status}</span>
-                            <button onClick={() => void runAction(t.id, "rewind")} className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-[10px] uppercase text-cyan-300">Rewind & Fork</button>
+                            <button onClick={() => void runAction(t.id, "rewind")} className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-300">Rewind & Fork</button>
                           </div>
                         ))}
                       </div>
@@ -944,7 +996,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                   {detailTab === "autopsy" && (
                     <div className="space-y-3">
                       <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-black/25 px-3 py-2">
-                        <span className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Task</span>
+                        <span className="text-xs text-slate-500">Task</span>
                         <select value={taskId} onChange={(e) => setTaskId(e.target.value)} className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs">
                           {detail.tasks.map((t) => (
                             <option key={t.id} value={t.id}>
@@ -966,7 +1018,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                         ) : (
                           logs.map((log) => (
                             <div key={log.id} className="rounded-xl border border-white/10 bg-black/30 px-3 py-2">
-                              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
+                              <p className="text-xs text-slate-500">
                                 {log.type} | {new Date(log.timestamp).toLocaleTimeString()}
                               </p>
                               <p className="text-xs text-slate-300">
@@ -991,8 +1043,8 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
 function Stat({ label, value, className }: { label: string; value: string; className?: string }) {
   return (
     <div className="rounded-xl border border-white/10 bg-black/25 p-3">
-      <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">{label}</p>
-      <p className={`mt-1 text-sm font-bold uppercase ${className ?? "text-white"}`}>{value}</p>
+      <p className="text-xs text-slate-500">{label}</p>
+      <p className={`mt-1 text-sm font-bold ${className ?? "text-white"}`}>{value}</p>
     </div>
   );
 }

@@ -888,14 +888,14 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
     <div className="mx-auto max-w-[1380px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Hub</h2>
-          <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-            Organizational / Directional / Workflow / DNA / Storage / Tools
+          <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Hub</h2>
+          <p className="text-xs text-slate-500">
+            Company data, workflows, memory, storage, and connected tools
           </p>
         </div>
         <button
           onClick={() => void refreshCurrent()}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200"
+          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
         >
           {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
           Refresh
@@ -904,17 +904,17 @@ export function HubConsole({ orgId, themeStyle, initialScope }: HubConsoleProps)
 
       <div className="flex flex-wrap gap-2">
         {[
-          { key: "ORGANIZATIONAL" as const, label: "Organizational Hub" },
-          { key: "DIRECTIONAL" as const, label: "Directional Hub" },
-          { key: "WORKFLOW" as const, label: "Workflow Hub" },
-          { key: "DNA" as const, label: "DNA Hub" },
-          { key: "STORAGE" as const, label: "Storage Hub" },
-          { key: "TOOLS" as const, label: "Organizational Tools" }
+          { key: "ORGANIZATIONAL" as const, label: "Company" },
+          { key: "DIRECTIONAL" as const, label: "Direction" },
+          { key: "WORKFLOW" as const, label: "Workflow" },
+          { key: "DNA" as const, label: "DNA memory" },
+          { key: "STORAGE" as const, label: "Storage" },
+          { key: "TOOLS" as const, label: "Connected tools" }
         ].map((item) => (
           <button
             key={item.key}
             onClick={() => setScope(item.key)}
-            className={`rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] ${
+            className={`rounded-full border px-4 py-2 text-xs font-semibold ${
               scope === item.key
                 ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                 : "border-white/20 bg-white/5 text-slate-300"

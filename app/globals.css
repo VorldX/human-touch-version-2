@@ -4,6 +4,14 @@
 
 :root {
   color-scheme: dark;
+  --vx-bg: #05070a;
+  --vx-surface: #0d1117;
+  --vx-surface-soft: #11161f;
+  --vx-text: #e2e8f0;
+  --vx-text-soft: #cbd5e1;
+  --vx-muted: #94a3b8;
+  --vx-border: rgba(255, 255, 255, 0.1);
+  --vx-border-soft: rgba(255, 255, 255, 0.07);
 }
 
 html,
@@ -14,9 +22,12 @@ body {
 
 body {
   margin: 0;
-  background: #05070a;
-  color: #e2e8f0;
+  background: var(--vx-bg);
+  color: var(--vx-text);
   font-family: var(--font-rajdhani), sans-serif;
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
 }
 
 * {
@@ -24,8 +35,9 @@ body {
 }
 
 .vx-panel {
-  background: #0d1117;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--vx-surface);
+  border: 1px solid var(--vx-border-soft);
+  box-shadow: 0 14px 42px rgba(0, 0, 0, 0.33);
 }
 
 .vx-no-scrollbar::-webkit-scrollbar {
@@ -46,18 +58,20 @@ body {
 }
 
 html[data-ghost="true"] body {
-  background: #060103;
-  color: #ffe3e3;
+  background: #080306;
+  color: #fbe2e2;
 }
 
 html[data-ghost="true"] .vx-shell {
-  filter: grayscale(0.85) contrast(1.35) brightness(0.72) sepia(0.75) hue-rotate(-35deg) saturate(4.5);
+  filter: grayscale(0.35) contrast(1.1) brightness(0.92) sepia(0.25) hue-rotate(-18deg) saturate(1.8);
 }
 
 html[data-ghost="true"] .vx-panel {
-  border-color: rgba(255, 80, 80, 0.28);
-  background: rgba(26, 10, 14, 0.88);
-  box-shadow: inset 0 0 0 1px rgba(255, 80, 80, 0.1);
+  border-color: rgba(255, 90, 90, 0.24);
+  background: rgba(23, 10, 15, 0.86);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 90, 90, 0.08),
+    0 14px 38px rgba(0, 0, 0, 0.36);
 }
 
 .vx-ghost-overlay {

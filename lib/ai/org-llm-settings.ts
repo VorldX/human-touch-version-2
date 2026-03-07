@@ -152,8 +152,8 @@ function parseSerialized(value: unknown): SerializedOrgLlmSettings {
     mode,
     provider: normalizeProvider(record.provider, "OpenAI"),
     model: normalizeModel(record.model, "gpt-4o-mini"),
-    fallbackProvider: normalizeProvider(record.fallbackProvider, "Anthropic"),
-    fallbackModel: normalizeModel(record.fallbackModel, "claude-3-5-sonnet"),
+    fallbackProvider: normalizeProvider(record.fallbackProvider, "Gemini"),
+    fallbackModel: normalizeModel(record.fallbackModel, "gemini-2.5-flash"),
     servicePlan,
     serviceMarkupPct: normalizeMarkup(
       record.serviceMarkupPct,
@@ -291,8 +291,8 @@ export async function upsertOrgLlmSettings(
     mode: normalizedMode,
     provider: normalizeProvider(input.provider, "OpenAI"),
     model: normalizeModel(input.model, "gpt-4o-mini"),
-    fallbackProvider: normalizeProvider(input.fallbackProvider, "Anthropic"),
-    fallbackModel: normalizeModel(input.fallbackModel, "claude-3-5-sonnet"),
+    fallbackProvider: normalizeProvider(input.fallbackProvider, "Gemini"),
+    fallbackModel: normalizeModel(input.fallbackModel, "gemini-2.5-flash"),
     servicePlan: normalizedPlan,
     serviceMarkupPct: normalizeMarkup(
       input.serviceMarkupPct,

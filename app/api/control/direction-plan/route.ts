@@ -6,6 +6,7 @@ import { LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
+import { selectCompanyContext } from "@/lib/ai/context-selector";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
 import { prisma } from "@/lib/db/prisma";
 import { createDirection } from "@/lib/direction/directions";
@@ -72,24 +73,64 @@ interface ModelPlanResponse {
   permissions: PermissionHint[];
 }
 
+const MAX_DIRECTION_CHARS = 2200;
+const MAX_HUMAN_PLAN_CHARS = 3200;
+const MAX_HISTORY_ITEM_CHARS = 1200;
+const MAX_HISTORY_TOTAL_CHARS = 7000;
+
+function positiveEnvInt(name: string, fallback: number) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+const MAX_PROMPT_COMPANY_CONTEXT_CHARS = positiveEnvInt(
+  "DIRECTION_PLAN_SELECTED_CONTEXT_MAX_CHARS",
+  2600
+);
+const MAX_CONTEXT_SELECTOR_CHUNK_CHARS = positiveEnvInt(
+  "DIRECTION_CONTEXT_SELECTOR_CHUNK_CHARS",
+  700
+);
+const DIRECTION_PLAN_MAX_OUTPUT_TOKENS = positiveEnvInt(
+  "DIRECTION_PLAN_MAX_OUTPUT_TOKENS",
+  680
+);
+
 function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function clampText(value: string, maxChars: number) {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+}
 function safeHistory(value: unknown) {
   if (!Array.isArray(value)) return [] as Array<{ role: string; content: string }>;
-  return value
+  const history = value
     .map((item) => {
       if (!item || typeof item !== "object") return null;
       const raw = item as Record<string, unknown>;
       const role = cleanText(raw.role).toLowerCase();
-      const content = cleanText(raw.content);
+      const content = clampText(cleanText(raw.content), MAX_HISTORY_ITEM_CHARS);
       if (!content) return null;
       if (role !== "owner" && role !== "organization") return null;
       return { role, content };
     })
     .filter((item): item is { role: string; content: string } => Boolean(item))
     .slice(-12);
+
+  let totalChars = history.reduce((sum, entry) => sum + entry.content.length, 0);
+  while (history.length > 1 && totalChars > MAX_HISTORY_TOTAL_CHARS) {
+    const dropped = history.shift();
+    totalChars -= dropped?.content.length ?? 0;
+  }
+
+  return history;
 }
 
 function extractJsonObject(raw: string) {
@@ -381,9 +422,9 @@ export async function POST(request: NextRequest) {
     | null;
 
   const orgId = cleanText(body?.orgId);
-  const direction = cleanText(body?.direction);
+  const direction = clampText(cleanText(body?.direction), MAX_DIRECTION_CHARS);
   const history = safeHistory(body?.history);
-  const humanPlan = cleanText(body?.humanPlan);
+  const humanPlan = clampText(cleanText(body?.humanPlan), MAX_HUMAN_PLAN_CHARS);
   const provider = cleanText(body?.provider);
   const model = cleanText(body?.model);
 
@@ -467,11 +508,25 @@ export async function POST(request: NextRequest) {
     .join(", ");
 
   let companyContext = "";
+  let contextSelection: ReturnType<typeof selectCompanyContext>["trace"] | null = null;
   try {
     const companyData = await ensureCompanyDataFile(orgId);
-    companyContext = companyData.content.slice(0, 9000);
+    const selected = selectCompanyContext({
+      mode: "direction-plan",
+      companyDataText: companyData.content,
+      primaryText: [direction, humanPlan, ...history.map((entry) => entry.content)].join("\n"),
+      history,
+      maxSelectedChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
+      maxChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS
+    });
+    companyContext = selected.contextText;
+    contextSelection = selected.trace;
+    if (!companyContext) {
+      companyContext = companyData.content.slice(0, MAX_PROMPT_COMPANY_CONTEXT_CHARS);
+    }
   } catch {
     companyContext = "";
+    contextSelection = null;
   }
 
   const modelPrompt = [
@@ -494,7 +549,7 @@ export async function POST(request: NextRequest) {
       : "Available Personnel: unknown",
     "",
     companyContext
-      ? ["Company Data Context (authoritative):", companyContext.slice(0, 7000)].join("\n")
+      ? ["Company Data Context (selector-brain curated, authoritative excerpt):", companyContext].join("\n")
       : "Company Data Context: unavailable.",
     "",
     "Return STRICT JSON with this schema:",
@@ -588,11 +643,12 @@ export async function POST(request: NextRequest) {
       "Produce complete, auditable implementation plans with realistic dependency and approval mapping.",
       "Do not fabricate capabilities, tool availability, approvals, or execution outcomes.",
       companyContext
-        ? "Company Data Context is provided in the user prompt; do not claim company data is inaccessible."
+        ? "Company Data Context is selector-curated and provided in the user prompt; use it as authoritative scope."
         : "If Company Data Context is unavailable, mark assumptions explicitly.",
       "When required information is missing, mark explicit assumptions and risk notes."
     ].join("\n"),
-    userPromptOverride: modelPrompt
+    userPromptOverride: modelPrompt,
+    maxOutputTokens: DIRECTION_PLAN_MAX_OUTPUT_TOKENS
   });
 
   if (!execution.ok || !execution.outputText) {
@@ -808,7 +864,8 @@ export async function POST(request: NextRequest) {
         source: execution.apiSource ?? null
       },
       tokenUsage: execution.tokenUsage ?? null,
-      billing: execution.billing ?? null
+      billing: execution.billing ?? null,
+      contextSelection
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed generating plans.";

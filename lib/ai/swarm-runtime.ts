@@ -56,6 +56,7 @@ export interface AgentExecutionInput {
   };
   systemPromptOverride?: string;
   userPromptOverride?: string;
+  maxOutputTokens?: number;
 }
 
 export interface AgentExecutionResult {
@@ -99,6 +100,34 @@ interface AgentBilling {
   serviceFeeUsd: number;
   totalCostUsd: number;
 }
+
+const DEFAULT_MAX_OUTPUT_TOKENS = 900;
+const MIN_MAX_OUTPUT_TOKENS = 120;
+const MAX_MAX_OUTPUT_TOKENS = 4096;
+const DEFAULT_MAX_CONTEXT_BLOCKS = 10;
+const DEFAULT_MAX_CONTEXT_TOTAL_CHARS = 12_000;
+const DEFAULT_MAX_CONTEXT_BLOCK_CHARS = 1_800;
+
+function parsePositiveEnvInt(name: string, fallback: number) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+  return Math.floor(raw);
+}
+
+const MAX_CONTEXT_BLOCKS = parsePositiveEnvInt(
+  "AGENT_CONTEXT_MAX_BLOCKS",
+  DEFAULT_MAX_CONTEXT_BLOCKS
+);
+const MAX_CONTEXT_TOTAL_CHARS = parsePositiveEnvInt(
+  "AGENT_CONTEXT_MAX_TOTAL_CHARS",
+  DEFAULT_MAX_CONTEXT_TOTAL_CHARS
+);
+const MAX_CONTEXT_BLOCK_CHARS = parsePositiveEnvInt(
+  "AGENT_CONTEXT_MAX_BLOCK_CHARS",
+  DEFAULT_MAX_CONTEXT_BLOCK_CHARS
+);
 
 function normalizeProvider(value: string | undefined): ProviderKind {
   const normalized = (value ?? "").trim().toLowerCase();
@@ -155,6 +184,91 @@ function defaultServiceMarkup(plan: RuntimePlan) {
 
 function estimateTokensFromText(text: string) {
   return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function clampTextForPrompt(value: string, maxChars: number) {
+  const normalized = value.replace(/\r\n/g, "\n").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  const head = normalized.slice(0, Math.max(0, maxChars - 40)).trimEnd();
+  const omitted = Math.max(0, normalized.length - head.length);
+  return `${head}\n[TRUNCATED ${omitted} chars]`;
+}
+
+function sanitizeContextBlocks(blocks: AgentContextBlock[]) {
+  const normalized: AgentContextBlock[] = [];
+  const seenIds = new Set<string>();
+
+  for (const block of blocks) {
+    const id = block.id?.trim() || `context-${normalized.length + 1}`;
+    if (seenIds.has(id)) {
+      continue;
+    }
+    seenIds.add(id);
+
+    const content = clampTextForPrompt(block.content ?? "", MAX_CONTEXT_BLOCK_CHARS);
+    if (!content) {
+      continue;
+    }
+
+    normalized.push({
+      id,
+      name: block.name?.trim() || "Context",
+      amnesiaProtected: Boolean(block.amnesiaProtected),
+      content
+    });
+    if (normalized.length >= MAX_CONTEXT_BLOCKS) {
+      break;
+    }
+  }
+
+  const selected: AgentContextBlock[] = [];
+  let usedChars = 0;
+
+  for (const block of normalized) {
+    const remaining = MAX_CONTEXT_TOTAL_CHARS - usedChars;
+    if (remaining <= 0) {
+      break;
+    }
+    const nextContent =
+      block.content.length <= remaining
+        ? block.content
+        : clampTextForPrompt(block.content, Math.max(80, remaining));
+    if (!nextContent) {
+      break;
+    }
+    selected.push({
+      ...block,
+      content: nextContent
+    });
+    usedChars += nextContent.length;
+  }
+
+  const omittedBlocks = Math.max(0, blocks.length - selected.length);
+  if (omittedBlocks > 0) {
+    const note = `Additional context omitted for token budget: ${omittedBlocks} block(s).`;
+    if (usedChars + note.length <= MAX_CONTEXT_TOTAL_CHARS) {
+      selected.push({
+        id: "context-budget-note",
+        name: "Context Budget Note",
+        amnesiaProtected: false,
+        content: note
+      });
+    }
+  }
+
+  return selected;
+}
+
+function resolveMaxOutputTokens(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_MAX_OUTPUT_TOKENS;
+  }
+  return Math.max(
+    MIN_MAX_OUTPUT_TOKENS,
+    Math.min(MAX_MAX_OUTPUT_TOKENS, Math.floor(value))
+  );
 }
 
 function normalizeUsage(input: Partial<TokenUsage> | null | undefined, fallbackText = ""): TokenUsage {
@@ -429,7 +543,8 @@ async function callOpenAI(
   model: string,
   apiKey: string,
   system: string,
-  userPrompt: string
+  userPrompt: string,
+  maxOutputTokens: number
 ): Promise<ProviderResult> {
   const response = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -440,6 +555,7 @@ async function callOpenAI(
     body: JSON.stringify({
       model,
       temperature: 0.2,
+      max_tokens: maxOutputTokens,
       messages: [
         { role: "system", content: system },
         { role: "user", content: userPrompt }
@@ -490,7 +606,8 @@ async function callAnthropic(
   model: string,
   apiKey: string,
   system: string,
-  userPrompt: string
+  userPrompt: string,
+  maxOutputTokens: number
 ): Promise<ProviderResult> {
   const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -501,7 +618,7 @@ async function callAnthropic(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 900,
+      max_tokens: maxOutputTokens,
       temperature: 0.2,
       system,
       messages: [
@@ -555,7 +672,8 @@ async function callGemini(
   model: string,
   apiKey: string,
   system: string,
-  userPrompt: string
+  userPrompt: string,
+  maxOutputTokens: number
 ): Promise<ProviderResult> {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
@@ -578,7 +696,8 @@ async function callGemini(
         }
       ],
       generationConfig: {
-        temperature: 0.2
+        temperature: 0.2,
+        maxOutputTokens
       }
     })
   });
@@ -635,21 +754,22 @@ async function callGemini(
 async function invokeProvider(
   settings: BrainSettings,
   system: string,
-  userPrompt: string
+  userPrompt: string,
+  maxOutputTokens: number
 ): Promise<ProviderResult> {
   if (!settings.apiKey) {
     throw new Error("Agent API key is not configured.");
   }
 
   if (settings.provider === "anthropic") {
-    return callAnthropic(settings.model, settings.apiKey, system, userPrompt);
+    return callAnthropic(settings.model, settings.apiKey, system, userPrompt, maxOutputTokens);
   }
 
   if (settings.provider === "gemini") {
-    return callGemini(settings.model, settings.apiKey, system, userPrompt);
+    return callGemini(settings.model, settings.apiKey, system, userPrompt, maxOutputTokens);
   }
 
-  return callOpenAI(settings.model, settings.apiKey, system, userPrompt);
+  return callOpenAI(settings.model, settings.apiKey, system, userPrompt, maxOutputTokens);
 }
 
 function resolvePrimarySettings(input: AgentExecutionInput): BrainSettings {
@@ -748,6 +868,8 @@ function resolveEmergencyFallbackSettings(
 export async function executeSwarmAgent(input: AgentExecutionInput): Promise<AgentExecutionResult> {
   const startedAt = Date.now();
   const now = new Date();
+  const maxOutputTokens = resolveMaxOutputTokens(input.maxOutputTokens);
+  const contextBlocks = sanitizeContextBlocks(input.contextBlocks);
   const systemBase =
     typeof input.systemPromptOverride === "string" && input.systemPromptOverride.trim().length > 0
       ? input.systemPromptOverride.trim()
@@ -756,7 +878,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
   const userPrompt =
     typeof input.userPromptOverride === "string" && input.userPromptOverride.trim().length > 0
       ? input.userPromptOverride.trim()
-      : buildUserPrompt(input.prompt, input.contextBlocks);
+      : buildUserPrompt(input.prompt, contextBlocks);
   const primary = resolvePrimarySettings(input);
   const fallback = resolveFallbackSettings(input);
   const preferredProviderRaw =
@@ -768,7 +890,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     : null;
   const contextDigest = createHash("sha256")
     .update(
-      input.contextBlocks
+      contextBlocks
         .map((block) => `${block.id}|${block.name}|${block.amnesiaProtected}|${block.content}`)
         .join("||")
     )
@@ -801,7 +923,12 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     }
 
     try {
-      const providerResult = await invokeProvider(candidateFallback, system, userPrompt);
+      const providerResult = await invokeProvider(
+        candidateFallback,
+        system,
+        userPrompt,
+        maxOutputTokens
+      );
       const outputText = providerResult.text;
       const billing = computeBilling(
         candidateFallback.provider,
@@ -829,7 +956,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           fallbackUsed: true,
           fallbackSource: fallback ? "configured" : "emergency",
           fallbackReason: "primary_api_key_missing",
-          contextCount: input.contextBlocks.length,
+          contextCount: contextBlocks.length,
           contextDigest,
           tokenUsage: providerResult.usage,
           billing,
@@ -867,7 +994,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
   }
 
   try {
-    const providerResult = await invokeProvider(primary, system, userPrompt);
+    const providerResult = await invokeProvider(primary, system, userPrompt, maxOutputTokens);
     const outputText = providerResult.text;
     const billing = computeBilling(
       primary.provider,
@@ -893,7 +1020,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
         model: primary.model,
         apiSource: primary.apiSource,
         fallbackUsed: false,
-        contextCount: input.contextBlocks.length,
+        contextCount: contextBlocks.length,
         contextDigest,
         tokenUsage: providerResult.usage,
         billing,
@@ -924,7 +1051,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           model: primary.model,
           apiSource: primary.apiSource,
           fallbackUsed: false,
-          contextCount: input.contextBlocks.length,
+          contextCount: contextBlocks.length,
           contextDigest,
           error: primaryError instanceof Error ? primaryError.message : "Primary model call failed."
         }
@@ -932,7 +1059,12 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     }
 
     try {
-      const providerResult = await invokeProvider(candidateFallback, system, userPrompt);
+      const providerResult = await invokeProvider(
+        candidateFallback,
+        system,
+        userPrompt,
+        maxOutputTokens
+      );
       const outputText = providerResult.text;
       const billing = computeBilling(
         candidateFallback.provider,
@@ -961,7 +1093,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           fallbackSource: fallback ? "configured" : "emergency",
           primaryError:
             primaryError instanceof Error ? primaryError.message : "Primary model call failed.",
-          contextCount: input.contextBlocks.length,
+          contextCount: contextBlocks.length,
           contextDigest,
           tokenUsage: providerResult.usage,
           billing,
@@ -986,7 +1118,7 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
             primaryError instanceof Error ? primaryError.message : "Primary model call failed.",
           fallbackError:
             fallbackError instanceof Error ? fallbackError.message : "Fallback model call failed.",
-          contextCount: input.contextBlocks.length,
+          contextCount: contextBlocks.length,
           contextDigest,
           durationMs: Date.now() - startedAt
         }

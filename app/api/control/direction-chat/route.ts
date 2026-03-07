@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 
+import { selectCompanyContext } from "@/lib/ai/context-selector";
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
 import { prisma } from "@/lib/db/prisma";
@@ -25,10 +26,41 @@ interface DirectionIntentRouting {
   cadenceHint?: "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
 }
 
+const MAX_OWNER_MESSAGE_CHARS = 2000;
+const MAX_HISTORY_ITEM_CHARS = 1200;
+const MAX_HISTORY_TOTAL_CHARS = 7000;
+
+function positiveEnvInt(name: string, fallback: number) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+const MAX_PROMPT_COMPANY_CONTEXT_CHARS = positiveEnvInt(
+  "DIRECTION_CHAT_SELECTED_CONTEXT_MAX_CHARS",
+  2200
+);
+const MAX_CONTEXT_SELECTOR_CHUNK_CHARS = positiveEnvInt(
+  "DIRECTION_CONTEXT_SELECTOR_CHUNK_CHARS",
+  700
+);
+const DIRECTION_CHAT_MAX_OUTPUT_TOKENS = positiveEnvInt(
+  "DIRECTION_CHAT_MAX_OUTPUT_TOKENS",
+  420
+);
+
 function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function clampText(value: string, maxChars: number) {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+}
 function safeHistory(value: unknown): DirectionMessageInput[] {
   if (!Array.isArray(value)) return [];
   const history: DirectionMessageInput[] = [];
@@ -36,11 +68,19 @@ function safeHistory(value: unknown): DirectionMessageInput[] {
     if (!item || typeof item !== "object") continue;
     const raw = item as Record<string, unknown>;
     const role = raw.role === "owner" || raw.role === "organization" ? raw.role : null;
-    const content = cleanText(raw.content);
+    const content = clampText(cleanText(raw.content), MAX_HISTORY_ITEM_CHARS);
     if (!role || !content) continue;
     history.push({ role, content });
   }
-  return history.slice(-12);
+
+  const sliced = history.slice(-12);
+  let totalChars = sliced.reduce((sum, entry) => sum + entry.content.length, 0);
+  while (sliced.length > 1 && totalChars > MAX_HISTORY_TOTAL_CHARS) {
+    const dropped = sliced.shift();
+    totalChars -= dropped?.content.length ?? 0;
+  }
+
+  return sliced;
 }
 
 function extractDirectionCandidate(text: string) {
@@ -286,7 +326,7 @@ export async function POST(request: NextRequest) {
       | null;
 
     const orgId = cleanText(body?.orgId);
-    const message = cleanText(body?.message);
+    const message = clampText(cleanText(body?.message), MAX_OWNER_MESSAGE_CHARS);
     const provider = cleanText(body?.provider);
     const model = cleanText(body?.model);
     const history = safeHistory(body?.history);
@@ -374,11 +414,25 @@ export async function POST(request: NextRequest) {
       }));
 
     let companyContext = "";
+    let contextSelection: ReturnType<typeof selectCompanyContext>["trace"] | null = null;
     try {
       const companyData = await ensureCompanyDataFile(orgId);
-      companyContext = companyData.content.slice(0, 8000);
+      const selected = selectCompanyContext({
+        mode: "direction-chat",
+        companyDataText: companyData.content,
+        primaryText: [message, ...history.map((entry) => entry.content)].join("\n"),
+        history,
+        maxSelectedChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
+        maxChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS
+      });
+      companyContext = selected.contextText;
+      contextSelection = selected.trace;
+      if (!companyContext) {
+        companyContext = companyData.content.slice(0, MAX_PROMPT_COMPANY_CONTEXT_CHARS);
+      }
     } catch {
       companyContext = "";
+      contextSelection = null;
     }
 
     const preIntentRouting = inferIntentRouting({
@@ -393,7 +447,7 @@ export async function POST(request: NextRequest) {
       `Owner: ${message}`,
       "",
       companyContext
-        ? ["Company Data Context (authoritative):", companyContext.slice(0, 6000)].join("\n")
+        ? ["Company Data Context (selector-brain curated, authoritative excerpt):", companyContext].join("\n")
         : "Company Data Context: unavailable.",
       "",
       "Respond as the Main Agent representing the organization.",
@@ -449,14 +503,15 @@ export async function POST(request: NextRequest) {
         "Do not fabricate facts, metrics, IDs, links, or completion claims.",
         "Ground responses only in conversation + provided company context.",
         companyContext
-          ? "Company Data Context is provided in the user prompt; do not claim you cannot access company data."
+          ? "Company Data Context is selector-curated and provided in the user prompt; use it as authoritative scope."
           : "If Company Data Context is unavailable, ask for missing details instead of guessing.",
         "If information is missing, explicitly say what is unknown and ask for clarification.",
         preIntentRouting.route === "PLAN_REQUIRED"
           ? "End with a 'Direction:' section."
           : "Keep this as a normal conversational response unless planning/execution intent is explicit."
       ].join("\n"),
-      userPromptOverride: userPrompt
+      userPromptOverride: userPrompt,
+      maxOutputTokens: DIRECTION_CHAT_MAX_OUTPUT_TOKENS
     });
 
     if (!execution.ok || !execution.outputText) {
@@ -487,7 +542,8 @@ export async function POST(request: NextRequest) {
         source: execution.apiSource ?? null
       },
       tokenUsage: execution.tokenUsage ?? null,
-      billing: execution.billing ?? null
+      billing: execution.billing ?? null,
+      contextSelection
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Direction chat failed.";

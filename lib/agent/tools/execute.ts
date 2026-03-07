@@ -53,6 +53,13 @@ function asText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function truncate(value: string | null | undefined, maxChars: number) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return null;
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
 function isTransientFailure(status: number, message: string) {
   if (status >= 500 || status === 429) {
     return true;
@@ -168,12 +175,12 @@ async function summarizeEmailsWithLlm(input: {
 
   const runtime = await getOrgLlmRuntime(input.orgId);
   const agent = await resolveSummarizerAgent(input.orgId);
-  const compactEmails = input.emails.slice(0, 20).map((item) => ({
+  const compactEmails = input.emails.slice(0, 12).map((item) => ({
     id: item.id,
     from: item.from,
     subject: item.subject,
-    snippet: item.snippet,
-    bodyText: item.bodyText,
+    snippet: truncate(item.snippet, 220),
+    bodyText: truncate(item.bodyText, 280),
     receivedAt: item.receivedAt
   }));
 
@@ -200,7 +207,8 @@ async function summarizeEmailsWithLlm(input: {
       `User request: ${input.prompt}`,
       `Search query: ${input.query?.trim() || "none"}`,
       "Summarize key updates, urgent asks, and any follow-ups."
-    ].join("\n")
+    ].join("\n"),
+    maxOutputTokens: 320
   });
 
   if (execution.ok && execution.outputText?.trim()) {

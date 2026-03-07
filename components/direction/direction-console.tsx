@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Loader2, PlayCircle, RefreshCw, Search } from "lucide-react";
+import { Loader2, PlayCircle, PlusCircle, RefreshCw, Search } from "lucide-react";
 import type { Edge, Node } from "reactflow";
 
 import { AutopsyBlueprint } from "@/components/autopsy/autopsy-blueprint";
@@ -66,6 +66,7 @@ interface DirectionConsoleProps {
 }
 
 type HistoryFilter = "ALL" | DirectionStatus;
+type DirectionDetailTab = "overview" | "links" | "workflows" | "graph";
 
 function buildCircularGraph(autopsy: DirectionAutopsy | null) {
   if (!autopsy) {
@@ -199,6 +200,8 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
   const [statusDraft, setStatusDraft] = useState<DirectionStatus>("ACTIVE");
   const [linkTargetId, setLinkTargetId] = useState("");
   const [linkRelation, setLinkRelation] = useState<DirectionRelation>("RELATES_TO");
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [detailTab, setDetailTab] = useState<DirectionDetailTab>("overview");
 
   const selectedDirection = useMemo(
     () => directions.find((item) => item.id === selectedDirectionId) ?? null,
@@ -354,6 +357,12 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
   }, [loadDirectionDetail, selectedDirectionId]);
 
   useEffect(() => {
+    if (selectedDirectionId) {
+      setDetailTab("overview");
+    }
+  }, [selectedDirectionId]);
+
+  useEffect(() => {
     if (!selectedDirection) return;
     setTitleDraft(selectedDirection.title);
     setSummaryDraft(selectedDirection.summary);
@@ -394,6 +403,8 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         return;
       }
       setSelectedDirectionId(payload.direction.id);
+      setShowCreateForm(false);
+      setDetailTab("overview");
       await loadDirections(true);
       await loadDirectionDetail(payload.direction.id);
     },
@@ -500,67 +511,43 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
     <div className="mx-auto max-w-[1400px] space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Direction</h2>
-          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500">
-            Direction Console
-          </p>
+          <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Direction</h2>
+          <p className="text-xs text-slate-500">Strategy workspace</p>
         </div>
-        <button
-          onClick={() => void loadDirections(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200"
-        >
-          {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              setShowCreateForm(true);
+              setTitleDraft("");
+              setSummaryDraft("");
+              setDirectionDraft("");
+              setStatusDraft("ACTIVE");
+            }}
+            className="inline-flex items-center gap-2 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-xs font-semibold text-cyan-200 transition hover:bg-cyan-500/20"
+          >
+            <PlusCircle size={14} />
+            New Direction
+          </button>
+          <button
+            onClick={() => void loadDirections(true)}
+            className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
+          >
+            {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+            Refresh
+          </button>
+        </div>
       </div>
 
       <div className="grid gap-4 2xl:grid-cols-[360px_1fr]">
-        <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-          <form onSubmit={createDirection} className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
-            <input
-              value={titleDraft}
-              onChange={(event) => setTitleDraft(event.target.value)}
-              placeholder="Direction title"
-              className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              required
-            />
-            <textarea
-              value={summaryDraft}
-              onChange={(event) => setSummaryDraft(event.target.value)}
-              placeholder="Summary"
-              className="h-16 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-100 outline-none"
-            />
-            <textarea
-              value={directionDraft}
-              onChange={(event) => setDirectionDraft(event.target.value)}
-              placeholder="Direction body"
-              className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              required
-            />
-            <div className="grid grid-cols-[1fr_auto] gap-2">
-              <select
-                value={statusDraft}
-                onChange={(event) => setStatusDraft(event.target.value as DirectionStatus)}
-                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-100 outline-none"
-              >
-                <option value="ACTIVE">ACTIVE</option>
-                <option value="DRAFT">DRAFT</option>
-                <option value="ARCHIVED">ARCHIVED</option>
-              </select>
-              <button className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300">
-                Create
-              </button>
-            </div>
-          </form>
-
+        <div className={`vx-panel space-y-2 rounded-3xl p-4 ${themeStyle.border}`}>
           <div className="space-y-2 rounded-2xl border border-white/10 bg-black/20 p-2">
-            <p className="px-1 text-[10px] uppercase tracking-[0.16em] text-slate-500">Direction History</p>
+            <p className="px-1 text-xs font-medium text-slate-500">Direction history</p>
             <div className="grid grid-cols-2 gap-1 sm:grid-cols-4">
               {(["ALL", "ACTIVE", "DRAFT", "ARCHIVED"] as HistoryFilter[]).map((item) => (
                 <button
                   key={item}
                   onClick={() => setHistoryFilter(item)}
-                  className={`rounded-xl border px-2 py-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
+                  className={`rounded-xl border px-2 py-1.5 text-xs font-semibold transition ${
                     historyFilter === item
                       ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                       : "border-white/10 bg-black/25 text-slate-300 hover:bg-white/5"
@@ -599,14 +586,10 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
                       : "border-white/10 bg-black/25"
                   }`}
                 >
-                  <p className="line-clamp-1 text-xs font-semibold uppercase tracking-[0.14em] text-white">
-                    {item.title}
-                  </p>
+                  <p className="line-clamp-1 text-sm font-semibold text-white">{item.title}</p>
                   <p className="line-clamp-2 text-xs text-slate-400">{item.summary || item.direction}</p>
-                  <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                    {item.status} | {item.ownerEmail ?? "unassigned"}
-                  </p>
-                  <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                  <p className="text-xs text-slate-500">{item.status} | {item.ownerEmail ?? "unassigned"}</p>
+                  <p className="mt-1 text-xs text-slate-500">
                     Updated {new Date(item.updatedAt).toLocaleString()}
                     {item.lastExecutedAt
                       ? ` | Last run ${new Date(item.lastExecutedAt).toLocaleString()}`
@@ -626,25 +609,87 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   onClick={() => void saveDirection()}
-                  className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-200"
+                  className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
                 >
                   Save Direction
                 </button>
                 <button
                   onClick={() => void launchWorkflow()}
-                  className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300"
+                  className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-300"
                 >
                   <PlayCircle size={12} />
                   Launch Workflow
                 </button>
-                <span className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                <span className="text-xs text-slate-500">
                   Last run: {selectedDirection.lastExecutedAt ? new Date(selectedDirection.lastExecutedAt).toLocaleString() : "Never"}
                 </span>
               </div>
 
-              <div className="grid gap-3 2xl:grid-cols-[1fr_1fr]">
+              <div className="inline-flex max-w-full flex-wrap rounded-full border border-white/15 bg-black/45 p-1">
+                {([
+                  { id: "overview", label: "Overview" },
+                  { id: "links", label: "Links" },
+                  { id: "workflows", label: "Workflows" },
+                  { id: "graph", label: "Graph" }
+                ] as Array<{ id: DirectionDetailTab; label: string }>).map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setDetailTab(tab.id)}
+                    className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                      detailTab === tab.id
+                        ? "bg-gradient-to-r from-white to-slate-100 text-slate-950"
+                        : "text-slate-300 hover:bg-white/10"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+
+              {detailTab === "overview" ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-xs text-slate-500">Direction title</span>
+                    <input
+                      value={titleDraft}
+                      onChange={(event) => setTitleDraft(event.target.value)}
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs text-slate-500">Status</span>
+                    <select
+                      value={statusDraft}
+                      onChange={(event) => setStatusDraft(event.target.value as DirectionStatus)}
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    >
+                      <option value="ACTIVE">ACTIVE</option>
+                      <option value="DRAFT">DRAFT</option>
+                      <option value="ARCHIVED">ARCHIVED</option>
+                    </select>
+                  </label>
+                  <label className="space-y-1 lg:col-span-2">
+                    <span className="text-xs text-slate-500">Summary</span>
+                    <textarea
+                      value={summaryDraft}
+                      onChange={(event) => setSummaryDraft(event.target.value)}
+                      className="h-20 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1 lg:col-span-2">
+                    <span className="text-xs text-slate-500">Direction body</span>
+                    <textarea
+                      value={directionDraft}
+                      onChange={(event) => setDirectionDraft(event.target.value)}
+                      className="h-44 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              {detailTab === "links" ? (
                 <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
-                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Links</p>
+                  <p className="text-xs font-medium text-slate-500">Link this direction</p>
                   <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
                     <select
                       value={linkTargetId}
@@ -673,32 +718,38 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
                     <button
                       onClick={() => void createLink()}
                       disabled={!linkTargetId}
-                      className="rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-[10px] uppercase tracking-[0.14em] text-cyan-300 disabled:opacity-60"
+                      className="rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-300 disabled:opacity-60"
                     >
                       Link
                     </button>
                   </div>
-                  <div className="max-h-36 space-y-1 overflow-y-auto">
-                    {links.map((item) => (
-                      <p key={item.id} className="text-xs text-slate-300">
-                        {item.relation}: {item.fromDirectionId.slice(0, 8)}
-                        {" -> "}
-                        {item.toDirectionId.slice(0, 8)}
-                      </p>
-                    ))}
+                  <div className="max-h-52 space-y-1 overflow-y-auto">
+                    {links.length === 0 ? (
+                      <p className="text-xs text-slate-500">No links yet.</p>
+                    ) : (
+                      links.map((item) => (
+                        <p key={item.id} className="text-xs text-slate-300">
+                          {item.relation}: {item.fromDirectionId.slice(0, 8)}
+                          {" -> "}
+                          {item.toDirectionId.slice(0, 8)}
+                        </p>
+                      ))
+                    )}
                   </div>
                 </div>
+              ) : null}
 
+              {detailTab === "workflows" ? (
                 <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
-                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Workflows</p>
-                  <div className="max-h-36 space-y-2 overflow-y-auto">
+                  <p className="text-xs font-medium text-slate-500">Workflow history</p>
+                  <div className="max-h-64 space-y-2 overflow-y-auto">
                     {workflows.length === 0 ? (
                       <p className="text-xs text-slate-500">No workflows yet.</p>
                     ) : (
                       workflows.map((item) => (
                         <article key={item.id} className="rounded-xl border border-white/10 bg-black/30 p-2">
-                          <p className="line-clamp-2 text-xs text-slate-200">{item.prompt}</p>
-                          <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                          <p className="line-clamp-2 text-sm text-slate-200">{item.prompt}</p>
+                          <p className="text-xs text-slate-500">
                             {item.status} | {item.progress}% | Burn {item.predictedBurn}
                           </p>
                         </article>
@@ -706,19 +757,77 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
                     )}
                   </div>
                 </div>
-              </div>
+              ) : null}
 
-              <AutopsyBlueprint
-                title="Direction Autopsy"
-                subtitle="Circular Direction Relationship Blueprint"
-                nodes={graph.nodes}
-                edges={graph.edges}
-                className="h-[520px]"
-              />
+              {detailTab === "graph" ? (
+                <AutopsyBlueprint
+                  title="Direction Graph"
+                  subtitle="Relationships and generated workflows"
+                  nodes={graph.nodes}
+                  edges={graph.edges}
+                  className="h-[520px]"
+                />
+              ) : null}
             </>
           )}
         </div>
       </div>
+
+      {showCreateForm ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className={`vx-panel w-full max-w-2xl rounded-3xl p-4 ${themeStyle.border}`}>
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <p className="font-display text-2xl font-black">Create Direction</p>
+                <p className="text-xs text-slate-500">Set the strategy before launching execution.</p>
+              </div>
+              <button
+                onClick={() => setShowCreateForm(false)}
+                className="rounded-full border border-white/20 bg-white/5 px-3 py-1 text-xs text-slate-200"
+              >
+                Close
+              </button>
+            </div>
+
+            <form onSubmit={createDirection} className="space-y-2">
+              <input
+                value={titleDraft}
+                onChange={(event) => setTitleDraft(event.target.value)}
+                placeholder="Direction title"
+                className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                required
+              />
+              <textarea
+                value={summaryDraft}
+                onChange={(event) => setSummaryDraft(event.target.value)}
+                placeholder="Summary"
+                className="h-16 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+              />
+              <textarea
+                value={directionDraft}
+                onChange={(event) => setDirectionDraft(event.target.value)}
+                placeholder="Direction body"
+                className="h-28 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                required
+              />
+              <div className="grid grid-cols-[1fr_auto] gap-2">
+                <select
+                  value={statusDraft}
+                  onChange={(event) => setStatusDraft(event.target.value as DirectionStatus)}
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                >
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="DRAFT">DRAFT</option>
+                  <option value="ARCHIVED">ARCHIVED</option>
+                </select>
+                <button className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-300">
+                  Create
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

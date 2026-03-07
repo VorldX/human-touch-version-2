@@ -107,6 +107,7 @@ async function runJsonTask(input: {
   systemPrompt: string;
   userPrompt: string;
 }) {
+  const maxOutputTokens = input.taskKind === "planner" ? 240 : 420;
   const organizationRuntime = await getOrgLlmRuntime(input.orgId);
   const agent = await resolveLlmAgent(input.orgId);
   const execution = await executeSwarmAgent({
@@ -117,7 +118,8 @@ async function runJsonTask(input: {
     contextBlocks: [],
     organizationRuntime,
     systemPromptOverride: input.systemPrompt,
-    userPromptOverride: input.userPrompt
+    userPromptOverride: input.userPrompt,
+    maxOutputTokens
   });
 
   if (!execution.ok || !execution.outputText?.trim()) {

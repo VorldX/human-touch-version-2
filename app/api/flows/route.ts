@@ -97,10 +97,7 @@ function splitDirectionIntoTasks(direction: string, swarmDensity: number) {
   }
 
   if (unique.length === 1) {
-    return [
-      `Main Agent mission planning: ${unique[0]}`,
-      `Execution and validation stream: ${unique[0]}`
-    ];
+    return [unique[0]];
   }
 
   return unique;

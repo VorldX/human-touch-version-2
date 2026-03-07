@@ -81,14 +81,14 @@ export function OnboardingWizard({ mode, onComplete, onCancel }: OnboardingWizar
 
   const [primaryBrain, setPrimaryBrain] = useState({
     provider: "OpenAI",
-    model: "gpt-4o",
+    model: "gpt-4o-mini",
     apiKey: "",
     computeType: "Cloud" as (typeof COMPUTE_TYPES)[number]
   });
 
   const [fallbackBrain, setFallbackBrain] = useState({
-    provider: "Anthropic",
-    model: "claude-3-5-sonnet",
+    provider: "Gemini",
+    model: "gemini-2.5-flash",
     apiKey: "",
     computeType: "Container" as (typeof COMPUTE_TYPES)[number]
   });
@@ -724,7 +724,7 @@ function BrainCard({
           label="Model"
           value={brain.model}
           onChange={(value) => onChange({ ...brain, model: value })}
-          placeholder="gpt-4o / claude / gemini"
+          placeholder="gpt-4o-mini / gemini-2.5-flash"
           icon={Brain}
         />
         {showApiKey ? (

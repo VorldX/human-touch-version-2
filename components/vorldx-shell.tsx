@@ -1,13 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
   Bell,
   Bot,
   Building2,
+  Camera,
+  Check,
   ChevronDown,
+  ChevronRight,
   ClipboardList,
   Command,
   Database,
@@ -54,17 +57,36 @@ import { getRealtimeClient } from "@/lib/realtime/client";
 import type { AppTheme } from "@/lib/store/vorldx-store";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
+type NavGroupId = "operate" | "manage";
+
 const NAV_ITEMS = [
-  { id: "control", label: "Control Deck", icon: LayoutDashboard },
-  { id: "direction", label: "Direction", icon: Target },
-  { id: "plan", label: "Plan", icon: ClipboardList },
-  { id: "flow", label: "Work Flow", icon: Workflow },
-  { id: "hub", label: "Hub", icon: FolderOpen },
-  { id: "squad", label: "Squad", icon: Users },
-  { id: "memory", label: "Memory", icon: Database },
-  { id: "collab", label: "Collaboration", icon: Handshake },
-  { id: "settings", label: "Settings", icon: SettingsIcon }
+  {
+    id: "control",
+    label: "Control Deck",
+    helper: "Chat + approvals",
+    group: "operate",
+    icon: LayoutDashboard
+  },
+  {
+    id: "direction",
+    label: "Direction",
+    helper: "Strategy",
+    group: "operate",
+    icon: Target
+  },
+  { id: "plan", label: "Plan", helper: "Execution plan", group: "operate", icon: ClipboardList },
+  { id: "flow", label: "Workflow", helper: "Runtime", group: "operate", icon: Workflow },
+  { id: "hub", label: "Hub", helper: "Data + tools", group: "manage", icon: FolderOpen },
+  { id: "squad", label: "Squad", helper: "People + agents", group: "manage", icon: Users },
+  { id: "memory", label: "Memory", helper: "Audit", group: "manage", icon: Database },
+  { id: "collab", label: "Collaboration", helper: "Marketplace", group: "manage", icon: Handshake },
+  { id: "settings", label: "Settings", helper: "Policies", group: "manage", icon: SettingsIcon }
 ] as const;
+
+const NAV_GROUPS: Array<{ id: NavGroupId; label: string }> = [
+  { id: "operate", label: "Operate" },
+  { id: "manage", label: "Manage" }
+];
 
 const THEME_STYLES: Record<
   AppTheme,
@@ -705,6 +727,7 @@ export function VorldXShell() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
+  const [showUtilityMenu, setShowUtilityMenu] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [intent, setIntent] = useState("");
@@ -781,6 +804,7 @@ export function VorldXShell() {
   const [humanInputFile, setHumanInputFile] = useState<File | null>(null);
   const [humanInputOverridePrompt, setHumanInputOverridePrompt] = useState("");
   const [humanInputSubmitting, setHumanInputSubmitting] = useState(false);
+  const permissionRequestsFetchSeqRef = useRef(0);
   const [realtimeSessionId] = useState(
     () => `shell-${Math.random().toString(36).slice(2, 10)}`
   );
@@ -875,10 +899,14 @@ export function VorldXShell() {
   }, []);
 
   const loadPermissionRequests = useCallback(async () => {
+    const fetchSeq = ++permissionRequestsFetchSeqRef.current;
     const orgId = currentOrg?.id ?? orgs[0]?.id ?? "";
     if (!orgId) {
-      setPermissionRequests([]);
-      setCanReviewPermissionRequests(false);
+      if (fetchSeq === permissionRequestsFetchSeqRef.current) {
+        setPermissionRequests([]);
+        setCanReviewPermissionRequests(false);
+        setPermissionRequestsLoading(false);
+      }
       return;
     }
 
@@ -906,16 +934,24 @@ export function VorldXShell() {
         );
       }
 
+      if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
+        return;
+      }
       setPermissionRequests(payload?.requests ?? []);
       setCanReviewPermissionRequests(Boolean(payload?.canReview));
     } catch (error) {
+      if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
+        return;
+      }
       setControlMessage({
         tone: "error",
         text:
           error instanceof Error ? error.message : "Failed loading permission requests."
       });
     } finally {
-      setPermissionRequestsLoading(false);
+      if (fetchSeq === permissionRequestsFetchSeqRef.current) {
+        setPermissionRequestsLoading(false);
+      }
     }
   }, [currentOrg?.id, orgs]);
 
@@ -1156,6 +1192,7 @@ export function VorldXShell() {
   }, [router, searchParams]);
 
   useEffect(() => {
+    permissionRequestsFetchSeqRef.current += 1;
     setDirectionTurns([]);
     setDirectionPrompt("");
     setIntent("");
@@ -1165,6 +1202,8 @@ export function VorldXShell() {
     setControlMode("MINDSTORM");
     setControlConversationDetail("REASONING_MIN");
     setShowRequestCenter(false);
+    setPermissionRequestsLoading(false);
+    setPermissionRequestActionId(null);
     setMissionSchedules([]);
     setScheduleDraft({
       title: "",
@@ -1397,7 +1436,11 @@ export function VorldXShell() {
       };
     }
 
-    const tabs = NAV_ITEMS.filter((item) => item.label.toLowerCase().includes(q));
+    const tabs = NAV_ITEMS.filter(
+      (item) =>
+        item.label.toLowerCase().includes(q) ||
+        item.helper.toLowerCase().includes(q)
+    );
     const orgMatches = orgs.filter((item) => item.name.toLowerCase().includes(q));
     const actions = [
       {
@@ -3237,34 +3280,42 @@ export function VorldXShell() {
             </div>
             {!isSidebarCollapsed && (
               <div className="min-w-0">
-                <p className="truncate font-display text-lg font-black uppercase tracking-tight">
+                <p className="truncate font-display text-xl font-black tracking-tight">
                   {resolvedOrg?.name ?? "Workspace Explorer"}
                 </p>
-                <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                  Command OS
-                </p>
+                <p className="text-xs text-slate-500">Command OS</p>
               </div>
             )}
           </div>
 
-          <div className="vx-scrollbar flex-1 space-y-2 overflow-y-auto px-3 py-6">
-            {NAV_ITEMS.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => handleTabChange(item.id)}
-                className={`flex w-full items-center rounded-2xl px-4 py-3 text-left transition ${
-                  activeTab === item.id
-                    ? `vx-panel ${themeStyle.border}`
-                    : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
-                }`}
-              >
-                <item.icon size={20} className={activeTab === item.id ? themeStyle.accent : ""} />
-                {!isSidebarCollapsed && (
-                  <span className="ml-4 text-[11px] font-semibold uppercase tracking-[0.2em]">
-                    {item.label}
-                  </span>
-                )}
-              </button>
+          <div className="vx-scrollbar flex-1 space-y-4 overflow-y-auto px-3 py-6">
+            {NAV_GROUPS.map((group) => (
+              <div key={group.id} className="space-y-2">
+                {!isSidebarCollapsed ? (
+                  <p className="px-2 text-[11px] font-medium tracking-[0.08em] text-slate-500">
+                    {group.label}
+                  </p>
+                ) : null}
+                {NAV_ITEMS.filter((item) => item.group === group.id).map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => handleTabChange(item.id)}
+                    className={`flex w-full items-center rounded-2xl px-4 py-3 text-left transition ${
+                      activeTab === item.id
+                        ? `vx-panel ${themeStyle.border}`
+                        : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
+                    }`}
+                  >
+                    <item.icon size={20} className={activeTab === item.id ? themeStyle.accent : ""} />
+                    {!isSidebarCollapsed ? (
+                      <div className="ml-4 min-w-0">
+                        <p className="text-sm font-semibold text-slate-100">{item.label}</p>
+                        <p className="text-xs text-slate-500">{item.helper}</p>
+                      </div>
+                    ) : null}
+                  </button>
+                ))}
+              </div>
             ))}
           </div>
 
@@ -3272,12 +3323,12 @@ export function VorldXShell() {
             <div className="rounded-2xl border border-white/10 bg-black/35 p-2">
               {!isSidebarCollapsed ? (
                 <>
-                  <p className="px-2 text-[10px] uppercase tracking-[0.22em] text-slate-500">Account</p>
-                  <p className="truncate px-2 pt-1 text-xs text-slate-200">{user?.email ?? "session user"}</p>
+                  <p className="px-2 text-xs font-medium text-slate-500">Account</p>
+                  <p className="truncate px-2 pt-1 text-sm text-slate-200">{user?.email ?? "session user"}</p>
                   <div className="mt-2 grid grid-cols-2 gap-2">
                     <button
                       onClick={() => handleTabChange("settings")}
-                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-white/20 bg-white/5 px-2 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-200 transition hover:bg-white/10"
+                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-white/20 bg-white/5 px-2 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
                     >
                       <UserCog size={12} />
                       Settings
@@ -3285,9 +3336,13 @@ export function VorldXShell() {
                     <button
                       onClick={() => void handleSignOut()}
                       disabled={signOutInFlight}
-                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                     >
-                      {signOutInFlight ? <Loader2 size={12} className="animate-spin" /> : <LogOut size={12} />}
+                      {signOutInFlight ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : (
+                        <LogOut size={12} />
+                      )}
                       Logout
                     </button>
                   </div>
@@ -3297,7 +3352,7 @@ export function VorldXShell() {
                   <button
                     onClick={() => handleTabChange("settings")}
                     className="flex items-center justify-center rounded-xl border border-white/20 bg-white/5 p-2 text-slate-200 transition hover:bg-white/10"
-                    title="Account Settings"
+                    title="Account settings"
                   >
                     <UserCog size={16} />
                   </button>
@@ -3331,17 +3386,16 @@ export function VorldXShell() {
               onClick={() => {
                 setShowOrgSwitcher((prev) => !prev);
                 setShowRequestCenter(false);
+                setShowUtilityMenu(false);
               }}
             >
               <Shield size={20} className={themeStyle.accent} />
               <div>
-                <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-white">
-                  {resolvedOrg?.name ?? "No Organization"}
+                <p className="flex items-center gap-2 text-sm font-semibold text-white">
+                  {resolvedOrg?.name ?? "No organization"}
                   <ChevronDown size={14} className="text-slate-400 group-hover:text-white" />
                 </p>
-                <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                  {(resolvedOrg?.role ?? "Explore")} Context
-                </p>
+                <p className="text-xs text-slate-500">{resolvedOrg?.role ?? "Explore"} context</p>
               </div>
             </div>
 
@@ -3354,7 +3408,7 @@ export function VorldXShell() {
                   onFocus={() => setSearchOpen(true)}
                   onBlur={closeSearch}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="Omni-Search..."
+                  placeholder="Search screens, organizations, actions"
                   className="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-600"
                 />
               </div>
@@ -3370,9 +3424,12 @@ export function VorldXShell() {
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
-                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs uppercase tracking-[0.2em] text-slate-200 hover:bg-white/5"
+                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
                       >
-                        <span>{item.label}</span>
+                        <span>
+                          {item.label}
+                          <span className="ml-2 text-xs text-slate-500">{item.helper}</span>
+                        </span>
                         <ArrowUpRight size={14} />
                       </button>
                     ))}
@@ -3386,7 +3443,7 @@ export function VorldXShell() {
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
-                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs uppercase tracking-[0.2em] text-slate-200 hover:bg-white/5"
+                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
                       >
                         <span>{org.name}</span>
                         <Building2 size={14} />
@@ -3401,7 +3458,7 @@ export function VorldXShell() {
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
-                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs uppercase tracking-[0.2em] text-slate-200 hover:bg-white/5"
+                        className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
                       >
                         <span>{item.label}</span>
                         <ArrowUpRight size={14} />
@@ -3411,7 +3468,7 @@ export function VorldXShell() {
                     {searchResults.tabs.length === 0 &&
                       searchResults.orgMatches.length === 0 &&
                       searchResults.actions.length === 0 && (
-                        <p className="px-3 py-2 text-xs uppercase tracking-[0.2em] text-slate-500">
+                        <p className="px-3 py-2 text-xs text-slate-500">
                           No matches found
                         </p>
                       )}
@@ -3428,7 +3485,7 @@ export function VorldXShell() {
                     setSetupPanel("chooser");
                     void loadUserJoinRequests();
                   }}
-                  className="inline-flex items-center gap-2 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-300 transition hover:bg-cyan-500/20"
+                  className="inline-flex items-center gap-2 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-500/20"
                 >
                   <Building2 size={14} />
                   Setup
@@ -3440,14 +3497,15 @@ export function VorldXShell() {
                   onClick={() => {
                     setShowRequestCenter((prev) => !prev);
                     setShowOrgSwitcher(false);
+                    setShowUtilityMenu(false);
                     void loadPermissionRequests();
                   }}
-                  className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200 transition hover:bg-white/10"
+                  className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
                 >
                   <Bell size={14} />
                   <span className="hidden sm:inline">Requests</span>
                   {pendingPermissionRequestCount > 0 ? (
-                    <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold text-white">
+                    <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[11px] font-bold text-white">
                       {pendingPermissionRequestCount}
                     </span>
                   ) : null}
@@ -3455,37 +3513,16 @@ export function VorldXShell() {
               ) : null}
 
               <button
-                onClick={toggleGhostMode}
-                className={`flex items-center gap-2 rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${
-                  isGhostModeActive
-                    ? "border-red-500/40 bg-red-900/30 text-red-300 animate-pulse-soft"
-                    : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
-                }`}
+                onClick={() => {
+                  setShowUtilityMenu((prev) => !prev);
+                  setShowRequestCenter(false);
+                  setShowOrgSwitcher(false);
+                }}
+                className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
               >
-                {isGhostModeActive ? <Ghost size={14} /> : <UserCheck size={14} />}
-                <span className="hidden sm:inline">
-                  {isGhostModeActive ? "Ghost Protocol Active" : "Ghost Protocol"}
-                </span>
+                <Activity size={14} />
+                <span className="hidden sm:inline">Utilities</span>
               </button>
-
-              <div className="hidden items-center gap-2 md:flex">
-                {activeUsers.slice(0, 4).map((user) => (
-                  <div key={user.id} className="relative">
-                    <div
-                      title={user.name}
-                      className={`flex h-9 w-9 items-center justify-center rounded-full border border-white/20 text-[11px] font-bold text-white ${user.color}`}
-                    >
-                      {initials(user.name)}
-                    </div>
-                    <span className="absolute -bottom-0.5 -right-0.5 inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/50" />
-                    </span>
-                  </div>
-                ))}
-                <span className="ml-1 text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                  {activeUsers.length} online
-                </span>
-              </div>
 
               <button
                 onClick={() => setIsMobileNavOpen((prev) => !prev)}
@@ -3496,12 +3533,62 @@ export function VorldXShell() {
               </button>
             </div>
 
+            {showUtilityMenu ? (
+              <div className="absolute right-4 top-24 z-50 w-[320px] rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10 md:top-20">
+                <div className="mb-2 flex items-center justify-between px-2 py-1">
+                  <p className="text-xs font-medium text-slate-500">Utilities</p>
+                  <button
+                    onClick={() => setShowUtilityMenu(false)}
+                    className="rounded-md p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => {
+                    toggleGhostMode();
+                    setShowUtilityMenu(false);
+                  }}
+                  className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left text-sm transition ${
+                    isGhostModeActive
+                      ? "border-red-500/35 bg-red-500/10 text-red-200"
+                      : "border-emerald-500/35 bg-emerald-500/10 text-emerald-200"
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-2">
+                    {isGhostModeActive ? <Ghost size={14} /> : <UserCheck size={14} />}
+                    Ghost protocol
+                  </span>
+                  <span className="text-xs">{isGhostModeActive ? "On" : "Off"}</span>
+                </button>
+
+                <div className="mt-3 rounded-2xl border border-white/10 bg-black/25 p-3">
+                  <p className="text-xs font-medium text-slate-500">Active collaborators</p>
+                  <div className="mt-2 flex items-center gap-2">
+                    {activeUsers.slice(0, 4).map((user) => (
+                      <div key={user.id} className="relative">
+                        <div
+                          title={user.name}
+                          className={`flex h-8 w-8 items-center justify-center rounded-full border border-white/20 text-[11px] font-bold text-white ${user.color}`}
+                        >
+                          {initials(user.name)}
+                        </div>
+                        <span className="absolute -bottom-0.5 -right-0.5 inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/50" />
+                        </span>
+                      </div>
+                    ))}
+                    <span className="ml-1 text-xs text-slate-400">{activeUsers.length} online</span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             {showOrgSwitcher && (
               <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-10 md:right-auto md:top-20 md:w-72">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
-                  <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                    Organizations
-                  </p>
+                  <p className="text-xs font-medium text-slate-500">Organizations</p>
                   <button
                     onClick={() => setShowOrgSwitcher(false)}
                     className="rounded-md p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
@@ -3527,12 +3614,8 @@ export function VorldXShell() {
                     >
                       <Building2 size={16} className="text-slate-500" />
                       <div className="min-w-0">
-                        <p className="truncate text-xs font-semibold uppercase tracking-[0.18em] text-white">
-                          {org.name}
-                        </p>
-                        <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500">
-                          {org.role}
-                        </p>
+                        <p className="truncate text-sm font-semibold text-white">{org.name}</p>
+                        <p className="text-xs text-slate-500">{org.role}</p>
                       </div>
                     </button>
                   ))}
@@ -3543,9 +3626,7 @@ export function VorldXShell() {
                   className="mt-2 flex w-full items-center gap-3 rounded-xl border-t border-white/10 px-3 py-3 text-left text-emerald-400 transition hover:bg-white/5"
                 >
                   <PlusCircle size={16} />
-                  <span className="text-xs font-semibold uppercase tracking-[0.18em]">
-                    Add Organization
-                  </span>
+                  <span className="text-sm font-semibold">Add organization</span>
                 </button>
               </div>
             )}
@@ -3554,12 +3635,8 @@ export function VorldXShell() {
               <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-auto md:right-10 md:top-20 md:w-[420px]">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <div>
-                    <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
-                      Request Center
-                    </p>
-                    <p className="text-[10px] uppercase tracking-[0.18em] text-slate-600">
-                      Pending {pendingPermissionRequestCount}
-                    </p>
+                    <p className="text-xs font-medium text-slate-500">Request center</p>
+                    <p className="text-xs text-slate-600">Pending {pendingPermissionRequestCount}</p>
                   </div>
                   <button
                     onClick={() => setShowRequestCenter(false)}
@@ -3587,29 +3664,25 @@ export function VorldXShell() {
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
-                            <p className="truncate text-xs font-semibold uppercase tracking-[0.14em] text-white">
-                              {item.area}
-                            </p>
-                            <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                              {item.status} | Target {item.targetRole}
-                            </p>
+                            <p className="truncate text-sm font-semibold text-white">{item.area}</p>
+                            <p className="text-xs text-slate-500">{item.status} | Target {item.targetRole}</p>
                           </div>
                           {item.status === "PENDING" ? (
-                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-amber-300">
+                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
                               Pending
                             </span>
                           ) : (
-                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-emerald-300">
+                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
                               {item.status}
                             </span>
                           )}
                         </div>
                         <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
-                        <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                        <p className="mt-1 text-xs text-slate-500">
                           Workflow: {item.workflowTitle || "N/A"} | Task:{" "}
                           {item.taskTitle || "N/A"}
                         </p>
-                        <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                        <p className="mt-1 text-xs text-slate-500">
                           Requested by {item.requestedByEmail}
                         </p>
 
@@ -3620,7 +3693,7 @@ export function VorldXShell() {
                                 void handlePermissionRequestDecision(item.id, "APPROVE")
                               }
                               disabled={permissionRequestActionId === item.id}
-                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                             >
                               {permissionRequestActionId === item.id
                                 ? "Working..."
@@ -3631,7 +3704,7 @@ export function VorldXShell() {
                                 void handlePermissionRequestDecision(item.id, "REJECT")
                               }
                               disabled={permissionRequestActionId === item.id}
-                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                             >
                               Reject
                             </button>
@@ -4414,6 +4487,11 @@ function ControlDeckSurface({
 }) {
   const [composer, setComposer] = useState("");
   const [sending, setSending] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showActionQueue, setShowActionQueue] = useState(true);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const hasConversation = turns.length > 0;
   const hasDirectionDraft = directionGiven.trim().length > 0;
   const isBusy =
@@ -4431,14 +4509,49 @@ function ControlDeckSurface({
     Boolean(pendingToolkitApproval) ||
     Boolean(pendingEmailApproval) ||
     agentRunResult?.status === "needs_input";
+  const actionQueueCount = Number(Boolean(planningResult?.analysis)) +
+    Number(Boolean(pendingPlanLaunchApproval)) +
+    Number(Boolean(pendingToolkitApproval)) +
+    Number(Boolean(pendingEmailApproval)) +
+    Number(agentRunResult?.status === "needs_input");
   const placeholder =
     mode === "MINDSTORM"
       ? "Ask anything about ideas, planning, or execution..."
       : "Give the direction the organization should shift toward...";
   const heroTitle =
     mode === "MINDSTORM"
-      ? "What's on your mind today?"
-      : "Where should organization move next?";
+      ? "What should we work on next?"
+      : "Where should the organization move next?";
+
+  useEffect(() => {
+    if (!showAttachMenu) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!attachMenuRef.current?.contains(event.target as Node)) {
+        setShowAttachMenu(false);
+      }
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowAttachMenu(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [showAttachMenu]);
+
+  const handleOpenToolsMenuAction = useCallback(() => {
+    setShowAttachMenu(false);
+    onOpenTools();
+  }, [onOpenTools]);
 
   const handleSend = useCallback(async () => {
     const text = composer.trim();
@@ -4462,15 +4575,107 @@ function ControlDeckSurface({
   }, [composer, engaged, isBusy, mode, onDirectionGivenChange, onEngageWithMode, onSendMessage]);
 
   const composerBar = (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-1.5 backdrop-blur-xl sm:rounded-[30px] sm:p-2">
-      <div className="flex items-end gap-1.5 sm:gap-2">
-        <button
-          type="button"
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 sm:h-9 sm:w-9"
-          title="Tools"
-        >
-          <PlusCircle size={16} />
-        </button>
+    <div className="relative overflow-visible rounded-[24px] border border-white/15 bg-[#02060d]/90 p-1.5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl sm:rounded-[30px] sm:p-2">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_10%_15%,rgba(56,189,248,0.2),transparent_38%),radial-gradient(circle_at_88%_86%,rgba(16,185,129,0.16),transparent_34%)]" />
+      <div className="relative flex items-end gap-1.5 sm:gap-2">
+        <div ref={attachMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setShowAttachMenu((prev) => !prev)}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-slate-300 transition hover:border-white/20 hover:bg-white/10 hover:text-white sm:h-9 sm:w-9"
+            title="Attach or connect"
+            aria-expanded={showAttachMenu}
+            aria-haspopup="menu"
+          >
+            <PlusCircle size={16} />
+          </button>
+
+          {showAttachMenu ? (
+            <div
+              role="menu"
+              aria-label="Attach menu"
+              className="absolute bottom-[calc(100%+0.6rem)] left-0 z-30 w-[min(16.5rem,calc(100vw-2rem))] rounded-2xl border border-white/15 bg-[#191a1d]/96 p-2 shadow-[0_26px_60px_rgba(0,0,0,0.58)] backdrop-blur-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleOpenToolsMenuAction}
+                className="flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <Paperclip size={16} className="text-slate-300" />
+                  Add files or photos
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleOpenToolsMenuAction}
+                className="mt-0.5 flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <Camera size={16} className="text-slate-300" />
+                  Take a screenshot
+                </span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleOpenToolsMenuAction}
+                className="mt-0.5 flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <FolderOpen size={16} className="text-slate-300" />
+                  Add to project
+                </span>
+                <ChevronRight size={15} className="text-slate-500" />
+              </button>
+
+              <div className="my-2 h-px bg-white/10" />
+
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={webSearchEnabled}
+                onClick={() => setWebSearchEnabled((prev) => !prev)}
+                className="flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-blue-300 transition hover:bg-white/10"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <Search size={16} className="text-blue-300" />
+                  Web search
+                </span>
+                {webSearchEnabled ? <Check size={15} className="text-blue-300" /> : null}
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => setShowAttachMenu(false)}
+                className="mt-0.5 flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-slate-100 transition hover:bg-white/10"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <Command size={16} className="text-slate-300" />
+                  Use style
+                </span>
+                <ChevronRight size={15} className="text-slate-500" />
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleOpenToolsMenuAction}
+                className="mt-1.5 flex w-full items-center justify-between rounded-xl border border-white/10 bg-black/35 px-2.5 py-2 text-left text-sm font-semibold text-slate-100 transition hover:bg-black/45"
+              >
+                <span className="inline-flex items-center gap-2.5">
+                  <LayoutGrid size={16} className="text-slate-300" />
+                  Add connectors
+                </span>
+              </button>
+            </div>
+          ) : null}
+        </div>
 
         <textarea
           value={composer}
@@ -4482,13 +4687,13 @@ function ControlDeckSurface({
               void handleSend();
             }
           }}
-          className="h-10 min-w-0 flex-1 resize-none bg-transparent px-1.5 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 sm:px-2 sm:text-base"
+          className="min-h-10 max-h-36 min-w-0 flex-1 resize-none bg-transparent px-1.5 py-2 text-sm leading-6 text-slate-100 outline-none placeholder:text-slate-500 sm:px-2 sm:text-base"
         />
 
         <button
           onClick={onVoiceIntent}
           disabled={isRecordingIntent || mode !== "MINDSTORM"}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-white/10 hover:text-slate-200 disabled:opacity-50 sm:h-9 sm:w-9"
+          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.03] text-slate-300 transition hover:border-white/20 hover:bg-white/10 hover:text-white disabled:opacity-50 sm:h-9 sm:w-9"
           title={isRecordingIntent ? "Listening..." : "Voice Input"}
         >
           {isRecordingIntent ? <MicOff size={16} /> : <Mic size={16} />}
@@ -4497,7 +4702,7 @@ function ControlDeckSurface({
         <button
           onClick={() => void handleSend()}
           disabled={isBusy || !composer.trim()}
-          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white text-black transition hover:bg-slate-200 disabled:opacity-60 sm:h-10 sm:w-10"
+          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-400/45 bg-gradient-to-br from-cyan-300 to-emerald-300 text-slate-950 shadow-[0_10px_24px_rgba(34,211,238,0.35)] transition hover:brightness-105 disabled:opacity-60 sm:h-10 sm:w-10"
           title={mode === "MINDSTORM" ? "Send Message" : "Generate Plan"}
         >
           {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUpRight size={16} />}
@@ -4507,27 +4712,30 @@ function ControlDeckSurface({
   );
 
   return (
-    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-2 sm:gap-3">
-      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-3">
-        <p className="text-sm text-slate-300">Talk to your organization</p>
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-3 sm:gap-4">
+      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <p className="text-xs text-slate-500">Control interface</p>
+          <p className="text-sm font-medium text-slate-200 sm:text-base">Talk to your organization</p>
+        </div>
 
         <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
-          <div className="inline-flex w-full max-w-full flex-wrap rounded-full border border-white/10 bg-black/25 p-1 sm:w-auto">
+          <div className="inline-flex w-full max-w-full flex-wrap rounded-full border border-white/15 bg-black/45 p-1 shadow-[0_10px_30px_rgba(0,0,0,0.35)] sm:w-auto">
             <button
               onClick={() => onModeChange("MINDSTORM")}
-              className={`flex-1 rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition sm:flex-none sm:px-5 sm:text-[11px] sm:tracking-[0.16em] ${
+              className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold transition sm:flex-none sm:px-5 ${
                 mode === "MINDSTORM"
-                  ? "bg-white text-black"
+                  ? "bg-gradient-to-r from-cyan-200 to-white text-slate-950 shadow-[0_8px_18px_rgba(148,163,184,0.35)]"
                   : "text-slate-300 hover:bg-white/10"
               }`}
             >
-              Mindstorming
+              Brainstorm
             </button>
             <button
               onClick={() => onModeChange("DIRECTION")}
-              className={`flex-1 rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition sm:flex-none sm:px-5 sm:text-[11px] sm:tracking-[0.16em] ${
+              className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold transition sm:flex-none sm:px-5 ${
                 mode === "DIRECTION"
-                  ? "bg-white text-black"
+                  ? "bg-gradient-to-r from-cyan-200 to-white text-slate-950 shadow-[0_8px_18px_rgba(148,163,184,0.35)]"
                   : "text-slate-300 hover:bg-white/10"
               }`}
             >
@@ -4535,88 +4743,141 @@ function ControlDeckSurface({
             </button>
           </div>
 
-          <select
-            value={directionModelId}
-            onChange={(event) =>
-              onDirectionModelChange(event.target.value as (typeof DIRECTION_MODELS)[number]["id"])
-            }
-            className="w-full rounded-full border border-white/10 bg-black/35 px-4 py-2 text-sm text-slate-100 outline-none sm:min-w-[210px] sm:w-auto"
-          >
-            {directionModels.map((option) => (
-              <option key={option.id} value={option.id}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-
           <button
             type="button"
             onClick={onOpenTools}
-            className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.14em] text-cyan-200 transition hover:bg-cyan-500/20"
+            className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-400/35 bg-gradient-to-r from-cyan-500/15 to-emerald-500/15 px-4 py-2 text-xs font-semibold text-cyan-100 transition hover:border-cyan-300/50 hover:from-cyan-500/25 hover:to-emerald-500/25"
           >
             <Link2 size={14} />
             Connect Tools
           </button>
+
+          <button
+            type="button"
+            onClick={() => setShowActionQueue((prev) => !prev)}
+            className={`inline-flex items-center justify-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+              showActionQueue
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            Action Queue {hasActionCards ? `(${actionQueueCount})` : "(0)"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((prev) => !prev)}
+            className={`inline-flex items-center justify-center rounded-full border px-4 py-2 text-xs font-semibold transition ${
+              showAdvanced
+                ? "border-cyan-400/40 bg-cyan-500/12 text-cyan-200"
+                : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            Advanced
+          </button>
         </div>
       </div>
 
-      <div className={`vx-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] p-3 sm:rounded-[28px] sm:p-4 ${themeStyle.border}`}>
+      {showAdvanced ? (
+        <div className={`vx-panel grid gap-3 rounded-2xl p-3 sm:grid-cols-[minmax(0,280px)_1fr] ${themeStyle.border}`}>
+          <label className="space-y-1">
+            <span className="text-xs text-slate-500">Model</span>
+            <div className="relative">
+              <select
+                value={directionModelId}
+                onChange={(event) =>
+                  onDirectionModelChange(event.target.value as (typeof DIRECTION_MODELS)[number]["id"])
+                }
+                className="w-full appearance-none rounded-xl border border-white/15 bg-black/50 px-3 py-2 pr-9 text-sm text-slate-100 outline-none transition hover:border-white/25"
+              >
+                {directionModels.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown
+                size={14}
+                className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-500"
+              />
+            </div>
+          </label>
+
+          <div className="space-y-1">
+            <span className="text-xs text-slate-500">Response style</span>
+            <div className="inline-flex max-w-full flex-wrap rounded-full border border-white/15 bg-black/45 p-1">
+              <button
+                onClick={() => onConversationDetailChange("REASONING_MIN")}
+                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                  conversationDetail === "REASONING_MIN"
+                    ? "bg-gradient-to-r from-white to-slate-100 text-slate-950"
+                    : "text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                Short replies
+              </button>
+              <button
+                onClick={() => onConversationDetailChange("DIRECTION_GIVEN")}
+                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                  conversationDetail === "DIRECTION_GIVEN"
+                    ? "bg-gradient-to-r from-white to-slate-100 text-slate-950"
+                    : "text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                Show direction
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div
+        className={`vx-panel relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#030a12]/90 p-3 shadow-[0_28px_70px_rgba(0,0,0,0.5)] sm:rounded-[30px] sm:p-4 ${themeStyle.border}`}
+      >
+        <div className="pointer-events-none absolute -left-20 top-0 h-52 w-52 rounded-full bg-cyan-500/10 blur-3xl" />
+        <div className="pointer-events-none absolute -right-16 bottom-0 h-52 w-52 rounded-full bg-emerald-500/10 blur-3xl" />
         {showLanding ? (
-          <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-3">
-            <h2 className="text-center text-3xl font-medium text-slate-100 md:text-5xl">
+          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-3">
+            <h2 className="text-center font-display text-3xl font-black tracking-[0.01em] text-slate-100 md:text-5xl">
               {heroTitle}
             </h2>
 
             {planningResult?.analysis ? (
-              <div className="mt-4 w-full max-w-4xl rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm text-blue-200">
-                {planningResult.analysis}
+              <div className="mt-4 w-full max-w-4xl rounded-2xl border border-cyan-500/25 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100">
+                <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                  {planningResult.analysis}
+                </p>
               </div>
             ) : null}
 
             <div className="mt-8 w-full max-w-4xl">{composerBar}</div>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <div className="inline-flex max-w-full flex-wrap rounded-full border border-white/10 bg-black/25 p-1">
-              <button
-                onClick={() => onConversationDetailChange("REASONING_MIN")}
-                className={`rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
-                  conversationDetail === "REASONING_MIN"
-                    ? "bg-white text-black"
-                    : "text-slate-300 hover:bg-white/10"
-                }`}
-              >
-                Reasoning Minimized
-              </button>
-              <button
-                onClick={() => onConversationDetailChange("DIRECTION_GIVEN")}
-                className={`rounded-full px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.14em] transition ${
-                  conversationDetail === "DIRECTION_GIVEN"
-                    ? "bg-white text-black"
-                    : "text-slate-300 hover:bg-white/10"
-                }`}
-              >
-                Direction Given
-              </button>
-            </div>
-
+          <div className="relative flex min-h-0 flex-1 flex-col gap-3">
             {conversationDetail === "DIRECTION_GIVEN" && hasDirectionDraft ? (
-              <div className="rounded-xl border border-white/10 bg-black/30 p-3">
-                <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                  Final Direction
-                </p>
+              <div className="rounded-2xl border border-cyan-500/25 bg-gradient-to-b from-cyan-500/10 via-cyan-500/5 to-transparent p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-cyan-200/85">Direction draft</p>
+                  <span className="text-xs text-cyan-100/65">
+                    {directionGiven.trim().length} chars
+                  </span>
+                </div>
                 <textarea
                   value={directionGiven}
                   onChange={(event) => onDirectionGivenChange(event.target.value)}
-                  className="mt-2 h-16 w-full resize-none rounded-lg border border-white/10 bg-black/35 px-3 py-2 text-sm text-slate-100 outline-none"
+                  className="mt-2 h-20 w-full resize-none rounded-xl border border-white/15 bg-black/45 px-3 py-2 text-sm leading-6 text-slate-100 outline-none"
                 />
               </div>
             ) : null}
 
-            {hasActionCards ? (
-              <div className="vx-scrollbar max-h-[28vh] space-y-2.5 overflow-y-auto pr-0 sm:pr-1">
+            {hasActionCards && showActionQueue ? (
+              <div className="vx-scrollbar max-h-[38vh] space-y-3 overflow-y-auto pr-0 sm:pr-1">
+                <div className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">
+                  <p className="text-xs font-semibold text-slate-200">Action Queue</p>
+                  <p className="text-xs text-slate-500">Review approvals and missing inputs.</p>
+                </div>
                 {planningResult?.analysis ? (
-                  <div className="max-h-40 overflow-y-auto rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm leading-6 text-blue-100">
+                  <div className="max-h-40 overflow-y-auto rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-cyan-500/15 via-cyan-500/8 to-transparent px-3 py-2 text-sm leading-6 text-cyan-100">
                     <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                       {planningResult.analysis}
                     </p>
@@ -4624,26 +4885,22 @@ function ControlDeckSurface({
                 ) : null}
 
                 {pendingPlanLaunchApproval ? (
-                  <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/10 p-3">
-                    <p className="text-[10px] uppercase tracking-[0.14em] text-cyan-300">
-                      Plan Approval Required
-                    </p>
+                  <div className="rounded-2xl border border-cyan-500/35 bg-gradient-to-b from-cyan-500/14 to-cyan-500/6 p-3">
+                    <p className="text-xs font-semibold text-cyan-300">Plan launch approval</p>
                     <p className="mt-2 text-sm text-cyan-100">
                       Review completed plan before workflow launch.
                     </p>
-                    <p className="mt-1 text-xs text-cyan-100/90">
+                    <p className="mt-1 whitespace-pre-wrap text-xs text-cyan-100/90 [overflow-wrap:anywhere]">
                       {pendingPlanLaunchApproval.reason}
                     </p>
                     {pendingPlanLaunchApproval.toolkits.length > 0 ? (
-                      <div className="mt-2 rounded-lg border border-cyan-500/25 bg-black/25 p-2">
-                        <p className="text-[10px] uppercase tracking-[0.12em] text-cyan-300">
-                          Required Tools
-                        </p>
+                      <div className="mt-2 rounded-xl border border-cyan-500/25 bg-black/30 p-2">
+                        <p className="text-xs text-cyan-300">Required tools</p>
                         <div className="mt-1 flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
                           {pendingPlanLaunchApproval.toolkits.map((toolkit, index) => (
                             <span
                               key={`${toolkit}-${index}`}
-                              className="rounded-full border border-cyan-500/35 bg-cyan-500/15 px-2 py-0.5 text-[11px] leading-5 text-cyan-100"
+                              className="inline-flex max-w-full break-all rounded-full border border-cyan-500/35 bg-cyan-500/15 px-2 py-0.5 text-[11px] leading-5 text-cyan-100"
                             >
                               {toolkit}
                             </span>
@@ -4656,7 +4913,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onApprovePlanLaunch}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve Launch
                       </button>
@@ -4664,7 +4921,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onRejectPlanLaunch}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
                       </button>
@@ -4673,19 +4930,15 @@ function ControlDeckSurface({
                 ) : null}
 
                 {pendingToolkitApproval ? (
-                  <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
-                    <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
-                      Tool Access Approval
-                    </p>
-                    <div className="mt-2 rounded-lg border border-amber-500/25 bg-black/25 p-2">
-                      <p className="text-[10px] uppercase tracking-[0.12em] text-amber-300">
-                        Required Tools
-                      </p>
+                  <div className="rounded-2xl border border-amber-500/35 bg-gradient-to-b from-amber-500/14 to-amber-500/6 p-3">
+                    <p className="text-xs font-semibold text-amber-300">Tool access approval</p>
+                    <div className="mt-2 rounded-xl border border-amber-500/25 bg-black/30 p-2">
+                      <p className="text-xs text-amber-300">Required tools</p>
                       <div className="mt-1 flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
                         {pendingToolkitApproval.toolkits.map((toolkit, index) => (
                           <span
                             key={`${toolkit}-${index}`}
-                            className="rounded-full border border-amber-500/35 bg-amber-500/15 px-2 py-0.5 text-[11px] leading-5 text-amber-100"
+                            className="inline-flex max-w-full break-all rounded-full border border-amber-500/35 bg-amber-500/15 px-2 py-0.5 text-[11px] leading-5 text-amber-100"
                           >
                             {toolkit}
                           </span>
@@ -4700,7 +4953,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onApproveToolkitAccess}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve
                       </button>
@@ -4708,7 +4961,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onRejectToolkitAccess}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
                       </button>
@@ -4717,10 +4970,8 @@ function ControlDeckSurface({
                 ) : null}
 
                 {pendingEmailApproval ? (
-                  <div className="rounded-xl border border-white/15 bg-white/[0.03] p-3">
-                    <p className="text-[10px] uppercase tracking-[0.14em] text-slate-300">
-                      Draft Approval Required
-                    </p>
+                  <div className="rounded-2xl border border-white/15 bg-white/[0.04] p-3">
+                    <p className="text-xs font-semibold text-slate-300">Email draft approval</p>
                     <p className="mt-2 whitespace-pre-wrap break-words text-xs text-slate-100">
                       To: {pendingEmailApproval.draft.to}
                     </p>
@@ -4740,7 +4991,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onApproveEmailDraft}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve
                       </button>
@@ -4748,7 +4999,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onRejectEmailDraft}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
                       </button>
@@ -4757,11 +5008,9 @@ function ControlDeckSurface({
                 ) : null}
 
                 {agentRunResult?.status === "needs_input" ? (
-                  <div className="space-y-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
+                  <div className="space-y-3 rounded-2xl border border-amber-500/35 bg-gradient-to-b from-amber-500/14 to-amber-500/6 p-3">
                     <div>
-                      <p className="text-[10px] uppercase tracking-[0.14em] text-amber-300">
-                        Missing Input Required
-                      </p>
+                      <p className="text-xs font-semibold text-amber-300">Missing input required</p>
                       <p className="mt-1 whitespace-pre-wrap text-xs text-amber-100">
                         {agentRunResult.assistant_message || "Provide missing details to continue."}
                       </p>
@@ -4769,7 +5018,7 @@ function ControlDeckSurface({
 
                     <div className="grid gap-2 md:grid-cols-2">
                       {requiredInputs.map((field) => (
-                        <label key={field.key} className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                        <label key={field.key} className="block text-xs text-amber-200">
                           {field.label}
                           <input
                             type={field.type === "number" ? "number" : field.type === "email" ? "email" : "text"}
@@ -4782,7 +5031,7 @@ function ControlDeckSurface({
                       ))}
                     </div>
 
-                    <label className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                    <label className="block text-xs text-amber-200">
                       Optional Source URL
                       <input
                         value={agentInputSourceUrl}
@@ -4792,7 +5041,7 @@ function ControlDeckSurface({
                       />
                     </label>
 
-                    <label className="block text-[11px] uppercase tracking-[0.1em] text-amber-200">
+                    <label className="block text-xs text-amber-200">
                       Optional File Upload
                       <div className="mt-1 flex min-w-0 items-center gap-2 rounded-xl border border-white/10 bg-black/40 px-3 py-2">
                         <Paperclip size={14} className="shrink-0 text-slate-500" />
@@ -4814,7 +5063,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onSubmitAgentInputs}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
                       >
                         Approve & Continue
                       </button>
@@ -4822,7 +5071,7 @@ function ControlDeckSurface({
                         type="button"
                         onClick={onRejectAgentInput}
                         disabled={isApprovalBusy}
-                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
                         Reject
                       </button>
@@ -4836,13 +5085,17 @@ function ControlDeckSurface({
               {turns.map((turn) => (
                 <div
                   key={turn.id}
-                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.25)] sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
+                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.3)] backdrop-blur sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
                     turn.role === "owner"
-                      ? "ml-auto border-cyan-400/40 bg-cyan-500/18 text-cyan-50"
-                      : "mr-auto border-slate-500/45 bg-slate-900/90 text-slate-100"
+                      ? "ml-auto border-cyan-300/45 bg-gradient-to-br from-cyan-500/30 to-cyan-500/12 text-cyan-50 shadow-[0_14px_34px_rgba(34,211,238,0.26)]"
+                      : "mr-auto border-slate-600/55 bg-slate-900/90 text-slate-100"
                   }`}
                 >
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-300/90">
+                  <p
+                    className={`text-xs font-semibold ${
+                      turn.role === "owner" ? "text-cyan-100/85" : "text-slate-300/90"
+                    }`}
+                  >
                     {turn.role === "owner" ? "You" : "Organization"}
                     {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
                   </p>
@@ -4859,12 +5112,12 @@ function ControlDeckSurface({
 
         {message ? (
           <div
-            className={`mt-3 rounded-xl border px-3 py-2 text-xs ${
+            className={`mt-3 rounded-xl border px-3 py-2 text-xs backdrop-blur ${
               message.tone === "success"
-                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
                 : message.tone === "warning"
-                  ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
-                  : "border-red-500/40 bg-red-500/10 text-red-300"
+                  ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                  : "border-red-500/40 bg-red-500/15 text-red-300"
             }`}
           >
             {message.text}

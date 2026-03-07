@@ -99,8 +99,8 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
     executionMode: "BALANCED",
     provider: "OpenAI",
     model: "gpt-4o-mini",
-    fallbackProvider: "Anthropic",
-    fallbackModel: "claude-3-5-sonnet",
+    fallbackProvider: "Gemini",
+    fallbackModel: "gemini-2.5-flash",
     servicePlan: "STARTER",
     serviceMarkupPct: 25,
     hasOrganizationApiKey: false,
@@ -485,23 +485,30 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
   return (
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
-        <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Settings</h2>
+        <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Settings</h2>
         <button
           onClick={() => void loadSettings(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-slate-200"
+          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
         >
           {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} Refresh
         </button>
       </div>
 
       <div className="flex flex-wrap gap-2">
-        {(["webhooks", "identity", "rails", "orchestration"] as Lane[]).map((item) => (
+        {(
+          [
+            { key: "webhooks" as Lane, label: "Webhooks" },
+            { key: "identity" as Lane, label: "Identity" },
+            { key: "rails" as Lane, label: "Guardrails" },
+            { key: "orchestration" as Lane, label: "Runtime" }
+          ] as const
+        ).map((item) => (
           <button
-            key={item}
-            onClick={() => setLane(item)}
-            className={`rounded-full border px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] ${lane === item ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300" : "border-white/20 bg-white/5 text-slate-300"}`}
+            key={item.key}
+            onClick={() => setLane(item.key)}
+            className={`rounded-full border px-4 py-2 text-xs font-semibold ${lane === item.key ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300" : "border-white/20 bg-white/5 text-slate-300"}`}
           >
-            {item}
+            {item.label}
           </button>
         ))}
       </div>

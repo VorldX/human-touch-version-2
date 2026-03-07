@@ -94,6 +94,29 @@ const ALLOWED_INTERNAL_EVENTS = new Set([
   "vorldx/dna.ingest"
 ]);
 
+function parsePositiveEnvInt(name: string, fallback: number) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return fallback;
+  }
+  return Math.floor(raw);
+}
+
+const TASK_CONTEXT_PREVIEW_CHARS = parsePositiveEnvInt(
+  "TASK_CONTEXT_PREVIEW_CHARS",
+  2800
+);
+const TASK_CONTEXT_FALLBACK_FILE_COUNT = parsePositiveEnvInt(
+  "TASK_CONTEXT_FALLBACK_FILE_COUNT",
+  1
+);
+const TOOL_ACTION_CATALOG_LIMIT = parsePositiveEnvInt("TOOL_ACTION_CATALOG_LIMIT", 40);
+const TOOL_BINDING_CONTEXT_LIMIT = parsePositiveEnvInt("TOOL_BINDING_CONTEXT_LIMIT", 30);
+const TOOL_RESULT_CONTEXT_MAX_CHARS = parsePositiveEnvInt(
+  "TOOL_RESULT_CONTEXT_MAX_CHARS",
+  3200
+);
+
 function asString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -107,6 +130,72 @@ function asRecord(value: unknown) {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function truncateText(value: string, maxChars: number) {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function sanitizeToolValueForContext(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    return truncateText(value, 320);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (depth >= 4) {
+      return `[array(${value.length}) omitted]`;
+    }
+    return value
+      .slice(0, 8)
+      .map((item) => sanitizeToolValueForContext(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    if (depth >= 4) {
+      return "[object omitted]";
+    }
+    const record = value as Record<string, unknown>;
+    const output: Record<string, unknown> = {};
+    for (const [key, current] of Object.entries(record)) {
+      const normalizedKey = key.trim();
+      if (!normalizedKey) continue;
+      const lower = normalizedKey.toLowerCase();
+      if (
+        lower === "raw" ||
+        lower === "payload" ||
+        lower === "parts" ||
+        lower === "headers" ||
+        lower === "mime" ||
+        lower === "attachments"
+      ) {
+        continue;
+      }
+      output[normalizedKey] = sanitizeToolValueForContext(current, depth + 1);
+      if (Object.keys(output).length >= 20) {
+        break;
+      }
+    }
+    return output;
+  }
+  return String(value);
+}
+
+function toContextJson(value: unknown, maxChars = TOOL_RESULT_CONTEXT_MAX_CHARS) {
+  let text = "";
+  try {
+    text = JSON.stringify(sanitizeToolValueForContext(value), null, 2);
+  } catch {
+    text = JSON.stringify({ note: "Unable to serialize full tool payload." }, null, 2);
+  }
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxChars - 24))}\n... [truncated]`;
 }
 
 function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
@@ -370,12 +459,10 @@ async function resolveTaskContext(orgId: string, requiredFiles: string[]): Promi
       : await prisma.file.findMany({
           where: {
             orgId,
-            type: {
-              in: [HubFileType.INPUT, HubFileType.DNA]
-            }
+            type: HubFileType.INPUT
           },
           orderBy: { updatedAt: "desc" },
-          take: 3
+          take: Math.max(1, TASK_CONTEXT_FALLBACK_FILE_COUNT)
         });
 
   const foundRefs = new Set<string>();
@@ -425,11 +512,11 @@ async function resolveTaskContext(orgId: string, requiredFiles: string[]): Promi
     let sourceText = "";
     const localBytes = await readLocalUploadByUrl(file.url);
     if (localBytes) {
-      sourceText = toPreviewText(localBytes, 6000);
+      sourceText = toPreviewText(localBytes, TASK_CONTEXT_PREVIEW_CHARS);
     } else if (/^https?:\/\//.test(file.url)) {
       try {
         const response = await fetch(file.url, { cache: "no-store" });
-        sourceText = (await response.text()).slice(0, 6000);
+        sourceText = (await response.text()).slice(0, TASK_CONTEXT_PREVIEW_CHARS);
       } catch {
         sourceText = "";
       }
@@ -888,7 +975,7 @@ function inferAgentToolActionHeuristic(
     return inferReadOnlyGenericToolAction(prompt, requestedToolkits, toolBindings);
   }
 
-  const hasMailContext = /gmail|email|mail|inbox/.test(normalized);
+  const hasMailContext = /\b(gmail|email|mail|inbox)\b/.test(normalized);
   const sendIntent =
     /\b(send|compose)\b/.test(normalized) && /\b(?:email|mail)\b/.test(normalized);
   if (hasMailContext && sendIntent) {
@@ -912,11 +999,15 @@ function inferAgentToolActionHeuristic(
         }
       };
     }
+
+    // Do not fall back to mailbox-read actions for incomplete send requests.
+    // Missing structured send fields should route through HUMAN_INPUT instead.
+    return null;
   }
 
   // MVP behavior: if task mentions inbox/email fetch semantics, call Gmail fetch.
-  const asksForMailboxRead = /gmail|email|inbox/.test(normalized);
-  const asksForList = /list|latest|recent|last|show|fetch|check|read/.test(normalized);
+  const asksForMailboxRead = /\b(gmail|email|inbox)\b/.test(normalized);
+  const asksForList = /\b(list|latest|recent|last|show|fetch|check|read)\b/.test(normalized);
   if (!asksForMailboxRead || !asksForList) {
     return inferReadOnlyGenericToolAction(prompt, requestedToolkits, toolBindings);
   }
@@ -1036,12 +1127,14 @@ async function inferAgentToolAction(
 
   try {
     const runtime = await getOrgLlmRuntime(input.orgId);
-    const actionCatalog = candidateBindings.slice(0, 80).map((binding) => ({
+    const actionCatalog = candidateBindings
+      .slice(0, Math.max(1, TOOL_ACTION_CATALOG_LIMIT))
+      .map((binding) => ({
       toolkit: binding.toolkit,
       action: binding.slug.toUpperCase(),
       name: binding.name,
       description: binding.description
-    }));
+      }));
 
     const execution = await executeSwarmAgent({
       taskId: `tool-router-${Date.now()}`,
@@ -1069,7 +1162,8 @@ async function inferAgentToolAction(
         "",
         "Action catalog (JSON):",
         JSON.stringify(actionCatalog)
-      ].join("\n")
+      ].join("\n"),
+      maxOutputTokens: 260
     });
 
     if (!execution.ok || !execution.outputText) {
@@ -2520,7 +2614,16 @@ async function executeTaskById(
             id: "composio-tool-bindings",
             name: "Connected Tool Bindings",
             amnesiaProtected: false,
-            content: JSON.stringify(toolBindings.slice(0, 80))
+            content: toContextJson(
+              toolBindings
+                .slice(0, Math.max(1, TOOL_BINDING_CONTEXT_LIMIT))
+                .map((binding) => ({
+                  toolkit: binding.toolkit,
+                  slug: binding.slug,
+                  name: binding.name
+                })),
+              1800
+            )
           }
         ]
       : [];
@@ -2545,16 +2648,12 @@ async function executeTaskById(
             id: "composio-tool-action-result",
             name: "Executed Tool Result",
             amnesiaProtected: false,
-            content: JSON.stringify(
-              {
-                toolkit: toolActionSuccess.toolkit,
-                action: toolActionSuccess.action,
-                toolSlug: toolActionSuccess.toolSlug,
-                data: toolActionSuccess.data
-              },
-              null,
-              2
-            )
+            content: toContextJson({
+              toolkit: toolActionSuccess.toolkit,
+              action: toolActionSuccess.action,
+              toolSlug: toolActionSuccess.toolSlug,
+              data: toolActionSuccess.data
+            })
           }
         ]
       : [];
@@ -2566,7 +2665,7 @@ async function executeTaskById(
             id: "composio-tool-action-error",
             name: "Tool Action Error",
             amnesiaProtected: false,
-            content: JSON.stringify(toolActionFailure.error)
+            content: toContextJson(toolActionFailure.error, 1400)
           }
         ]
       : [];
@@ -2577,16 +2676,12 @@ async function executeTaskById(
             id: "composio-tool-action-followup-result",
             name: "Executed Follow-up Tool Result",
             amnesiaProtected: false,
-            content: JSON.stringify(
-              {
-                toolkit: followupToolActionSuccess.toolkit,
-                action: followupToolActionSuccess.action,
-                toolSlug: followupToolActionSuccess.toolSlug,
-                data: followupToolActionSuccess.data
-              },
-              null,
-              2
-            )
+            content: toContextJson({
+              toolkit: followupToolActionSuccess.toolkit,
+              action: followupToolActionSuccess.action,
+              toolSlug: followupToolActionSuccess.toolSlug,
+              data: followupToolActionSuccess.data
+            })
           }
         ]
       : [];
@@ -2597,10 +2692,13 @@ async function executeTaskById(
             id: "composio-tool-action-followup-error",
             name: "Follow-up Tool Action Error",
             amnesiaProtected: false,
-            content: JSON.stringify(followupToolActionFailure.error)
+            content: toContextJson(followupToolActionFailure.error, 1400)
           }
         ]
       : [];
+
+  const taskExecutionMaxOutputTokens =
+    executionMode === "ECO" ? 420 : executionMode === "TURBO" ? 900 : 650;
 
   const execution = await executeSwarmAgent({
     taskId: task.id,
@@ -2616,7 +2714,8 @@ async function executeTaskById(
       ...followupToolActionContextBlocks,
       ...followupToolActionErrorContextBlocks
     ],
-    organizationRuntime: await getOrgLlmRuntime(orgId)
+    organizationRuntime: await getOrgLlmRuntime(orgId),
+    maxOutputTokens: taskExecutionMaxOutputTokens
   });
 
   const executionTrace = {
@@ -2627,8 +2726,8 @@ async function executeTaskById(
     requestedToolkits,
     inferredToolAction,
     toolInferenceReason: inferredToolPlan.reason ?? null,
-    toolActionExecution,
-    followupToolActionExecution,
+    toolActionExecution: sanitizeToolValueForContext(toolActionExecution),
+    followupToolActionExecution: sanitizeToolValueForContext(followupToolActionExecution),
     toolBindings: toolBindings.map((item) => ({
       toolkit: item.toolkit,
       slug: item.slug

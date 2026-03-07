@@ -139,8 +139,23 @@ function parseCustomToolkitAuthConfigs(allowlistedToolkits: string[]) {
   return configs;
 }
 
+function resolveComposioApiKey() {
+  const apiKey = process.env.COMPOSIO_API_KEY?.trim() ?? "";
+  if (!apiKey) {
+    return "";
+  }
+
+  // Treat template placeholders as unset so local/dev environments don't keep
+  // retrying Composio endpoints with invalid credentials.
+  if (/^replace_with_/i.test(apiKey)) {
+    return "";
+  }
+
+  return apiKey;
+}
+
 function enabled() {
-  return featureFlags.composioIntegrations && Boolean(process.env.COMPOSIO_API_KEY?.trim());
+  return featureFlags.composioIntegrations && Boolean(resolveComposioApiKey());
 }
 
 export function composioIntegrationEnabled() {
@@ -256,7 +271,7 @@ export function initComposioClient() {
   if (!enabled()) {
     return null;
   }
-  const apiKey = process.env.COMPOSIO_API_KEY?.trim();
+  const apiKey = resolveComposioApiKey();
   if (!apiKey) {
     return null;
   }
