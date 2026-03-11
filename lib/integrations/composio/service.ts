@@ -9,6 +9,8 @@ import {
   ComposioServiceCore,
   ComposioServiceError,
   inferRequestedToolkits as inferRequestedToolkitsCore,
+  isConnectedIntegrationStatus as isConnectedIntegrationStatusCore,
+  normalizeConnectionStatus as normalizeConnectionStatusCore,
   type ConnectionSummary,
   type CustomToolkitAuthConfig,
   type UserIntegrationStore
@@ -139,6 +141,21 @@ function parseCustomToolkitAuthConfigs(allowlistedToolkits: string[]) {
   return configs;
 }
 
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") {
+    return fallback;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 function resolveComposioApiKey() {
   const apiKey = process.env.COMPOSIO_API_KEY?.trim() ?? "";
   if (!apiKey) {
@@ -161,6 +178,9 @@ function enabled() {
 export function composioIntegrationEnabled() {
   return enabled();
 }
+
+export const isConnectedIntegrationStatus = isConnectedIntegrationStatusCore;
+export const normalizeConnectionStatus = normalizeConnectionStatusCore;
 
 export function composioAllowlistedToolkits() {
   return parseAllowlistedToolkits();
@@ -192,12 +212,20 @@ function callbackUrl(callbackUrlOverride?: string) {
 
 const store: UserIntegrationStore = {
   async listByUser(input) {
+    const where =
+      input.orgId
+        ? {
+            userId: input.userId,
+            provider: input.provider,
+            OR: [{ orgId: input.orgId }, { orgId: null }]
+          }
+        : {
+            userId: input.userId,
+            provider: input.provider
+          };
+
     const rows = await prisma.userIntegration.findMany({
-      where: {
-        userId: input.userId,
-        provider: input.provider,
-        ...(input.orgId ? { orgId: input.orgId } : {})
-      },
+      where,
       orderBy: {
         updatedAt: "desc"
       }
@@ -206,30 +234,72 @@ const store: UserIntegrationStore = {
     return rows.map((row) => toConnectionSummary(row));
   },
 
-  async findByConnection(input) {
-    const row = await prisma.userIntegration.findFirst({
+  async listByOrg(input) {
+    const rows = await prisma.userIntegration.findMany({
       where: {
-        userId: input.userId,
         provider: input.provider,
-        connectionId: input.connectionId,
-        ...(input.orgId ? { orgId: input.orgId } : {})
+        orgId: input.orgId
+      },
+      orderBy: {
+        updatedAt: "desc"
       }
     });
+
+    const normalizedToolkits = Array.isArray(input.toolkits)
+      ? input.toolkits.map((item) => item.trim().toLowerCase()).filter(Boolean)
+      : [];
+    const includeAll = normalizedToolkits.length === 0;
+    const filtered = includeAll
+      ? rows
+      : rows.filter((row) => normalizedToolkits.includes(row.toolkit.toLowerCase()));
+
+    return filtered.map((row) => toConnectionSummary(row));
+  },
+
+  async findByConnection(input) {
+    const where =
+      input.orgId
+        ? {
+            userId: input.userId,
+            provider: input.provider,
+            connectionId: input.connectionId,
+            OR: [{ orgId: input.orgId }, { orgId: null }]
+          }
+        : {
+            userId: input.userId,
+            provider: input.provider,
+            connectionId: input.connectionId
+          };
+
+    const row = await prisma.userIntegration.findFirst({ where });
     return row ? toConnectionSummary(row) : null;
   },
 
   async findByNonce(input) {
+    const where =
+      input.orgId
+        ? {
+            userId: input.userId,
+            provider: input.provider,
+            toolkit: input.toolkit,
+            OR: [{ orgId: input.orgId }, { orgId: null }],
+            metadata: {
+              path: ["oauthStateNonce"],
+              equals: input.nonce
+            }
+          }
+        : {
+            userId: input.userId,
+            provider: input.provider,
+            toolkit: input.toolkit,
+            metadata: {
+              path: ["oauthStateNonce"],
+              equals: input.nonce
+            }
+          };
+
     const row = await prisma.userIntegration.findFirst({
-      where: {
-        userId: input.userId,
-        provider: input.provider,
-        toolkit: input.toolkit,
-        ...(input.orgId ? { orgId: input.orgId } : {}),
-        metadata: {
-          path: ["oauthStateNonce"],
-          equals: input.nonce
-        }
-      },
+      where,
       orderBy: {
         updatedAt: "desc"
       }
@@ -304,7 +374,8 @@ function createCore(options?: { callbackUrlOverride?: string }) {
     createStateToken: createComposioOAuthState,
     verifyStateToken: verifyComposioOAuthState,
     connectUrlForToolkit: buildIntegrationConnectPath,
-    customAuthConfigs: parseCustomToolkitAuthConfigs(allowlistedToolkits)
+    customAuthConfigs: parseCustomToolkitAuthConfigs(allowlistedToolkits),
+    allowOrgToolkitFallback: parseBooleanEnv("COMPOSIO_ALLOW_ORG_TOOL_FALLBACK", true)
   });
 }
 

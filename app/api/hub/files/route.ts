@@ -5,7 +5,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { posix } from "node:path";
 
 import { prisma } from "@/lib/db/prisma";
-import { persistUploadLocal } from "@/lib/hub/storage";
+import {
+  HUB_UPLOAD_MAX_BYTES,
+  persistUploadLocal,
+  UploadTooLargeError
+} from "@/lib/hub/storage";
 import { publishInngestEvent } from "@/lib/inngest/publish";
 import { recordPassivePolicy, recordPassiveSpend } from "@/lib/enterprise/passive";
 import { requireOrgAccess } from "@/lib/security/org-access";
@@ -54,6 +58,16 @@ function normalizeSourceUrl(value: string) {
   }
 
   return normalized;
+}
+
+function formatByteSize(bytes: number) {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.ceil(bytes / 1024)} KB`;
+  }
+  return `${bytes} B`;
 }
 
 export async function GET(request: NextRequest) {
@@ -189,10 +203,34 @@ export async function POST(request: NextRequest) {
   let contentMime = "application/octet-stream";
 
   if (uploadFile && uploadFile.size > 0) {
-    const saved = await persistUploadLocal({
-      orgId,
-      file: uploadFile
-    });
+    if (uploadFile.size > HUB_UPLOAD_MAX_BYTES) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: `Upload too large. Max allowed size is ${formatByteSize(HUB_UPLOAD_MAX_BYTES)}.`
+        },
+        { status: 413 }
+      );
+    }
+
+    let saved: Awaited<ReturnType<typeof persistUploadLocal>>;
+    try {
+      saved = await persistUploadLocal({
+        orgId,
+        file: uploadFile
+      });
+    } catch (error) {
+      if (error instanceof UploadTooLargeError) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message: `Upload too large. Max allowed size is ${formatByteSize(error.maxBytes)}.`
+          },
+          { status: 413 }
+        );
+      }
+      throw error;
+    }
 
     url = saved.url;
     sizeValue = BigInt(saved.byteLength);

@@ -44,12 +44,23 @@ interface FlowTask {
   agent: { name: string; role: string } | null;
 }
 
+interface FlowApprovalEntry {
+  id: string;
+  timestamp: string;
+  user: {
+    id: string;
+    username: string;
+    email: string;
+  };
+}
+
 interface FlowDetail {
   id: string;
   status: FlowStatus;
   progress: number;
   predictedBurn: number;
   requiredSignatures: number;
+  approvals?: FlowApprovalEntry[];
   tasks: FlowTask[];
 }
 
@@ -368,6 +379,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
   const [note, setNote] = useState("");
   const [rewindPrompt, setRewindPrompt] = useState("");
   const [actionKey, setActionKey] = useState<string | null>(null);
+  const [signatureActionInFlight, setSignatureActionInFlight] = useState(false);
 
   const loadFlows = useCallback(async (silent?: boolean) => {
     if (!silent) setLoading(true);
@@ -701,6 +713,64 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
     }
   }, [detail, fileUrl, flowId, loadDetail, loadFlows, note, notify, onTaskNeedsInput, orgId, overridePrompt, rewindPrompt]);
 
+  const captureFlowSignature = useCallback(async () => {
+    if (!detail || signatureActionInFlight) {
+      return;
+    }
+
+    setSignatureActionInFlight(true);
+    try {
+      const response = await fetch(`/api/flows/${detail.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orgId })
+      });
+      const { payload, rawText } = await parseJsonResponse<{
+        ok?: boolean;
+        message?: string;
+        warning?: string;
+        flow?: {
+          status?: string;
+          approvalsProvided?: number;
+          requiredSignatures?: number;
+          launchTriggered?: boolean;
+        };
+        signatureRecorded?: boolean;
+      }>(response);
+
+      if (!response.ok || !payload?.ok) {
+        notify({
+          title: "Signature Capture Failed",
+          message:
+            payload?.message ??
+            (rawText
+              ? `Request failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Request failed."),
+          type: "error"
+        });
+        return;
+      }
+
+      const approvalsProvided = payload.flow?.approvalsProvided ?? 0;
+      const requiredSignatures = payload.flow?.requiredSignatures ?? detail.requiredSignatures;
+      const launchTriggered = payload.flow?.launchTriggered === true;
+      notify({
+        title: "Signature Captured",
+        message: launchTriggered
+          ? `Signature threshold reached (${approvalsProvided}/${requiredSignatures}). Flow queued.`
+          : `Flow signatures: ${approvalsProvided}/${requiredSignatures}.`,
+        type: payload.warning ? "warning" : "success"
+      });
+
+      if (flowId) {
+        await loadDetail(flowId, true);
+      }
+      await loadFlows(true);
+    } finally {
+      setSignatureActionInFlight(false);
+    }
+  }, [detail, flowId, loadDetail, loadFlows, notify, orgId, signatureActionInFlight]);
+
   return (
     <div className="mx-auto max-w-[1400px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
@@ -805,8 +875,29 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                         <Stat label="Status" value={detail.status} className={badgeClass(detail.status)} />
                         <Stat label="Progress" value={`${detail.progress}%`} />
                         <Stat label="Burn" value={detail.predictedBurn.toLocaleString()} />
-                        <Stat label="Signatures" value={String(detail.requiredSignatures)} />
+                        <Stat
+                          label="Signatures"
+                          value={`${detail.approvals?.length ?? 0}/${detail.requiredSignatures}`}
+                        />
                       </div>
+                      {detail.status === "DRAFT" ? (
+                        <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                          <span className="text-xs text-amber-200">
+                            Flow is in draft until signature threshold is met.
+                          </span>
+                          <button
+                            onClick={() => void captureFlowSignature()}
+                            className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/15 px-3 py-1 text-xs font-semibold text-amber-100"
+                          >
+                            {signatureActionInFlight ? (
+                              <Loader2 size={12} className="animate-spin" />
+                            ) : (
+                              <ShieldAlert size={12} />
+                            )}
+                            Sign Flow
+                          </button>
+                        </div>
+                      ) : null}
                       <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
                         {detail.tasks.map((task) => {
                           const integrationError = parseIntegrationError(task.executionTrace);

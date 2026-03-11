@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 
 import { type Personnel } from "@prisma/client";
 
+import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
 import { decryptBrainKey } from "@/lib/security/crypto";
 
 type ProviderKind = "openai" | "anthropic" | "gemini";
@@ -88,6 +89,10 @@ interface TokenUsage {
 interface ProviderResult {
   text: string;
   usage: TokenUsage;
+  stopReason: string | null;
+  truncated: boolean;
+  retryCount: number;
+  effectiveMaxOutputTokens: number;
 }
 
 interface AgentBilling {
@@ -107,6 +112,10 @@ const MAX_MAX_OUTPUT_TOKENS = 4096;
 const DEFAULT_MAX_CONTEXT_BLOCKS = 10;
 const DEFAULT_MAX_CONTEXT_TOTAL_CHARS = 12_000;
 const DEFAULT_MAX_CONTEXT_BLOCK_CHARS = 1_800;
+const DEFAULT_PROMPT_MAX_TOKENS = 2_400;
+const DEFAULT_PROMPT_MAX_CHARS = 14_000;
+const DEFAULT_MAX_INFLIGHT = 6;
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 6_000;
 
 function parsePositiveEnvInt(name: string, fallback: number) {
   const raw = Number(process.env[name]);
@@ -114,6 +123,17 @@ function parsePositiveEnvInt(name: string, fallback: number) {
     return fallback;
   }
   return Math.floor(raw);
+}
+
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") {
+    return fallback;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 const MAX_CONTEXT_BLOCKS = parsePositiveEnvInt(
@@ -128,6 +148,32 @@ const MAX_CONTEXT_BLOCK_CHARS = parsePositiveEnvInt(
   "AGENT_CONTEXT_MAX_BLOCK_CHARS",
   DEFAULT_MAX_CONTEXT_BLOCK_CHARS
 );
+const MAX_PROMPT_TOKENS = parsePositiveEnvInt(
+  "SWARM_MAX_PROMPT_TOKENS",
+  DEFAULT_PROMPT_MAX_TOKENS
+);
+const MAX_PROMPT_CHARS = parsePositiveEnvInt(
+  "SWARM_MAX_PROMPT_CHARS",
+  DEFAULT_PROMPT_MAX_CHARS
+);
+const SWARM_CONCISE_MODE = parseBooleanEnv("SWARM_CONCISE_MODE", true);
+const SWARM_ALWAYS_INCLUDE_TIME_CONTEXT = parseBooleanEnv(
+  "SWARM_ALWAYS_INCLUDE_TIME_CONTEXT",
+  false
+);
+const SWARM_MAX_INFLIGHT = parsePositiveEnvInt("SWARM_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT);
+const SWARM_ACQUIRE_TIMEOUT_MS = parsePositiveEnvInt(
+  "SWARM_ACQUIRE_TIMEOUT_MS",
+  DEFAULT_ACQUIRE_TIMEOUT_MS
+);
+const GLOBAL_MAX_OUTPUT_TOKENS = parsePositiveEnvInt(
+  "SWARM_GLOBAL_MAX_OUTPUT_TOKENS",
+  1200
+);
+const SWARM_RETRY_TRUNCATED_ONCE = parseBooleanEnv("SWARM_RETRY_TRUNCATED_ONCE", true);
+
+let inflightCalls = 0;
+const inflightQueue: Array<() => void> = [];
 
 function normalizeProvider(value: string | undefined): ProviderKind {
   const normalized = (value ?? "").trim().toLowerCase();
@@ -263,11 +309,11 @@ function sanitizeContextBlocks(blocks: AgentContextBlock[]) {
 
 function resolveMaxOutputTokens(value: unknown) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    return DEFAULT_MAX_OUTPUT_TOKENS;
+    return Math.min(DEFAULT_MAX_OUTPUT_TOKENS, GLOBAL_MAX_OUTPUT_TOKENS);
   }
   return Math.max(
     MIN_MAX_OUTPUT_TOKENS,
-    Math.min(MAX_MAX_OUTPUT_TOKENS, Math.floor(value))
+    Math.min(MAX_MAX_OUTPUT_TOKENS, GLOBAL_MAX_OUTPUT_TOKENS, Math.floor(value))
   );
 }
 
@@ -344,23 +390,35 @@ function computeBilling(
 }
 
 function resolvePlatformApiKey(provider: ProviderKind) {
+  const normalizeApiKey = (value: string | undefined) => {
+    const trimmed = value?.trim() ?? "";
+    if (!trimmed || /^replace_with_/i.test(trimmed)) {
+      return null;
+    }
+    return trimmed;
+  };
+
   if (provider === "anthropic") {
     return (
-      process.env.PLATFORM_ANTHROPIC_API_KEY?.trim() ||
-      process.env.ANTHROPIC_API_KEY?.trim() ||
+      normalizeApiKey(process.env.PLATFORM_ANTHROPIC_API_KEY) ??
+      normalizeApiKey(process.env.ANTHROPIC_API_KEY) ??
       null
     );
   }
 
   if (provider === "gemini") {
     return (
-      process.env.PLATFORM_GEMINI_API_KEY?.trim() ||
-      process.env.GEMINI_API_KEY?.trim() ||
+      normalizeApiKey(process.env.PLATFORM_GEMINI_API_KEY) ??
+      normalizeApiKey(process.env.GEMINI_API_KEY) ??
       null
     );
   }
 
-  return process.env.PLATFORM_OPENAI_API_KEY?.trim() || process.env.OPENAI_API_KEY?.trim() || null;
+  return (
+    normalizeApiKey(process.env.PLATFORM_OPENAI_API_KEY) ??
+    normalizeApiKey(process.env.OPENAI_API_KEY) ??
+    null
+  );
 }
 
 function resolveKeyForProvider(
@@ -368,8 +426,17 @@ function resolveKeyForProvider(
   agentApiKey: string | null,
   organizationRuntime?: AgentExecutionInput["organizationRuntime"]
 ): { apiKey: string | null; apiSource: ApiSource } {
-  if (agentApiKey) {
-    return { apiKey: agentApiKey, apiSource: "agent" };
+  const normalizeApiKey = (value: string | null | undefined) => {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (!trimmed || /^replace_with_/i.test(trimmed)) {
+      return null;
+    }
+    return trimmed;
+  };
+
+  const normalizedAgentKey = normalizeApiKey(agentApiKey);
+  if (normalizedAgentKey) {
+    return { apiKey: normalizedAgentKey, apiSource: "agent" };
   }
 
   const orgApiKeys =
@@ -377,15 +444,16 @@ function resolveKeyForProvider(
     typeof organizationRuntime.organizationApiKeys === "object"
       ? organizationRuntime.organizationApiKeys
       : null;
-  const providerScopedKey =
+  const providerScopedKeyRaw =
     orgApiKeys && typeof orgApiKeys[provider] === "string"
       ? orgApiKeys[provider]?.trim()
       : "";
+  const providerScopedKey = normalizeApiKey(providerScopedKeyRaw);
   if (providerScopedKey) {
     return { apiKey: providerScopedKey, apiSource: "organization" };
   }
 
-  const orgApiKey = organizationRuntime?.organizationApiKey?.trim();
+  const orgApiKey = normalizeApiKey(organizationRuntime?.organizationApiKey ?? null);
   if (orgApiKey) {
     return { apiKey: orgApiKey, apiSource: "organization" };
   }
@@ -437,48 +505,74 @@ function isMainOrchestratorRole(agentRole: string) {
 }
 
 function buildMainOrchestratorCriticalRules() {
-  return [
-    "CRITICAL RULES (MAIN ORCHESTRATOR):",
-    "1) Determine required platform/toolkit before execution and explicitly include `toolkits: ...` in your plan.",
-    "2) Connection gate is mandatory: if a required toolkit is not connected, stop and request Human Touch to connect it.",
-    "3) Never report external execution as complete unless tool execution evidence is present in context.",
-    "4) For action tasks, provide exact execution fields (for email: recipient, subject, body) without ambiguity.",
-    "5) If a step fails, return root cause plus immediate retry/fallback path instead of silent continuation.",
-    "6) If evidence is missing, explicitly mark outcome as `Not executed` instead of implying completion."
-  ].join("\n");
+  return SWARM_CONCISE_MODE
+    ? [
+        "Main orchestrator rules:",
+        "1) Include required toolkits in plan (`toolkits:`).",
+        "2) If toolkit is not connected, stop and request Human Touch.",
+        "3) Never claim external execution without tool evidence.",
+        "4) For action tasks, provide exact fields (recipient, subject, body).",
+        "5) If missing evidence, mark `Not executed`."
+      ].join("\n")
+    : [
+        "CRITICAL RULES (MAIN ORCHESTRATOR):",
+        "1) Determine required platform/toolkit before execution and explicitly include `toolkits: ...` in your plan.",
+        "2) Connection gate is mandatory: if a required toolkit is not connected, stop and request Human Touch to connect it.",
+        "3) Never report external execution as complete unless tool execution evidence is present in context.",
+        "4) For action tasks, provide exact execution fields (for email: recipient, subject, body) without ambiguity.",
+        "5) If a step fails, return root cause plus immediate retry/fallback path instead of silent continuation.",
+        "6) If evidence is missing, explicitly mark outcome as `Not executed` instead of implying completion."
+      ].join("\n");
 }
 
 function buildSystemPrompt(agentName: string, agentRole: string) {
-  const base = [
-    `You are ${agentName}, acting as ${agentRole} in VorldX Swarm.`,
-    "Follow Human Touch philosophy: be precise, cite assumptions, and avoid unsafe leaps.",
-    "Never fabricate facts, IDs, links, numbers, tool outputs, or completion status.",
-    "If certainty is low, say `Unknown based on current context` and ask for the missing evidence.",
-    "If data is missing, explicitly state what is missing and request Human Touch intervention.",
-    "Return concise actionable output."
-  ];
-
-  if (!isMainOrchestratorRole(agentRole)) {
-    return base.join("\n");
+  if (isMainOrchestratorRole(agentRole)) {
+    return [
+      buildOrganizationMainAgentPrompt({
+        orgName: "the organization",
+        mode: "execution",
+        contextAvailable: true
+      }),
+      "",
+      buildMainOrchestratorCriticalRules()
+    ].join("\n");
   }
 
-  return [...base, "", buildMainOrchestratorCriticalRules()].join("\n");
+  const base = SWARM_CONCISE_MODE
+    ? [
+        `You are ${agentName} (${agentRole}).`,
+        "Use only provided context and tool evidence.",
+        "Never invent IDs, links, numbers, tool outputs, or completion claims.",
+        "If information is missing, say `Unknown based on current context` and request what is missing.",
+        "Return concise actionable output."
+      ]
+    : [
+        `You are ${agentName}, acting as ${agentRole} in VorldX Swarm.`,
+        "Follow Human Touch philosophy: be precise, cite assumptions, and avoid unsafe leaps.",
+        "Never fabricate facts, IDs, links, numbers, tool outputs, or completion status.",
+        "If certainty is low, say `Unknown based on current context` and ask for the missing evidence.",
+        "If data is missing, explicitly state what is missing and request Human Touch intervention.",
+        "Return concise actionable output."
+      ];
+
+  return base.join("\n");
 }
 
 function buildUserPrompt(prompt: string, contextBlocks: AgentContextBlock[]) {
-  const contextText =
-    contextBlocks.length === 0
-      ? "No Hub context files were attached."
-      : contextBlocks
-          .map((item) => {
-            if (item.amnesiaProtected) {
-              return `File ${item.name} (${item.id}) is amnesia protected. Use metadata only.`;
-            }
-            return `File ${item.name} (${item.id}) context:\n${item.content}`;
-          })
-          .join("\n\n---\n\n");
+  if (contextBlocks.length === 0) {
+    return `Task:\n${prompt}\n\nContext:\nnone`;
+  }
 
-  return [`Mission Task:`, prompt, "", "Hub Context:", contextText].join("\n");
+  const contextText = contextBlocks
+    .map((item, index) => {
+      if (item.amnesiaProtected) {
+        return `[${index + 1}] ${item.name} (${item.id}): amnesia protected; metadata only.`;
+      }
+      return `[${index + 1}] ${item.name} (${item.id}):\n${item.content}`;
+    })
+    .join("\n\n");
+
+  return [`Task:`, prompt, "", "Context:", contextText].join("\n");
 }
 
 function buildTimeAwarenessContext(reference: Date) {
@@ -503,6 +597,112 @@ function buildTimeAwarenessContext(reference: Date) {
     `Unix timestamp (seconds): ${unixSeconds}`,
     "Resolve relative dates (today/tomorrow/yesterday/next week) against current UTC time above and respond with concrete dates when relevant."
   ].join("\n");
+}
+
+const TIME_AWARENESS_TRIGGER =
+  /\b(today|tomorrow|yesterday|next week|this week|date|time|timezone|calendar|meeting|deadline|schedule|quarter|month|year)\b/i;
+
+function shouldInjectTimeAwareness(input: {
+  prompt: string;
+  systemPrompt: string;
+  userPrompt: string;
+}) {
+  if (SWARM_ALWAYS_INCLUDE_TIME_CONTEXT) {
+    return true;
+  }
+  return TIME_AWARENESS_TRIGGER.test(
+    `${input.prompt}\n${input.systemPrompt}\n${input.userPrompt}`
+  );
+}
+
+function truncatePromptByTokenBudget(value: string, maxTokens: number) {
+  const maxChars = Math.max(120, maxTokens * 4);
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const trimmed = value.slice(0, Math.max(0, maxChars - 32)).trimEnd();
+  const omitted = Math.max(0, value.length - trimmed.length);
+  return `${trimmed}\n[TRUNCATED ${omitted} chars for prompt budget]`;
+}
+
+function applyPromptBudget(systemPrompt: string, userPrompt: string) {
+  const systemTrimmed = truncatePromptByTokenBudget(systemPrompt, Math.ceil(MAX_PROMPT_TOKENS * 0.45));
+  const systemTokens = estimateTokensFromText(systemTrimmed);
+
+  const remainingForUser = Math.max(
+    180,
+    Math.min(
+      MAX_PROMPT_TOKENS - systemTokens,
+      Math.floor((MAX_PROMPT_CHARS - systemTrimmed.length) / 4)
+    )
+  );
+  const userTrimmed = truncatePromptByTokenBudget(userPrompt, remainingForUser);
+  const userTokens = estimateTokensFromText(userTrimmed);
+
+  return {
+    systemPrompt: systemTrimmed,
+    userPrompt: userTrimmed,
+    estimatedPromptTokens: systemTokens + userTokens,
+    estimatedSystemTokens: systemTokens,
+    estimatedUserTokens: userTokens
+  };
+}
+
+async function acquireLlmSlot() {
+  if (SWARM_MAX_INFLIGHT <= 1) {
+    return;
+  }
+  if (inflightCalls < SWARM_MAX_INFLIGHT) {
+    inflightCalls += 1;
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let queued: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (queued) {
+        const index = inflightQueue.indexOf(queued);
+        if (index >= 0) {
+          inflightQueue.splice(index, 1);
+        }
+      }
+      reject(new Error("LLM concurrency queue timed out."));
+    }, SWARM_ACQUIRE_TIMEOUT_MS);
+
+    queued = () => {
+      clearTimeout(timer);
+      inflightCalls += 1;
+      resolve();
+    };
+
+    inflightQueue.push(queued);
+  });
+}
+
+function releaseLlmSlot() {
+  if (SWARM_MAX_INFLIGHT <= 1) {
+    return;
+  }
+  inflightCalls = Math.max(0, inflightCalls - 1);
+  const next = inflightQueue.shift();
+  if (next) {
+    next();
+  }
+}
+
+async function invokeProviderGuarded(
+  settings: BrainSettings,
+  system: string,
+  userPrompt: string,
+  maxOutputTokens: number
+) {
+  // Process-local guard only; distributed limiting should be handled at queue/worker layer.
+  await acquireLlmSlot();
+  try {
+    return await invokeProvider(settings, system, userPrompt, maxOutputTokens);
+  } finally {
+    releaseLlmSlot();
+  }
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 45_000) {
@@ -539,6 +739,112 @@ function normalizeOutputContent(value: unknown): string {
   return "";
 }
 
+function normalizeStopReason(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized || null;
+}
+
+function isTruncatedStopReason(stopReason: string | null) {
+  if (!stopReason) {
+    return false;
+  }
+  return (
+    stopReason === "length" ||
+    stopReason === "max_tokens" ||
+    stopReason === "max_output_tokens" ||
+    stopReason === "token_limit"
+  );
+}
+
+function looksAbruptlyCut(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return true;
+  }
+  if (/[.!?`'"]$/.test(trimmed)) {
+    return false;
+  }
+  if (/[,:;\-(]$/.test(trimmed)) {
+    return true;
+  }
+  const words = trimmed.split(/\s+/g).filter(Boolean);
+  if (words.length <= 3) {
+    return true;
+  }
+  const tail = words.slice(-2).join(" ").toLowerCase();
+  if (
+    /\b(and|or|to|for|with|from|as|because|if|then|that|which|who|while|when|where)$/.test(
+      tail
+    )
+  ) {
+    return true;
+  }
+  return words.length <= 8;
+}
+
+function resolveRetryMaxOutputTokens(current: number) {
+  const hardCeiling = Math.min(MAX_MAX_OUTPUT_TOKENS, GLOBAL_MAX_OUTPUT_TOKENS);
+  if (current >= hardCeiling) {
+    return current;
+  }
+  return Math.max(
+    current + 80,
+    Math.min(hardCeiling, Math.floor(current * 1.6))
+  );
+}
+
+async function invokeProviderWithCompletenessRetry(
+  settings: BrainSettings,
+  system: string,
+  userPrompt: string,
+  maxOutputTokens: number
+) {
+  const first = await invokeProviderGuarded(
+    settings,
+    system,
+    userPrompt,
+    maxOutputTokens
+  );
+  const firstNeedsRetry =
+    SWARM_RETRY_TRUNCATED_ONCE &&
+    maxOutputTokens < Math.min(MAX_MAX_OUTPUT_TOKENS, GLOBAL_MAX_OUTPUT_TOKENS) &&
+    (first.truncated || looksAbruptlyCut(first.text));
+
+  if (!firstNeedsRetry) {
+    return first;
+  }
+
+  const retryMaxOutputTokens = resolveRetryMaxOutputTokens(maxOutputTokens);
+  if (retryMaxOutputTokens <= maxOutputTokens) {
+    return {
+      ...first,
+      retryCount: 1
+    };
+  }
+
+  try {
+    const retried = await invokeProviderGuarded(
+      settings,
+      system,
+      userPrompt,
+      retryMaxOutputTokens
+    );
+    return {
+      ...retried,
+      retryCount: 1,
+      effectiveMaxOutputTokens: retryMaxOutputTokens
+    };
+  } catch {
+    return {
+      ...first,
+      retryCount: 1
+    };
+  }
+}
+
 async function callOpenAI(
   model: string,
   apiKey: string,
@@ -572,6 +878,7 @@ async function callOpenAI(
   const choices = Array.isArray(payload.choices) ? payload.choices : [];
   const first = choices[0] as Record<string, unknown> | undefined;
   const message = (first?.message as Record<string, unknown> | undefined) ?? {};
+  const stopReason = normalizeStopReason(first?.finish_reason);
   const content = normalizeOutputContent(message.content);
   if (!content) {
     throw new Error("OpenAI returned an empty response.");
@@ -598,7 +905,11 @@ async function callOpenAI(
 
   return {
     text: content,
-    usage
+    usage,
+    stopReason,
+    truncated: isTruncatedStopReason(stopReason),
+    retryCount: 0,
+    effectiveMaxOutputTokens: maxOutputTokens
   };
 }
 
@@ -636,6 +947,7 @@ async function callAnthropic(
   }
 
   const payload = (await response.json()) as Record<string, unknown>;
+  const stopReason = normalizeStopReason(payload.stop_reason);
   const content = normalizeOutputContent(payload.content);
   if (!content) {
     throw new Error("Anthropic returned an empty response.");
@@ -664,7 +976,11 @@ async function callAnthropic(
 
   return {
     text: content,
-    usage
+    usage,
+    stopReason,
+    truncated: isTruncatedStopReason(stopReason),
+    retryCount: 0,
+    effectiveMaxOutputTokens: maxOutputTokens
   };
 }
 
@@ -710,6 +1026,7 @@ async function callGemini(
   const payload = (await response.json()) as Record<string, unknown>;
   const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
   const first = candidates[0] as Record<string, unknown> | undefined;
+  const stopReason = normalizeStopReason(first?.finishReason ?? first?.finish_reason);
   const content = (first?.content as Record<string, unknown> | undefined) ?? {};
   const parts = Array.isArray(content.parts) ? content.parts : [];
   const text = parts
@@ -747,7 +1064,11 @@ async function callGemini(
 
   return {
     text,
-    usage
+    usage,
+    stopReason,
+    truncated: isTruncatedStopReason(stopReason),
+    retryCount: 0,
+    effectiveMaxOutputTokens: maxOutputTokens
   };
 }
 
@@ -874,11 +1195,21 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
     typeof input.systemPromptOverride === "string" && input.systemPromptOverride.trim().length > 0
       ? input.systemPromptOverride.trim()
       : buildSystemPrompt(input.agent.name, input.agent.role);
-  const system = [systemBase, buildTimeAwarenessContext(now)].join("\n\n");
-  const userPrompt =
+  const rawUserPrompt =
     typeof input.userPromptOverride === "string" && input.userPromptOverride.trim().length > 0
       ? input.userPromptOverride.trim()
       : buildUserPrompt(input.prompt, contextBlocks);
+  const timeAwarenessInjected = shouldInjectTimeAwareness({
+    prompt: input.prompt,
+    systemPrompt: systemBase,
+    userPrompt: rawUserPrompt
+  });
+  const rawSystem = timeAwarenessInjected
+    ? [systemBase, buildTimeAwarenessContext(now)].join("\n\n")
+    : systemBase;
+  const promptBudgeted = applyPromptBudget(rawSystem, rawUserPrompt);
+  const system = promptBudgeted.systemPrompt;
+  const userPrompt = promptBudgeted.userPrompt;
   const primary = resolvePrimarySettings(input);
   const fallback = resolveFallbackSettings(input);
   const preferredProviderRaw =
@@ -917,13 +1248,18 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           provider: primary.provider,
           model: primary.model,
           apiSource: primary.apiSource,
-          contextDigest
+          contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens
         }
       };
     }
 
     try {
-      const providerResult = await invokeProvider(
+      const providerResult = await invokeProviderWithCompletenessRetry(
         candidateFallback,
         system,
         userPrompt,
@@ -958,6 +1294,15 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           fallbackReason: "primary_api_key_missing",
           contextCount: contextBlocks.length,
           contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens,
+          effectiveMaxOutputTokens: providerResult.effectiveMaxOutputTokens,
+          providerStopReason: providerResult.stopReason,
+          outputTruncated: providerResult.truncated,
+          truncationRetryCount: providerResult.retryCount,
           tokenUsage: providerResult.usage,
           billing,
           outputPreview: outputText.slice(0, 1200),
@@ -982,8 +1327,13 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           fallbackUsed: true,
           fallbackSource: fallback ? "configured" : "emergency",
           fallbackReason: "primary_api_key_missing",
-          contextCount: input.contextBlocks.length,
+          contextCount: contextBlocks.length,
           contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens,
           error:
             fallbackError instanceof Error
               ? fallbackError.message
@@ -994,7 +1344,12 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
   }
 
   try {
-    const providerResult = await invokeProvider(primary, system, userPrompt, maxOutputTokens);
+    const providerResult = await invokeProviderWithCompletenessRetry(
+      primary,
+      system,
+      userPrompt,
+      maxOutputTokens
+    );
     const outputText = providerResult.text;
     const billing = computeBilling(
       primary.provider,
@@ -1022,6 +1377,15 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
         fallbackUsed: false,
         contextCount: contextBlocks.length,
         contextDigest,
+        estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+        estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+        estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+        timeAwarenessInjected,
+        maxOutputTokens,
+        effectiveMaxOutputTokens: providerResult.effectiveMaxOutputTokens,
+        providerStopReason: providerResult.stopReason,
+        outputTruncated: providerResult.truncated,
+        truncationRetryCount: providerResult.retryCount,
         tokenUsage: providerResult.usage,
         billing,
         outputPreview: outputText.slice(0, 1200),
@@ -1053,13 +1417,18 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
           fallbackUsed: false,
           contextCount: contextBlocks.length,
           contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens,
           error: primaryError instanceof Error ? primaryError.message : "Primary model call failed."
         }
       };
     }
 
     try {
-      const providerResult = await invokeProvider(
+      const providerResult = await invokeProviderWithCompletenessRetry(
         candidateFallback,
         system,
         userPrompt,
@@ -1095,6 +1464,15 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
             primaryError instanceof Error ? primaryError.message : "Primary model call failed.",
           contextCount: contextBlocks.length,
           contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens,
+          effectiveMaxOutputTokens: providerResult.effectiveMaxOutputTokens,
+          providerStopReason: providerResult.stopReason,
+          outputTruncated: providerResult.truncated,
+          truncationRetryCount: providerResult.retryCount,
           tokenUsage: providerResult.usage,
           billing,
           outputPreview: outputText.slice(0, 1200),
@@ -1120,6 +1498,11 @@ export async function executeSwarmAgent(input: AgentExecutionInput): Promise<Age
             fallbackError instanceof Error ? fallbackError.message : "Fallback model call failed.",
           contextCount: contextBlocks.length,
           contextDigest,
+          estimatedPromptTokens: promptBudgeted.estimatedPromptTokens,
+          estimatedSystemTokens: promptBudgeted.estimatedSystemTokens,
+          estimatedUserTokens: promptBudgeted.estimatedUserTokens,
+          timeAwarenessInjected,
+          maxOutputTokens,
           durationMs: Date.now() - startedAt
         }
       };

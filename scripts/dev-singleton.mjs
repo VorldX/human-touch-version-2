@@ -1,5 +1,15 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from "node:fs";
+import { delimiter, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import process from "node:process";
 import { createRequire } from "node:module";
@@ -11,6 +21,59 @@ const cleanScriptPath = resolve(process.cwd(), "scripts/clean-next.mjs");
 const prismaGenerateScriptPath = resolve(process.cwd(), "scripts/prisma-generate-safe.mjs");
 const nextBin = require.resolve("next/dist/bin/next");
 const isOneDriveWorkspace = /(^|[\\/])onedrive([\\/]|$)/i.test(process.cwd());
+
+function normalizePathForCompare(value) {
+  return value.replace(/^\\\\\?\\/, "").toLowerCase();
+}
+
+function appendNodePathEntry(existingValue, entry) {
+  const normalizedEntry = entry.trim();
+  if (!normalizedEntry) return existingValue || "";
+
+  const items = (existingValue || "")
+    .split(delimiter)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const hasEntry = items.some(
+    (item) => normalizePathForCompare(item) === normalizePathForCompare(normalizedEntry)
+  );
+  if (!hasEntry) {
+    items.unshift(normalizedEntry);
+  }
+  return items.join(delimiter);
+}
+
+function resolveExternalNextCacheRoot() {
+  const explicitBase = process.env.NEXT_WINDOWS_CACHE_BASE_DIR?.trim() || "";
+  const localAppData = process.env.LOCALAPPDATA?.trim() || "";
+  const tempBase = process.env.TEMP?.trim() || process.env.TMP?.trim() || "";
+  const basePath = explicitBase || localAppData || tempBase;
+
+  if (!basePath) {
+    return null;
+  }
+
+  const repoHash = createHash("sha1")
+    .update(process.cwd().toLowerCase())
+    .digest("hex")
+    .slice(0, 12);
+
+  return join(basePath, "vorldx-next-cache", repoHash);
+}
+
+function resolveExternalRelativeDistDir(externalCacheRoot) {
+  const externalDistAbsolute = join(externalCacheRoot, "dist");
+  mkdirSync(externalDistAbsolute, { recursive: true });
+
+  const relativeDist = relative(process.cwd(), externalDistAbsolute);
+  if (!relativeDist) {
+    return null;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(relativeDist)) {
+    return null;
+  }
+  return relativeDist;
+}
 
 function isRunningPid(pid) {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -66,24 +129,92 @@ removeLockIfMatches(existing?.pid ?? null);
 const devEnv = { ...process.env };
 
 if (!devEnv.NEXT_DIST_DIR && process.platform === "win32" && isOneDriveWorkspace) {
-  const cacheRootPath = resolve(process.cwd(), ".next-local-cache");
-  const cacheDistPath = resolve(cacheRootPath, "dist");
+  const externalCacheRoot = resolveExternalNextCacheRoot();
+  const localCacheRoot = resolve(process.cwd(), ".next-local-cache");
+  const localDistRelative = ".next-local-cache/dist";
+  const localDistAbsolute = resolve(process.cwd(), localDistRelative);
 
-  try {
-    if (existsSync(cacheRootPath)) {
-      const stat = lstatSync(cacheRootPath);
-      if (stat.isSymbolicLink()) {
-        rmSync(cacheRootPath, { recursive: true, force: true });
+  if (externalCacheRoot) {
+    try {
+      mkdirSync(externalCacheRoot, { recursive: true });
+
+      let recreateLink = true;
+      if (existsSync(localCacheRoot)) {
+        const stat = lstatSync(localCacheRoot);
+        if (stat.isSymbolicLink()) {
+          const linked = readlinkSync(localCacheRoot);
+          const resolvedLinked = resolve(process.cwd(), linked.replace(/^\\\\\?\\/, ""));
+          if (
+            normalizePathForCompare(resolvedLinked) ===
+            normalizePathForCompare(externalCacheRoot)
+          ) {
+            recreateLink = false;
+          } else {
+            rmSync(localCacheRoot, {
+              recursive: true,
+              force: true,
+              maxRetries: 6,
+              retryDelay: 180
+            });
+          }
+        } else {
+          rmSync(localCacheRoot, {
+            recursive: true,
+            force: true,
+            maxRetries: 6,
+            retryDelay: 180
+          });
+        }
+      }
+
+      if (recreateLink) {
+        symlinkSync(externalCacheRoot, localCacheRoot, "junction");
+      }
+
+      mkdirSync(localDistAbsolute, { recursive: true });
+      devEnv.NEXT_DIST_DIR = localDistRelative;
+      console.log(
+        `[dev-singleton] Using Next.js cache outside OneDrive at ${externalCacheRoot}`
+      );
+    } catch (error) {
+      console.warn(
+        "Failed to initialize external Next.js cache junction. Falling back to workspace cache path.",
+        error
+      );
+      try {
+        const externalRelativeDist = resolveExternalRelativeDistDir(externalCacheRoot);
+        if (externalRelativeDist) {
+          devEnv.NEXT_DIST_DIR = externalRelativeDist;
+          console.log(
+            `[dev-singleton] Using direct external Next.js cache at ${resolve(
+              process.cwd(),
+              externalRelativeDist
+            )}`
+          );
+        }
+      } catch {
+        // Continue to workspace fallback below.
       }
     }
-
-    mkdirSync(cacheDistPath, { recursive: true });
-  } catch (error) {
-    console.warn("Failed to initialize local Next.js cache path. Falling back to default .next.", error);
   }
 
-  if (existsSync(cacheDistPath)) {
-    devEnv.NEXT_DIST_DIR = ".next-local-cache/dist";
+  if (!devEnv.NEXT_DIST_DIR) {
+    try {
+      mkdirSync(localDistAbsolute, { recursive: true });
+      devEnv.NEXT_DIST_DIR = localDistRelative;
+      console.log(
+        `[dev-singleton] Using fallback Next.js cache at ${localDistAbsolute}`
+      );
+    } catch {
+      // Keep default ".next" behavior if cache bootstrap fails.
+    }
+  }
+
+  // Externalized dist paths execute compiled files outside repo root; ensure runtime
+  // still resolves project-local dependencies like "react" and "next/dist/compiled/*".
+  if (devEnv.NEXT_DIST_DIR) {
+    const projectNodeModules = resolve(process.cwd(), "node_modules");
+    devEnv.NODE_PATH = appendNodePathEntry(devEnv.NODE_PATH, projectNodeModules);
   }
 }
 

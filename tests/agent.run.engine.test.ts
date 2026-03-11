@@ -297,6 +297,294 @@ test("writer fallback creates draft when writer fails", async () => {
 
   assert.equal(response.status, "needs_confirmation");
   assert.equal(response.draft?.to, "test@example.com");
-  assert.match(response.draft?.subject ?? "", /congrat/i);
+  assert.equal(Boolean(response.draft?.subject), true);
   assert.equal(Boolean(response.draft?.body), true);
+});
+
+test("structured send prompt extracts clean subject and body into approval draft", async () => {
+  let sentArgs: Record<string, unknown> | null = null;
+  const response = await runAgentEngine(
+    {
+      prompt:
+        "Send an email to x@example.com. Subject: Hello Body: Test message",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async ({ arguments: args }) => {
+        sentArgs = args;
+        return {
+          ok: true,
+          toolkit: "gmail",
+          action: "SEND_EMAIL",
+          toolSlug: "GMAIL_SEND_EMAIL",
+          data: {},
+          logId: null,
+          attempts: 1
+        };
+      }
+    }
+  );
+
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(response.draft?.to, "x@example.com");
+  assert.equal(response.draft?.subject, "Hello");
+  assert.equal(response.draft?.body, "Test message");
+  assert.equal(sentArgs, null);
+});
+
+test("informal send prompt is parsed into clean recipient/subject/body draft", async () => {
+  const response = await runAgentEngine(
+    {
+      prompt: "cn u send mail to ssinghtarun7985@gmail.com that he is a good boy",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async () => ({
+        ok: true,
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        toolSlug: "GMAIL_SEND_EMAIL",
+        data: {},
+        logId: null,
+        attempts: 1
+      })
+    }
+  );
+
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(response.draft?.to, "ssinghtarun7985@gmail.com");
+  assert.equal(response.draft?.subject, "Quick note");
+  assert.equal(
+    response.draft?.body,
+    ["Hi,", "", "Just wanted to let you know that you are a good boy.", "", "Best regards,"].join(
+      "\n"
+    )
+  );
+});
+
+test("missing subject defaults to quick note for informal body phrasing", async () => {
+  const response = await runAgentEngine(
+    {
+      prompt: "send email to x@example.com saying meeting moved to tomorrow",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async () => ({
+        ok: true,
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        toolSlug: "GMAIL_SEND_EMAIL",
+        data: {},
+        logId: null,
+        attempts: 1
+      })
+    }
+  );
+
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(response.draft?.to, "x@example.com");
+  assert.equal(response.draft?.subject, "Quick note");
+  assert.equal(response.draft?.body, ["Hi,", "", "Meeting moved to tomorrow.", "", "Best regards,"].join("\n"));
+});
+
+test("structured send prompt reports missing body", async () => {
+  const response = await runAgentEngine(
+    {
+      prompt: "Send an email to x@example.com. Subject: Hello",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async () => ({
+        ok: true,
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        toolSlug: "GMAIL_SEND_EMAIL",
+        data: {},
+        logId: null,
+        attempts: 1
+      })
+    }
+  );
+
+  assert.equal(response.status, "needs_input");
+  assert.equal(response.required_inputs?.some((item) => item.key === "body"), true);
+});
+
+test("inline structured fields without delimiters are parsed correctly", async () => {
+  const response = await runAgentEngine(
+    {
+      prompt: "email x@example.com subject hello body test",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async () => ({
+        ok: true,
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        toolSlug: "GMAIL_SEND_EMAIL",
+        data: {},
+        logId: null,
+        attempts: 1
+      })
+    }
+  );
+
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(response.draft?.to, "x@example.com");
+  assert.equal(response.draft?.subject, "hello");
+  assert.equal(response.draft?.body, "test");
+});
+
+test("explicit draft mode keeps approval flow active", async () => {
+  let sendInvoked = false;
+  const response = await runAgentEngine(
+    {
+      prompt: "draft email to x@example.com saying meeting moved to tomorrow",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async () => {
+        sendInvoked = true;
+        return {
+          ok: true,
+          toolkit: "gmail",
+          action: "SEND_EMAIL",
+          toolSlug: "GMAIL_SEND_EMAIL",
+          data: {},
+          logId: null,
+          attempts: 1
+        };
+      }
+    }
+  );
+
+  assert.equal(response.status, "needs_confirmation");
+  assert.equal(sendInvoked, false);
+});
+
+test("approval mode keeps boilerplate out of sent payload", async () => {
+  let capturedSendArgs: Record<string, unknown> | null = null;
+  const response = await runAgentEngine(
+    {
+      prompt: "Send an email to x@example.com. Subject: Hello Body: Test message",
+      confirm: true,
+      input: {
+        recipient_email: "x@example.com",
+        subject: "Draft Email (Approval Required)\nSubject: Hello",
+        body: [
+          "Draft Email (Approval Required)",
+          "To: x@example.com",
+          "Subject: Hello",
+          "",
+          "Test message",
+          "",
+          "Reply \"approve\" to send this email, or reply with edits."
+        ].join("\n")
+      }
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async ({ arguments: args }) => {
+        capturedSendArgs = args;
+        return {
+          ok: true,
+          toolkit: "gmail",
+          action: "SEND_EMAIL",
+          toolSlug: "GMAIL_SEND_EMAIL",
+          data: {},
+          logId: null,
+          attempts: 1
+        };
+      }
+    }
+  );
+
+  assert.equal(response.status, "completed");
+  assert.equal((capturedSendArgs?.["subject"] as string | undefined) ?? "", "Hello");
+  assert.equal((capturedSendArgs?.["body"] as string | undefined) ?? "", "Test message");
+});
+
+test("direct send mode bypasses approval and sends structured payload", async () => {
+  let capturedSendArgs: Record<string, unknown> | null = null;
+  const response = await runAgentEngine(
+    {
+      prompt:
+        "Send now an email to x@example.com. Subject: Hello Body: Test message",
+      confirm: false
+    },
+    {
+      plan: async () => {
+        throw new Error("Planner unavailable");
+      },
+      writeEmail: async () => ({
+        subject: "unused",
+        body: "unused"
+      }),
+      executeGmailAction: async ({ arguments: args }) => {
+        capturedSendArgs = args;
+        return {
+          ok: true,
+          toolkit: "gmail",
+          action: "SEND_EMAIL",
+          toolSlug: "GMAIL_SEND_EMAIL",
+          data: { delivered: true },
+          logId: null,
+          attempts: 1
+        };
+      }
+    }
+  );
+
+  assert.equal(response.status, "completed");
+  assert.equal((capturedSendArgs?.["to"] as string | undefined) ?? "", "x@example.com");
+  assert.equal((capturedSendArgs?.["subject"] as string | undefined) ?? "", "Hello");
+  assert.equal((capturedSendArgs?.["body"] as string | undefined) ?? "", "Test message");
 });

@@ -57,6 +57,24 @@ export interface DelegationPolicyDecision {
 export interface AgentContextPack {
   summary: string;
   blocks: AgentContextBlock[];
+  selectionTrace?: {
+    budgetTokens: number;
+    usedTokens: number;
+    includedSections: Array<{
+      id: string;
+      name: string;
+      priority: number;
+      estimatedTokens: number;
+      reason: string;
+    }>;
+    omittedSections: Array<{
+      id: string;
+      name: string;
+      priority: number;
+      estimatedTokens: number;
+      reason: string;
+    }>;
+  };
   memoryHighlights: Array<{
     id: string;
     key: string;

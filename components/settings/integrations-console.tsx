@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import { ExternalLink, Link2, Loader2, RefreshCw, Search, Unplug, X } from "lucide-react";
 
 import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
@@ -177,11 +178,14 @@ function ToolkitIcon(props: {
 
   return (
     <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/35">
-      <img
+      <Image
+        loader={({ src: imageSource }) => imageSource}
         src={src}
         alt={`${props.toolkitName} icon`}
+        width={20}
+        height={20}
         className="h-5 w-5 object-contain"
-        loading="lazy"
+        unoptimized
         onError={() => setIndex((current) => current + 1)}
       />
     </div>

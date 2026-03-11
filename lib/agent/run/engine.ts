@@ -1,5 +1,10 @@
-import type { ExecuteAgentToolResult } from "@/lib/agent/tools/execute";
-import type { GmailPlannerOutput } from "@/lib/agent/prompts/gmailPlanner";
+import type { ExecuteAgentToolResult } from "../tools/execute.ts";
+import type { GmailPlannerOutput } from "../prompts/gmailPlanner.ts";
+import {
+  parseStructuredSendFields,
+  sanitizeEmailBody,
+  sanitizeEmailSubject
+} from "./email-request-parser.ts";
 
 export interface AgentRunResponse {
   status: "needs_input" | "needs_confirmation" | "completed" | "error";
@@ -55,6 +60,18 @@ interface EngineDependencies {
 
 const MAX_EMAIL_BODY_CHARS = 4000;
 
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+const AGENT_RUN_ENABLE_LLM_PLANNER = parseBooleanEnv("AGENT_RUN_ENABLE_LLM_PLANNER", false);
+const AGENT_RUN_ENABLE_LLM_WRITER = parseBooleanEnv("AGENT_RUN_ENABLE_LLM_WRITER", false);
+
 function asText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -74,6 +91,31 @@ function normalizeLimit(value: unknown, fallback = 10) {
 
 function isValidEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function isLikelyGmailPrompt(prompt: string, providedInput: Record<string, unknown>) {
+  const normalized = prompt.toLowerCase();
+  if (/\b(gmail|emails?|mail|inbox|messages?|reply|subject)\b/.test(normalized)) {
+    return true;
+  }
+
+  const signalFields = [
+    "recipient_email",
+    "to",
+    "subject",
+    "body",
+    "message_id",
+    "search_query",
+    "query"
+  ];
+  return signalFields.some((field) => Object.prototype.hasOwnProperty.call(providedInput, field));
+}
+
+function extractMeetingLink(prompt: string) {
+  const match = prompt.match(
+    /https?:\/\/(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|calendar\.google\.com)\/[^\s)]+/i
+  );
+  return match?.[0]?.trim() || "";
 }
 
 function pickEmailFromPrompt(prompt: string) {
@@ -100,20 +142,54 @@ function extractFromHint(prompt: string) {
   return match?.[1]?.trim() || "";
 }
 
+function summarizePromptForDraftBody(prompt: string) {
+  const compact = prompt.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  const stripped = compact
+    .replace(/^(?:please\s+|kindly\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|cn\s*u\s+)+/i, "")
+    .replace(/\b(send|compose|draft|write)\b/i, "")
+    .replace(/\b(?:an?\s+)?(?:gmail\s+)?(?:email|mail)\b/i, "")
+    .replace(/\bto\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i, "")
+    .replace(/\bsubject\s*[:\-][\s\S]*$/i, "")
+    .replace(/\b(?:body|message|content)\s*[:\-][\s\S]*$/i, "")
+    .replace(/^[\s,:;\-]+/, "")
+    .trim();
+  if (!stripped) return "";
+  return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+}
+
 function inferPlannerFallback(
   prompt: string,
   providedInput: Record<string, unknown>
 ): GmailPlannerOutput {
-  const lowered = prompt.toLowerCase();
   const args: Record<string, unknown> = { ...providedInput };
   const needs = new Set<string>();
+  const structuredSend = parseStructuredSendFields(prompt);
 
   const inferredRecipient =
     asText(providedInput.recipient_email) ||
     asText(providedInput.to) ||
-    pickEmailFromPrompt(prompt);
+    structuredSend.recipientEmail;
   if (inferredRecipient) {
     args.recipient_email = inferredRecipient;
+  }
+
+  const inferredSubject = asText(providedInput.subject) || structuredSend.subject;
+  if (inferredSubject) {
+    args.subject = inferredSubject;
+  }
+
+  const inferredBody = asText(providedInput.body) || structuredSend.body;
+  if (inferredBody) {
+    args.body = inferredBody;
+  }
+  const inferredCc = asText(providedInput.cc) || structuredSend.cc;
+  if (inferredCc) {
+    args.cc = inferredCc;
+  }
+  const inferredBcc = asText(providedInput.bcc) || structuredSend.bcc;
+  if (inferredBcc) {
+    args.bcc = inferredBcc;
   }
 
   const inferredLimit = extractLimitFromPrompt(prompt);
@@ -134,7 +210,8 @@ function inferPlannerFallback(
 
   const sendIntent =
     /\b(send|compose|draft|write)\b[\s\S]*\b(email|mail)\b/i.test(prompt) ||
-    /\bemail\b[\s\S]*\bto\b/i.test(prompt);
+    /\bemail\b[\s\S]*\bto\b/i.test(prompt) ||
+    /\b(?:email|mail)\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(prompt);
   const summarizeIntent =
     /\b(summarize|summary)\b[\s\S]*(email|mail|inbox|gmail)/i.test(prompt) ||
     /\b(last|latest)\s+\d{1,2}\s+emails?\b/i.test(prompt);
@@ -149,14 +226,23 @@ function inferPlannerFallback(
     if (!asText(args.recipient_email)) {
       needs.add("recipient_email");
     }
+    if (structuredSend.hasStructuredSubject && !asText(args.subject)) {
+      needs.add("subject");
+    }
+    if (structuredSend.hasStructuredBody && !asText(args.body)) {
+      needs.add("body");
+    }
+    const requiresConfirmation = structuredSend.sendMode !== "direct_send";
     return {
       intent: "send_email",
       needs: [...needs],
       args,
-      requires_confirmation: true,
+      requires_confirmation: requiresConfirmation,
       assistant_message: needs.size > 0
-        ? "I need recipient email before I can draft this message."
-        : "I drafted the email. Please confirm before sending."
+        ? "I need the required email fields before I can send this message."
+        : requiresConfirmation
+          ? "I drafted the email. Please confirm before sending."
+          : "I can send this email directly."
     };
   }
 
@@ -216,9 +302,16 @@ function buildDraftFallback(input: {
 }) {
   const normalizedPrompt = input.prompt.replace(/\s+/g, " ").trim();
   const recipientLabel = input.recipientName?.trim() || "there";
+  const meetingLink = extractMeetingLink(input.prompt);
+  const looksLikeMeetingShare =
+    /\b(meeting|invite|invitation|calendar|google meet|zoom|join link)\b/i.test(
+      normalizedPrompt
+    ) && /\b(send|share|email|mail)\b/i.test(normalizedPrompt);
 
-  let subject = "Quick update";
-  if (/\bcongrat/i.test(normalizedPrompt) && /\bwedding\b/i.test(normalizedPrompt)) {
+  let subject = "Quick note";
+  if (looksLikeMeetingShare) {
+    subject = "Meeting details";
+  } else if (/\bcongrat/i.test(normalizedPrompt) && /\bwedding\b/i.test(normalizedPrompt)) {
     subject = "Congratulations on your wedding";
   } else if (/\bcongrat/i.test(normalizedPrompt)) {
     subject = "Congratulations";
@@ -226,22 +319,55 @@ function buildDraftFallback(input: {
     subject = "Thank you";
   } else if (/\bmeeting\b/i.test(normalizedPrompt)) {
     subject = "Quick follow-up";
-  } else {
-    const compact = normalizedPrompt.slice(0, 56).trim();
-    if (compact) {
-      subject = `Regarding: ${compact}`;
-    }
   }
+
+  const summarizedPurpose = summarizePromptForDraftBody(input.prompt);
 
   const body = [
     `Hi ${recipientLabel},`,
     "",
-    normalizedPrompt || `I wanted to reach out to ${input.recipientEmail}.`,
+    looksLikeMeetingShare
+      ? "Sharing the meeting details below."
+      : summarizedPurpose || `I wanted to reach out to ${input.recipientEmail}.`,
+    looksLikeMeetingShare && meetingLink ? `Meeting link: ${meetingLink}` : "",
+    looksLikeMeetingShare ? "Please let me know if you need any changes." : "",
+    "",
+    "Best regards,"
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return { subject, body };
+}
+
+function buildReplyDraftFallback(input: {
+  prompt: string;
+  recipientEmail: string;
+  originalSubject?: string;
+}) {
+  const subjectBase = asText(input.originalSubject);
+  const subject = subjectBase
+    ? /^re:/i.test(subjectBase)
+      ? subjectBase
+      : `Re: ${subjectBase}`
+    : "Re: Quick follow-up";
+
+  const body = [
+    "Hi,",
+    "",
+    "Thanks for your email.",
+    "I will get back to you shortly.",
+    "",
+    `Context: ${input.prompt.slice(0, 220)}`,
     "",
     "Best regards,"
   ].join("\n");
 
-  return { subject, body };
+  return {
+    to: input.recipientEmail,
+    subject,
+    body
+  };
 }
 
 function isLikelyReplyIntent(prompt: string, args: Record<string, unknown>) {
@@ -266,6 +392,22 @@ function toRequiredInput(key: string) {
       label: "Search query",
       type: "text" as const,
       placeholder: "from:alice@example.com"
+    };
+  }
+  if (key === "subject") {
+    return {
+      key,
+      label: "Email subject",
+      type: "text" as const,
+      placeholder: "Project update"
+    };
+  }
+  if (key === "body") {
+    return {
+      key,
+      label: "Email body",
+      type: "text" as const,
+      placeholder: "Write the message you want to send"
     };
   }
   if (key === "message_id") {
@@ -363,20 +505,50 @@ export async function runAgentEngine(
   }
 
   const providedInput = asRecord(payload.input);
-  let planner: GmailPlannerOutput;
-  try {
-    planner = await deps.plan({ prompt, providedInput });
-  } catch {
-    planner = inferPlannerFallback(prompt, providedInput);
+  if (!isLikelyGmailPrompt(prompt, providedInput)) {
+    return {
+      status: "error",
+      assistant_message:
+        "This endpoint currently handles Gmail send, search, read, and summarize actions.",
+      error: {
+        code: "UNSUPPORTED_INTENT",
+        message: "Prompt does not look like a Gmail workflow request."
+      }
+    };
+  }
+
+  const deterministicPlanner = inferPlannerFallback(prompt, providedInput);
+  let planner: GmailPlannerOutput = deterministicPlanner;
+
+  if (AGENT_RUN_ENABLE_LLM_PLANNER && deterministicPlanner.intent === "unknown") {
+    try {
+      const llmPlanner = await deps.plan({ prompt, providedInput });
+      if (
+        llmPlanner.intent !== "unknown" ||
+        llmPlanner.needs.length > 0 ||
+        Object.keys(llmPlanner.args ?? {}).length > 0
+      ) {
+        planner = llmPlanner;
+      }
+    } catch {
+      planner = deterministicPlanner;
+    }
   }
 
   const args = mergeArgs(planner.args, providedInput);
   const actionsTaken: AgentRunResponse["actions_taken"] = [];
 
   if (planner.intent === "send_email") {
+    const structuredSend = parseStructuredSendFields(prompt);
     let recipientEmail =
-      asText(args.recipient_email) || asText(args.to) || pickEmailFromPrompt(prompt);
+      asText(args.recipient_email) ||
+      asText(args.to) ||
+      structuredSend.recipientEmail ||
+      pickEmailFromPrompt(prompt);
     const recipientName = asText(args.recipient_name) || asText(args.name);
+    const requiresConfirmation =
+      planner.requires_confirmation !== false &&
+      structuredSend.sendMode !== "direct_send";
 
     const missing = new Set<string>(planner.needs);
     if (!recipientEmail) {
@@ -402,38 +574,70 @@ export async function runAgentEngine(
     }
 
     const rawDraft = asRecord(args.draft);
-    let subject = asText(rawDraft.subject) || asText(args.subject);
-    let body = asText(rawDraft.body) || asText(args.body);
+    let subject = asText(rawDraft.subject) || asText(args.subject) || structuredSend.subject;
+    let body = asText(rawDraft.body) || asText(args.body) || structuredSend.body;
 
-    if (!subject || !body) {
-      try {
-        const generated = await deps.writeEmail({
-          prompt,
-          recipientEmail,
-          ...(recipientName ? { recipientName } : {}),
-          ...(asText(args.context) ? { extraContext: asText(args.context) } : {})
-        });
-        subject = asText(generated.subject);
-        body = asText(generated.body);
-      } catch {
+    const missingStructuredFields = new Set<string>();
+    if (structuredSend.hasStructuredSubject && !subject) {
+      missingStructuredFields.add("subject");
+    }
+    if (structuredSend.hasStructuredBody && !body) {
+      missingStructuredFields.add("body");
+    }
+    if (missingStructuredFields.size > 0) {
+      return {
+        status: "needs_input",
+        assistant_message: "Please provide the missing structured email fields before sending.",
+        required_inputs: [...missingStructuredFields].map(toRequiredInput)
+      };
+    }
+
+    const shouldGenerateBody = !body && !structuredSend.hasStructuredSignal;
+    if (shouldGenerateBody) {
+      if (AGENT_RUN_ENABLE_LLM_WRITER) {
+        try {
+          const generated = await deps.writeEmail({
+            prompt,
+            recipientEmail,
+            ...(recipientName ? { recipientName } : {}),
+            ...(asText(args.context) ? { extraContext: asText(args.context) } : {})
+          });
+          if (!subject) {
+            subject = asText(generated.subject);
+          }
+          if (!body) {
+            body = asText(generated.body);
+          }
+        } catch {
+          // Deterministic fallback below.
+        }
+      }
+      if (!body) {
         const fallbackDraft = buildDraftFallback({
           prompt,
           recipientEmail,
           ...(recipientName ? { recipientName } : {})
         });
-        subject = asText(fallbackDraft.subject);
+        if (!subject) {
+          subject = asText(fallbackDraft.subject);
+        }
         body = asText(fallbackDraft.body);
       }
     }
 
-    if (!subject || !body) {
+    subject = sanitizeEmailSubject(subject);
+    if (!subject) {
+      subject = "Quick note";
+    }
+    body = sanitizeEmailBody(body);
+
+    if (!body) {
       return {
-        status: "error",
-        assistant_message: "Draft generation failed because subject/body are empty.",
-        error: {
-          code: "INVALID_DRAFT",
-          message: "Email subject and body are required."
-        }
+        status: "needs_input",
+        assistant_message: "Email body is required before sending.",
+        required_inputs: [
+          ...(!body ? [toRequiredInput("body")] : [])
+        ]
       };
     }
 
@@ -448,7 +652,7 @@ export async function runAgentEngine(
       };
     }
 
-    if (payload.confirm !== true) {
+    if (requiresConfirmation && payload.confirm !== true) {
       return {
         status: "needs_confirmation",
         assistant_message:
@@ -471,48 +675,76 @@ export async function runAgentEngine(
       };
     }
 
-    const confirmDraftInput = asRecord(providedInput.draft);
-    const confirmRecipient =
-      asText(providedInput.recipient_email) ||
-      asText(providedInput.to) ||
-      asText(confirmDraftInput.to);
-    const confirmSubject = asText(providedInput.subject) || asText(confirmDraftInput.subject);
-    const confirmBody = asText(providedInput.body) || asText(confirmDraftInput.body);
+    if (payload.confirm === true && requiresConfirmation) {
+      const confirmDraftInput = asRecord(providedInput.draft);
+      const confirmRecipient =
+        asText(providedInput.recipient_email) ||
+        asText(providedInput.to) ||
+        asText(confirmDraftInput.to);
+      const confirmSubjectRaw =
+        asText(providedInput.subject) || asText(confirmDraftInput.subject);
+      const confirmBodyRaw = asText(providedInput.body) || asText(confirmDraftInput.body);
+      const confirmSubject = sanitizeEmailSubject(confirmSubjectRaw);
+      const confirmBody = sanitizeEmailBody(confirmBodyRaw);
 
-    if (!confirmRecipient || !confirmSubject || !confirmBody) {
-      return {
-        status: "needs_confirmation",
-        assistant_message:
-          "Approval requires reviewing the draft preview first. Please approve the visible draft to send.",
-        draft: {
-          to: recipientEmail,
-          subject,
-          body
-        },
-        actions_taken: [
-          {
-            type: "draft_created",
-            meta: {
-              to: recipientEmail,
-              subjectLength: subject.length,
-              bodyLength: body.length
+      if (!confirmRecipient || !confirmSubject || !confirmBody) {
+        return {
+          status: "needs_confirmation",
+          assistant_message:
+            "Approval requires reviewing the draft preview first. Please approve the visible draft to send.",
+          draft: {
+            to: recipientEmail,
+            subject,
+            body
+          },
+          actions_taken: [
+            {
+              type: "draft_created",
+              meta: {
+                to: recipientEmail,
+                subjectLength: subject.length,
+                bodyLength: body.length
+              }
             }
-          }
-        ]
-      };
+          ]
+        };
+      }
+
+      if (!isValidEmail(confirmRecipient)) {
+        return {
+          status: "needs_input",
+          assistant_message: "Please provide a valid recipient email address.",
+          required_inputs: [toRequiredInput("recipient_email")]
+        };
+      }
+
+      recipientEmail = confirmRecipient;
+      subject = confirmSubject;
+      body = confirmBody;
     }
 
-    if (!isValidEmail(confirmRecipient)) {
-      return {
-        status: "needs_input",
-        assistant_message: "Please provide a valid recipient email address.",
-        required_inputs: [toRequiredInput("recipient_email")]
-      };
-    }
+    if (payload.confirm === true && !requiresConfirmation) {
+      const confirmDraftInput = asRecord(providedInput.draft);
+      const confirmRecipient =
+        asText(providedInput.recipient_email) ||
+        asText(providedInput.to) ||
+        asText(confirmDraftInput.to);
+      const confirmSubjectRaw =
+        asText(providedInput.subject) || asText(confirmDraftInput.subject);
+      const confirmBodyRaw = asText(providedInput.body) || asText(confirmDraftInput.body);
+      const confirmSubject = sanitizeEmailSubject(confirmSubjectRaw);
+      const confirmBody = sanitizeEmailBody(confirmBodyRaw);
 
-    recipientEmail = confirmRecipient;
-    subject = confirmSubject;
-    body = confirmBody;
+      if (confirmRecipient && isValidEmail(confirmRecipient)) {
+        recipientEmail = confirmRecipient;
+      }
+      if (confirmSubject) {
+        subject = confirmSubject;
+      }
+      if (confirmBody) {
+        body = confirmBody;
+      }
+    }
 
     if (body.length > MAX_EMAIL_BODY_CHARS) {
       return {
@@ -531,8 +763,12 @@ export async function runAgentEngine(
         to: recipientEmail,
         subject,
         body,
-        ...(asText(args.cc) ? { cc: asText(args.cc) } : {}),
-        ...(asText(args.bcc) ? { bcc: asText(args.bcc) } : {})
+        ...(asText(args.cc) || structuredSend.cc
+          ? { cc: asText(args.cc) || structuredSend.cc }
+          : {}),
+        ...(asText(args.bcc) || structuredSend.bcc
+          ? { bcc: asText(args.bcc) || structuredSend.bcc }
+          : {})
       }
     });
 
@@ -723,21 +959,41 @@ export async function runAgentEngine(
         };
       }
 
-      const emailContext = stringifyPreview(read.data.email);
-      const replyDraft = await deps.writeEmail({
-        prompt: `Draft a reply to this email:\n${emailContext}\n\nUser request: ${prompt}`,
-        recipientEmail: to,
-        ...(asText(emailRecord.from) ? { recipientName: asText(emailRecord.from) } : {}),
-        extraContext: "This is a reply draft. Keep it concise and context-aware."
-      });
+      let replySubject = "";
+      let replyBody = "";
+      if (AGENT_RUN_ENABLE_LLM_WRITER) {
+        try {
+          const emailContext = stringifyPreview(read.data.email);
+          const replyDraft = await deps.writeEmail({
+            prompt: `Draft a reply to this email:\n${emailContext}\n\nUser request: ${prompt}`,
+            recipientEmail: to,
+            ...(asText(emailRecord.from) ? { recipientName: asText(emailRecord.from) } : {}),
+            extraContext: "This is a reply draft. Keep it concise and context-aware."
+          });
+          replySubject = asText(replyDraft.subject);
+          replyBody = asText(replyDraft.body);
+        } catch {
+          // Deterministic fallback below.
+        }
+      }
+
+      if (!replySubject || !replyBody) {
+        const fallbackReply = buildReplyDraftFallback({
+          prompt,
+          recipientEmail: to,
+          originalSubject: asText(emailRecord.subject)
+        });
+        replySubject = fallbackReply.subject;
+        replyBody = fallbackReply.body;
+      }
 
       return {
         status: "completed",
         assistant_message: "I drafted a reply based on the latest matching email.",
         draft: {
           to,
-          subject: asText(replyDraft.subject),
-          body: asText(replyDraft.body)
+          subject: replySubject,
+          body: replyBody
         },
         actions_taken: actionsTaken
       };

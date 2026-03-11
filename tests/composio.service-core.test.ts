@@ -38,6 +38,17 @@ function createStore() {
           )
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       },
+      async listByOrg(input: { orgId: string; provider: string; toolkits?: string[] }) {
+        const requestedToolkits = (input.toolkits ?? []).map((toolkit) => toolkit.toLowerCase());
+        return [...records.values()]
+          .filter((record) => {
+            if (record.provider !== input.provider) return false;
+            if (record.orgId !== input.orgId) return false;
+            if (requestedToolkits.length === 0) return true;
+            return requestedToolkits.includes(record.toolkit.toLowerCase());
+          })
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      },
       async findByConnection(input: {
         userId: string;
         provider: string;
@@ -140,7 +151,12 @@ function createMockClient() {
           description: "Send an email",
           toolkit: { slug: "gmail" }
         }
-      ]
+      ],
+      execute: async () => ({
+        successful: true,
+        data: { ok: true },
+        logId: "log_mock_1"
+      })
     }
   };
   return client;
@@ -200,6 +216,41 @@ test("getToolsForAgent returns INTEGRATION_NOT_CONNECTED when toolkit missing", 
   assert.equal(result.error?.toolkit, "gmail");
 });
 
+test("getToolsForAgent uses org fallback connection when actor user has no direct integration", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-2",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_shared_gmail",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  const core = new ComposioServiceCore({
+    enabled: false,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => createMockClient(),
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`,
+    allowOrgToolkitFallback: true
+  });
+
+  const result = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+
+  assert.equal(result.ok, true);
+});
+
 test("getToolsForAgent returns tool bindings when connection is active", async () => {
   const store = createStore();
   await store.adapter.upsertByConnection({
@@ -245,6 +296,434 @@ test("getToolsForAgent returns tool bindings when connection is active", async (
   assert.equal(result.ok, true);
   assert.equal(result.bindings.length, 1);
   assert.equal(result.bindings[0]?.slug, "GMAIL_SEND_EMAIL");
+});
+
+test("getToolsForAgent treats SUCCESS status as connected", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_success",
+    status: "SUCCESS",
+    metadata: {}
+  });
+
+  const core = new ComposioServiceCore({
+    enabled: false,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => createMockClient(),
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`
+  });
+
+  const result = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+
+  assert.equal(result.ok, true);
+});
+
+test("getToolsForAgent resolves gmeet/googlemeet aliases", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmeet",
+    connectionId: "conn_gmeet",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  const core = new ComposioServiceCore({
+    enabled: false,
+    provider: "composio",
+    allowlistedToolkits: ["gmeet", "gmail"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => createMockClient(),
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`
+  });
+
+  const result = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["googlemeet"],
+    action: "TASK_EXECUTION"
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.requestedToolkits, ["gmeet"]);
+});
+
+test("getConnections falls back to stored records when remote listing is unavailable", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_123",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  let remoteListCalls = 0;
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => {
+    remoteListCalls += 1;
+    throw new Error("remote unavailable");
+  };
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`,
+    connectionCacheTtlMs: 60_000
+  });
+
+  const first = await core.getConnections({
+    userId: "user-1",
+    orgId: "org-1"
+  });
+  const second = await core.getConnections({
+    userId: "user-1",
+    orgId: "org-1"
+  });
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+  assert.equal(first[0]?.connectionId, "conn_123");
+  assert.equal(remoteListCalls, 1);
+});
+
+test("getConnections reconciles stale local ACTIVE rows when remote account is missing", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_stale",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => ({
+    items: []
+  });
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`
+  });
+
+  const reconciled = await core.getConnections({
+    userId: "user-1",
+    orgId: "org-1"
+  });
+
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0]?.connectionId, "conn_stale");
+  assert.equal(reconciled[0]?.status, "DISCONNECTED");
+});
+
+test("getToolsForAgent reuses cached catalog within ttl", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_123",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  let toolCatalogCalls = 0;
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => ({
+    items: [{ id: "conn_123", status: "ACTIVE", toolkit: { slug: "gmail" } }]
+  });
+  mockClient.tools.getRawComposioTools = async () => {
+    toolCatalogCalls += 1;
+    return [
+      {
+        slug: "GMAIL_SEND_EMAIL",
+        name: "Send Gmail",
+        description: "Send an email",
+        toolkit: { slug: "gmail" }
+      }
+    ];
+  };
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`,
+    toolCatalogCacheTtlMs: 60_000
+  });
+
+  const first = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+  const second = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(second.bindings.length, 1);
+  assert.equal(toolCatalogCalls, 1);
+});
+
+test("getToolsForAgent falls back to stale catalog when refresh fails", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_123",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  let nowMs = 1_000;
+  let toolCatalogCalls = 0;
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => ({
+    items: [{ id: "conn_123", status: "ACTIVE", toolkit: { slug: "gmail" } }]
+  });
+  mockClient.tools.getRawComposioTools = async () => {
+    toolCatalogCalls += 1;
+    if (toolCatalogCalls === 1) {
+      return [
+        {
+          slug: "GMAIL_SEND_EMAIL",
+          name: "Send Gmail",
+          description: "Send an email",
+          toolkit: { slug: "gmail" }
+        }
+      ];
+    }
+    throw new Error("catalog temporarily unavailable");
+  };
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`,
+    now: () => nowMs,
+    toolCatalogCacheTtlMs: 1
+  });
+
+  const first = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.bindings.length, 1);
+
+  nowMs = 5_000;
+  const second = await core.getToolsForAgent({
+    userId: "user-1",
+    orgId: "org-1",
+    requestedToolkits: ["gmail"],
+    action: "TASK_EXECUTION"
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.bindings.length, 1);
+  assert.equal(toolCatalogCalls, 2);
+});
+
+test("disconnectConnection succeeds when remote account is already missing", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_123",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.delete = async () => {
+    const error: Error & { status?: number } = new Error("Connected account not found");
+    error.status = 404;
+    throw error;
+  };
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`
+  });
+
+  const disconnected = await core.disconnectConnection({
+    userId: "user-1",
+    orgId: "org-1",
+    connectionId: "conn_123"
+  });
+
+  assert.ok(disconnected);
+  assert.equal(disconnected?.status, "DISCONNECTED");
+  assert.equal(disconnected?.connectionId, "conn_123");
+});
+
+test("executeToolAction accepts connected-account SUCCESS status from remote sync", async () => {
+  const store = createStore();
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => ({
+    items: [
+      {
+        id: "conn_success_exec",
+        status: "SUCCESS",
+        toolkit: { slug: "gmail" }
+      }
+    ]
+  });
+  mockClient.tools.execute = async (_slug: string) => ({
+    successful: true,
+    data: { sent: true },
+    logId: "log_exec_success"
+  });
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`
+  });
+
+  const result = await core.executeToolAction({
+    userId: "user-1",
+    orgId: "org-1",
+    toolkit: "gmail",
+    toolSlug: "GMAIL_SEND_EMAIL",
+    action: "SEND_EMAIL",
+    arguments: { to: "a@example.com" }
+  });
+
+  assert.equal(result.successful, true);
+  assert.equal(result.logId, "log_exec_success");
+});
+
+test("executeToolAction uses org fallback owner when actor user has no direct connection", async () => {
+  const store = createStore();
+  await store.adapter.upsertByConnection({
+    userId: "owner-user",
+    orgId: "org-1",
+    provider: "composio",
+    toolkit: "gmail",
+    connectionId: "conn_shared_fallback",
+    status: "ACTIVE",
+    metadata: {}
+  });
+
+  let executedUserId = "";
+  let executedConnectionId = "";
+  const mockClient = createMockClient();
+  mockClient.connectedAccounts.list = async () => ({
+    items: []
+  });
+  mockClient.tools.execute = async (
+    _slug: string,
+    body: { userId: string; connectedAccountId: string }
+  ) => {
+    executedUserId = body.userId;
+    executedConnectionId = body.connectedAccountId;
+    return {
+      successful: true,
+      data: { ok: true },
+      logId: "log_exec_fallback"
+    };
+  };
+
+  const core = new ComposioServiceCore({
+    enabled: true,
+    provider: "composio",
+    allowlistedToolkits: ["gmail", "slack"],
+    callbackUrl: "http://localhost:3001/api/integrations/composio/oauth/callback",
+    createClient: () => mockClient,
+    store: store.adapter,
+    createStateToken: () => "signed-state",
+    verifyStateToken: () => null,
+    connectUrlForToolkit: (toolkit: string) => `/app?toolkit=${toolkit}`,
+    allowOrgToolkitFallback: true
+  });
+
+  const result = await core.executeToolAction({
+    userId: "session-user",
+    orgId: "org-1",
+    toolkit: "gmail",
+    toolSlug: "GMAIL_SEND_EMAIL",
+    action: "SEND_EMAIL",
+    arguments: { to: "a@example.com", subject: "Hi", body: "Hello" }
+  });
+
+  assert.equal(result.successful, true);
+  assert.equal(executedUserId, "ht-user-owner-user");
+  assert.equal(executedConnectionId, "conn_shared_fallback");
 });
 
 test("listAvailableToolkits includes app launch URL for popup embedding", async () => {
@@ -349,4 +828,40 @@ test("inferRequestedToolkits maps Google Meet signals without duplicate meet too
   );
 
   assert.deepEqual([...inferred].sort(), ["googlemeet"].sort());
+});
+
+test("inferRequestedToolkits detects setup-meeting plus details-email workflows", () => {
+  const inferred = inferRequestedToolkits(
+    "Setup meeting and send meeting details to singhtrun7985@gmail.com",
+    ["gmail", "googlemeet", "googlecalendar", "gmeet"]
+  );
+
+  assert.deepEqual(
+    [...inferred].sort(),
+    ["gmail", "googlecalendar", "googlemeet"].sort()
+  );
+});
+
+test("inferRequestedToolkits does not force whatsapp for plain meeting scheduling", () => {
+  const inferred = inferRequestedToolkits(
+    "Can you schedule meeting on Google Meet and share me details",
+    ["gmail", "whatsapp", "googlemeet", "googlecalendar", "gmeet"]
+  );
+
+  assert.deepEqual(
+    [...inferred].sort(),
+    ["googlecalendar", "googlemeet"].sort()
+  );
+});
+
+test("inferRequestedToolkits includes whatsapp for explicit phone notification intent", () => {
+  const inferred = inferRequestedToolkits(
+    "Create a meeting and send WhatsApp update to +91 98765 43210",
+    ["whatsapp", "googlemeet", "googlecalendar", "gmeet"]
+  );
+
+  assert.deepEqual(
+    [...inferred].sort(),
+    ["googlecalendar", "googlemeet", "whatsapp"].sort()
+  );
 });

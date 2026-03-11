@@ -42,22 +42,19 @@ export function buildEmailWriterPrompt(input: {
   extraContext?: string;
 }) {
   const systemPrompt = [
-    "You draft concise Gmail messages.",
-    "Return ONLY valid JSON with this schema:",
-    '{ "subject": string, "body": string }',
-    "Rules:",
-    "1) Keep tone friendly and professional.",
-    "2) Subject max 120 chars.",
-    "3) Body should be concise and clear.",
-    "4) Do not include signatures unless asked."
+    "Draft concise Gmail messages.",
+    'Return JSON only: {"subject":"","body":""}',
+    "Friendly professional tone.",
+    "Subject <= 120 chars.",
+    "No signature unless asked."
   ].join("\n");
 
   const userPrompt = [
-    `Original request: ${input.userPrompt}`,
-    `Recipient email: ${input.recipientEmail}`,
-    `Recipient name: ${input.recipientName?.trim() || "Unknown"}`,
-    `Extra context: ${input.extraContext?.trim() || "None"}`,
-    "Return JSON now."
+    `Request: ${input.userPrompt}`,
+    `To: ${input.recipientEmail}`,
+    `Name: ${input.recipientName?.trim() || "Unknown"}`,
+    `Context: ${input.extraContext?.trim() || "None"}`,
+    "JSON:"
   ].join("\n");
 
   return { systemPrompt, userPrompt };

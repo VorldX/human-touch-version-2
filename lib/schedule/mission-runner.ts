@@ -75,6 +75,22 @@ export async function runMissionSchedule(
 
   let response: Response;
   try {
+    const approvalUserIds =
+      schedule.approvalUserIds?.length > 0
+        ? schedule.approvalUserIds
+        : schedule.createdByUserId
+          ? [schedule.createdByUserId]
+          : [];
+
+    if (approvalUserIds.length < schedule.requiredSignatures) {
+      return {
+        ok: false,
+        status: 412,
+        message:
+          "Scheduled launch blocked: approvalUserIds must include at least requiredSignatures users."
+      };
+    }
+
     response = await fetch(`${input.origin}/api/flows`, {
       method: "POST",
       headers: {
@@ -88,7 +104,7 @@ export async function runMissionSchedule(
         swarmDensity: schedule.swarmDensity,
         predictedBurn: schedule.predictedBurn,
         requiredSignatures: schedule.requiredSignatures,
-        approvalsProvided: schedule.requiredSignatures
+        approvalUserIds
       }),
       cache: "no-store"
     });

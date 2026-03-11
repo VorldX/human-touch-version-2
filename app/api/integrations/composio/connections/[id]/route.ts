@@ -40,13 +40,11 @@ export async function DELETE(request: NextRequest, { params }: Params) {
     });
 
     if (!disconnected) {
-      return NextResponse.json(
-        {
-          ok: false,
-          message: "Connection not found."
-        },
-        { status: 404 }
-      );
+      return NextResponse.json({
+        ok: true,
+        alreadyDisconnected: true,
+        connectionId
+      });
     }
 
     return NextResponse.json({

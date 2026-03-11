@@ -6,6 +6,29 @@ import { extname, join, posix, resolve, sep } from "node:path";
 
 const PUBLIC_ROOT = join(process.cwd(), "public");
 const UPLOAD_ROOT = join(PUBLIC_ROOT, "uploads");
+const DEFAULT_UPLOAD_MAX_BYTES = 15 * 1024 * 1024; // 15 MB
+
+function resolveUploadMaxBytes() {
+  const raw = Number(process.env.HUB_UPLOAD_MAX_BYTES ?? DEFAULT_UPLOAD_MAX_BYTES);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_UPLOAD_MAX_BYTES;
+  }
+  return Math.floor(raw);
+}
+
+export const HUB_UPLOAD_MAX_BYTES = resolveUploadMaxBytes();
+
+export class UploadTooLargeError extends Error {
+  readonly sizeBytes: number;
+  readonly maxBytes: number;
+
+  constructor(sizeBytes: number, maxBytes: number) {
+    super(`Upload exceeds maximum allowed size (${sizeBytes} > ${maxBytes} bytes).`);
+    this.name = "UploadTooLargeError";
+    this.sizeBytes = sizeBytes;
+    this.maxBytes = maxBytes;
+  }
+}
 
 function cleanSegment(input: string) {
   return input.replace(/[^a-zA-Z0-9_-]/g, "");
@@ -15,6 +38,10 @@ export async function persistUploadLocal(input: {
   orgId: string;
   file: File;
 }) {
+  if (input.file.size > HUB_UPLOAD_MAX_BYTES) {
+    throw new UploadTooLargeError(input.file.size, HUB_UPLOAD_MAX_BYTES);
+  }
+
   const orgSegment = cleanSegment(input.orgId);
   const extension = extname(input.file.name).slice(0, 10) || ".bin";
   const fileName = `${Date.now()}-${randomUUID().slice(0, 8)}${extension}`;

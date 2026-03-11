@@ -13,6 +13,8 @@ export interface MissionSchedule {
   title: string;
   direction: string;
   directionId?: string;
+  createdByUserId?: string;
+  approvalUserIds: string[];
   cadence: MissionCadence;
   nextRunAt: string;
   timezone: string;
@@ -29,6 +31,8 @@ interface CreateMissionScheduleInput {
   title: string;
   direction: string;
   directionId?: string;
+  createdByUserId?: string;
+  approvalUserIds?: string[];
   cadence: MissionCadence;
   nextRunAt: string;
   timezone?: string;
@@ -42,6 +46,7 @@ interface UpdateMissionScheduleInput {
   title?: string;
   direction?: string;
   directionId?: string;
+  approvalUserIds?: string[];
   cadence?: MissionCadence;
   nextRunAt?: string;
   timezone?: string;
@@ -73,6 +78,16 @@ function clampInt(value: unknown, fallback: number, min = 1, max = 1_000_000) {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
+function normalizeUserIdList(value: unknown, limit = 16) {
+  if (!Array.isArray(value)) {
+    return [] as string[];
+  }
+  const normalized = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+  return [...new Set(normalized)].slice(0, limit);
+}
+
 function normalizeTimestamp(value: unknown, fallback: Date) {
   if (typeof value !== "string") return fallback.toISOString();
   const parsed = new Date(value);
@@ -88,6 +103,10 @@ function parseSchedule(value: unknown): MissionSchedule {
     title: typeof record.title === "string" ? record.title : "Scheduled Mission",
     direction: typeof record.direction === "string" ? record.direction : "",
     ...(typeof record.directionId === "string" ? { directionId: record.directionId } : {}),
+    ...(typeof record.createdByUserId === "string"
+      ? { createdByUserId: record.createdByUserId }
+      : {}),
+    approvalUserIds: normalizeUserIdList(record.approvalUserIds),
     cadence: normalizeCadence(record.cadence),
     nextRunAt: normalizeTimestamp(record.nextRunAt, now),
     timezone: typeof record.timezone === "string" ? record.timezone : "UTC",
@@ -177,11 +196,22 @@ export async function getMissionSchedule(orgId: string, scheduleId: string) {
 
 export async function createMissionSchedule(orgId: string, input: CreateMissionScheduleInput) {
   const now = new Date().toISOString();
+  const createdByUserId = input.createdByUserId?.trim() || undefined;
+  const approvalUserIds = normalizeUserIdList(input.approvalUserIds);
+  const resolvedApprovalUserIds =
+    approvalUserIds.length > 0
+      ? approvalUserIds
+      : createdByUserId
+        ? [createdByUserId]
+        : [];
+
   const schedule: MissionSchedule = {
     id: randomUUID(),
     title: input.title.trim() || "Scheduled Mission",
     direction: input.direction.trim(),
     ...(input.directionId?.trim() ? { directionId: input.directionId.trim() } : {}),
+    ...(createdByUserId ? { createdByUserId } : {}),
+    approvalUserIds: resolvedApprovalUserIds,
     cadence: normalizeCadence(input.cadence),
     nextRunAt: normalizeTimestamp(input.nextRunAt, new Date()),
     timezone: input.timezone?.trim() || "UTC",
@@ -232,6 +262,9 @@ export async function updateMissionSchedule(
       : {}),
     ...(typeof patch.directionId === "string"
       ? { directionId: patch.directionId.trim() || undefined }
+      : {}),
+    ...(patch.approvalUserIds !== undefined
+      ? { approvalUserIds: normalizeUserIdList(patch.approvalUserIds) }
       : {}),
     ...(patch.cadence ? { cadence: normalizeCadence(patch.cadence) } : {}),
     ...(typeof patch.nextRunAt === "string"

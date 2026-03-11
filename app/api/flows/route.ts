@@ -26,7 +26,12 @@ import {
   inferRequestedToolkits
 } from "@/lib/integrations/composio/service";
 import { publishInngestEvent } from "@/lib/inngest/publish";
+import { getPlan } from "@/lib/plans/plans";
 import { publishRealtimeEvent } from "@/lib/realtime/publish";
+import {
+  listOrgPermissionRequests,
+  type PermissionRequestRecord
+} from "@/lib/requests/permission-requests";
 import { buildInternalApiHeaders } from "@/lib/security/internal-api";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
@@ -36,12 +41,26 @@ interface LaunchFlowRequest {
   directionId?: string;
   planId?: string;
   fallbackPlanId?: string;
+  planWorkflows?: unknown;
   executionMode?: "ECO" | "BALANCED" | "TURBO";
   swarmDensity?: number;
   predictedBurn?: number;
   requiredSignatures?: number;
-  approvalsProvided?: number;
+  approvalUserIds?: string[];
   requestedToolkits?: string[];
+  permissionRequestIds?: string[];
+}
+
+interface LaunchPlanTaskInput {
+  title: string;
+  subtasks: string[];
+  tools: string[];
+}
+
+interface LaunchPlanWorkflowInput {
+  title: string;
+  goal: string;
+  tasks: LaunchPlanTaskInput[];
 }
 
 function asPositiveInt(value: unknown): number | null {
@@ -69,8 +88,135 @@ function parseRequestedToolkits(value: unknown) {
   return [...new Set(parsed)];
 }
 
+function asRecord(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {} as Record<string, unknown>;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeTextList(value: unknown, limit: number) {
+  if (!Array.isArray(value)) {
+    return [] as string[];
+  }
+  return value
+    .map((item) => compactText(typeof item === "string" ? item : ""))
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function parseStringList(value: unknown, limit: number) {
+  if (!Array.isArray(value)) {
+    return [] as string[];
+  }
+
+  const normalized = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+
+  return [...new Set(normalized)].slice(0, limit);
+}
+
+async function validateOrgMemberUserIds(input: {
+  orgId: string;
+  userIds: string[];
+}) {
+  const uniqueUserIds = [...new Set(input.userIds.map((id) => id.trim()).filter(Boolean))];
+  if (uniqueUserIds.length === 0) {
+    return {
+      validUserIds: [] as string[],
+      invalidUserIds: [] as string[]
+    };
+  }
+
+  const members = await prisma.orgMember.findMany({
+    where: {
+      orgId: input.orgId,
+      userId: {
+        in: uniqueUserIds
+      }
+    },
+    select: {
+      userId: true
+    }
+  });
+
+  const memberUserIds = new Set(members.map((member) => member.userId));
+  const validUserIds = uniqueUserIds.filter((id) => memberUserIds.has(id));
+  const invalidUserIds = uniqueUserIds.filter((id) => !memberUserIds.has(id));
+
+  return {
+    validUserIds,
+    invalidUserIds
+  };
+}
+
+function normalizeDirectionKey(value: string) {
+  return compactText(value).toLowerCase();
+}
+
+function formatIdSnippet(ids: string[], limit = 3) {
+  const head = ids.slice(0, limit);
+  return head.join(", ");
+}
+
+function parsePlanWorkflows(value: unknown): LaunchPlanWorkflowInput[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => {
+      const workflow = asRecord(item);
+      const title = compactText(typeof workflow.title === "string" ? workflow.title : "Workflow");
+      const goal = compactText(typeof workflow.goal === "string" ? workflow.goal : "");
+      const rawTasks = Array.isArray(workflow.tasks) ? workflow.tasks : [];
+      const tasks = rawTasks
+        .map((rawTask) => {
+          const task = asRecord(rawTask);
+          const taskTitle = compactText(typeof task.title === "string" ? task.title : "Task");
+          const subtasks = normalizeTextList(task.subtasks, 6);
+          const tools = parseRequestedToolkits(task.tools);
+          return {
+            title: taskTitle,
+            subtasks,
+            tools
+          };
+        })
+        .filter((task) => task.title.length > 0)
+        .slice(0, 16);
+
+      return {
+        title,
+        goal,
+        tasks
+      };
+    })
+    .filter((workflow) => workflow.tasks.length > 0)
+    .slice(0, 10);
+}
+
 function splitDirectionIntoTasks(direction: string, swarmDensity: number) {
   const normalized = direction.replace(/\r\n/g, "\n").trim();
+  const recipientEmailMatch = normalized.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  const recipientEmail = recipientEmailMatch?.[0]?.trim() ?? "";
+  const hasMeetingCreateIntent =
+    /\b(set up|setup|schedule|book|arrange|create|plan)\b[\s\S]{0,80}\b(meeting|call|invite|invitation|session)\b/i.test(
+      normalized
+    ) ||
+    /\b(meeting|call|invite|invitation|session)\b[\s\S]{0,80}\b(set up|setup|schedule|book|arrange|create|plan)\b/i.test(
+      normalized
+    );
+  const hasMeetingShareIntent =
+    /\b(send|share|mail|email)\b/i.test(normalized) &&
+    /\b(details?|invite|invitation|link|meeting)\b/i.test(normalized);
+  if (hasMeetingCreateIntent && hasMeetingShareIntent && recipientEmail) {
+    return [
+      "Set up the meeting first and capture the meeting link, code, and schedule details.",
+      `Send meeting details to ${recipientEmail} with the generated meeting link and key context.`
+    ];
+  }
+
   const lines = normalized
     .split("\n")
     .map((line) => line.trim())
@@ -107,7 +253,62 @@ function formatToolkitMarker(toolkits: string[]) {
   return `toolkits: ${toolkits.length > 0 ? toolkits.join(",") : "none"}`;
 }
 
-function buildTaskPlan(prompt: string, swarmDensity: number) {
+function collectPlanWorkflowToolkits(workflows: LaunchPlanWorkflowInput[]) {
+  const toolkits = new Set<string>();
+  for (const workflow of workflows) {
+    for (const task of workflow.tasks) {
+      for (const toolkit of task.tools) {
+        if (toolkit) {
+          toolkits.add(toolkit);
+        }
+      }
+    }
+  }
+  return [...toolkits];
+}
+
+function buildTaskPlan(
+  prompt: string,
+  swarmDensity: number,
+  planWorkflows: LaunchPlanWorkflowInput[]
+) {
+  if (planWorkflows.length > 0) {
+    const mission = compactText(prompt);
+    const workflowToolkits = collectPlanWorkflowToolkits(planWorkflows);
+    const missionToolkits = [
+      ...new Set([...inferRequestedToolkits(mission), ...workflowToolkits])
+    ];
+    const planStep = `Main Agent planning phase: execute approved direction workflows, dependencies, and tool constraints. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`;
+    const executionSteps: string[] = [];
+
+    for (const workflow of planWorkflows) {
+      for (const task of workflow.tasks) {
+        const details = [
+          workflow.title ? `Workflow: ${workflow.title}` : "",
+          workflow.goal ? `Goal: ${workflow.goal}` : "",
+          `Task: ${task.title}`,
+          task.subtasks.length > 0
+            ? `Subtasks: ${task.subtasks.join(" | ")}`
+            : ""
+        ]
+          .filter(Boolean)
+          .join(" | ");
+        const toolkits =
+          task.tools.length > 0
+            ? task.tools
+            : inferRequestedToolkits(`${workflow.title} ${workflow.goal} ${task.title}`);
+
+        executionSteps.push(`${details} | ${formatToolkitMarker(toolkits)}`);
+      }
+    }
+
+    const cappedSteps = executionSteps.slice(
+      0,
+      Math.min(24, Math.max(3, swarmDensity + 2))
+    );
+    return [planStep, ...cappedSteps];
+  }
+
   const executionSteps = splitDirectionIntoTasks(prompt, swarmDensity);
   const mission = compactText(prompt);
   const missionToolkits = inferRequestedToolkits(mission);
@@ -116,7 +317,9 @@ function buildTaskPlan(prompt: string, swarmDensity: number) {
   return [
     planStep,
     ...executionSteps.map((step, index) => {
-      const stepToolkits = [...new Set([...missionToolkits, ...inferRequestedToolkits(step)])];
+      const inferredStepToolkits = inferRequestedToolkits(step);
+      const stepToolkits =
+        inferredStepToolkits.length > 0 ? inferredStepToolkits : missionToolkits;
       return `Execution step ${index + 1}: ${step} | ${formatToolkitMarker(stepToolkits)}`;
     })
   ];
@@ -274,8 +477,10 @@ export async function POST(request: NextRequest) {
   const swarmDensity = asPositiveInt(body.swarmDensity);
   const predictedBurn = asPositiveInt(body.predictedBurn);
   const requiredSignatures = asPositiveInt(body.requiredSignatures);
-  const approvalsProvided = asPositiveInt(body.approvalsProvided);
+  const requestedApprovalUserIds = parseStringList(body.approvalUserIds, 32);
   const providedRequestedToolkits = parseRequestedToolkits(body.requestedToolkits);
+  const providedPermissionRequestIds = parseStringList(body.permissionRequestIds, 64);
+  const parsedPlanWorkflows = parsePlanWorkflows(body.planWorkflows);
 
   if (!orgId || !prompt || !swarmDensity || !predictedBurn || !requiredSignatures) {
     return NextResponse.json(
@@ -283,18 +488,8 @@ export async function POST(request: NextRequest) {
         ok: false,
         message: "Missing required mission launch fields."
       },
-      { status: 400 }
-    );
-  }
-
-  if (!approvalsProvided || approvalsProvided < requiredSignatures) {
-    return NextResponse.json(
-      {
-        ok: false,
-        message: `Insufficient signatures. Required: ${requiredSignatures}, received: ${approvalsProvided ?? 0}.`
-      },
-      { status: 412 }
-    );
+        { status: 400 }
+      );
   }
 
   const access = await requireOrgAccess({ request, orgId, allowInternal: true });
@@ -317,7 +512,180 @@ export async function POST(request: NextRequest) {
         { status: 404 }
       );
     }
+    const launchActorUserId = access.actor.userId;
+    const nonInternalRequestedApprovers = requestedApprovalUserIds.filter(
+      (userId) => userId !== launchActorUserId
+    );
+    if (!access.actor.isInternal && nonInternalRequestedApprovers.length > 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Cross-user approvals cannot be supplied at launch time. Additional signatures must be captured by each approver."
+        },
+        { status: 403 }
+      );
+    }
+
+    let capturedApprovalUserIds: string[] = [];
+    if (access.actor.isInternal) {
+      if (requestedApprovalUserIds.length === 0) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message:
+              "Internal launches must provide explicit approvalUserIds. approvalsProvided is not accepted."
+          },
+          { status: 412 }
+        );
+      }
+      const validated = await validateOrgMemberUserIds({
+        orgId,
+        userIds: requestedApprovalUserIds
+      });
+      if (validated.invalidUserIds.length > 0) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message: `Unknown approver user ids: ${formatIdSnippet(validated.invalidUserIds)}.`
+          },
+          { status: 412 }
+        );
+      }
+      capturedApprovalUserIds = validated.validUserIds;
+    } else {
+      capturedApprovalUserIds = [launchActorUserId];
+    }
+
+    const approvalsCaptured = capturedApprovalUserIds.length;
+    const launchReady = approvalsCaptured >= requiredSignatures;
     const orgExecutionMode = await resolveOrgExecutionMode(orgId);
+
+    let scopedPermissionRequests: PermissionRequestRecord[] = [];
+    const permissionRequestCounts = {
+      total: 0,
+      approved: 0,
+      pending: 0,
+      rejected: 0,
+      cancelled: 0
+    };
+    const shouldResolvePermissionRequests =
+      Boolean(planId) || Boolean(directionId) || providedPermissionRequestIds.length > 0;
+
+    if (shouldResolvePermissionRequests) {
+      const allPermissionRequests = await listOrgPermissionRequests(orgId);
+      const permissionRequestsById = new Map(
+        allPermissionRequests.map((item) => [item.id, item] as const)
+      );
+      if (providedPermissionRequestIds.length > 0) {
+        const unknownProvidedIds = providedPermissionRequestIds.filter(
+          (id) => !permissionRequestsById.has(id)
+        );
+        if (unknownProvidedIds.length > 0) {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `Launch blocked: unknown permission request ids in payload (${formatIdSnippet(unknownProvidedIds)}).`
+            },
+            { status: 412 }
+          );
+        }
+      }
+
+      if (planId) {
+        scopedPermissionRequests = allPermissionRequests.filter(
+          (item) => item.planId === planId
+        );
+
+        if (scopedPermissionRequests.length === 0) {
+          const planRecord = await getPlan(orgId, planId);
+          const normalizedPlanDirection = planRecord?.direction
+            ? normalizeDirectionKey(planRecord.direction)
+            : "";
+          if (normalizedPlanDirection) {
+            scopedPermissionRequests = allPermissionRequests.filter(
+              (item) =>
+                !item.planId &&
+                normalizeDirectionKey(item.direction) === normalizedPlanDirection
+            );
+          }
+        }
+      } else if (directionId) {
+        scopedPermissionRequests = allPermissionRequests.filter(
+          (item) => item.directionId === directionId
+        );
+      } else {
+        scopedPermissionRequests = providedPermissionRequestIds
+          .map((id) => permissionRequestsById.get(id))
+          .filter((item): item is PermissionRequestRecord => Boolean(item));
+      }
+
+      if (providedPermissionRequestIds.length > 0 && scopedPermissionRequests.length > 0) {
+        const providedIds = new Set(providedPermissionRequestIds);
+        const missingScopedIds = scopedPermissionRequests
+          .filter((item) => !providedIds.has(item.id))
+          .map((item) => item.id);
+
+        if (missingScopedIds.length > 0) {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `Launch blocked: approval payload is stale. Missing permission request ids: ${formatIdSnippet(missingScopedIds)}.`
+            },
+            { status: 412 }
+          );
+        }
+      }
+
+      if (scopedPermissionRequests.length > 0) {
+        const pending = scopedPermissionRequests
+          .filter((item) => item.status === "PENDING")
+          .map((item) => item.id);
+        if (pending.length > 0) {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `Launch blocked: ${pending.length} permission request(s) still pending approval (${formatIdSnippet(pending)}).`
+            },
+            { status: 412 }
+          );
+        }
+
+        const rejected = scopedPermissionRequests
+          .filter((item) => item.status === "REJECTED")
+          .map((item) => item.id);
+        if (rejected.length > 0) {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `Launch blocked: ${rejected.length} permission request(s) rejected (${formatIdSnippet(rejected)}). Revise plan or regenerate direction.`
+            },
+            { status: 409 }
+          );
+        }
+
+        const cancelled = scopedPermissionRequests
+          .filter((item) => item.status === "CANCELLED")
+          .map((item) => item.id);
+        if (cancelled.length > 0) {
+          return NextResponse.json(
+            {
+              ok: false,
+              message: `Launch blocked: ${cancelled.length} permission request(s) were cancelled (${formatIdSnippet(cancelled)}). Regenerate plan approvals before launch.`
+            },
+            { status: 409 }
+          );
+        }
+      }
+
+      permissionRequestCounts.total = scopedPermissionRequests.length;
+      for (const item of scopedPermissionRequests) {
+        if (item.status === "APPROVED") permissionRequestCounts.approved += 1;
+        if (item.status === "PENDING") permissionRequestCounts.pending += 1;
+        if (item.status === "REJECTED") permissionRequestCounts.rejected += 1;
+        if (item.status === "CANCELLED") permissionRequestCounts.cancelled += 1;
+      }
+    }
 
     const activeAgents = await prisma.personnel.findMany({
       where: {
@@ -345,12 +713,14 @@ export async function POST(request: NextRequest) {
       ? [mainAgent, ...activeAgents.filter((agent) => agent.id !== mainAgent.id)]
       : [];
     const fallbackToMainOnly = assignmentPool.length === 0;
-    const taskPrompts = buildTaskPlan(prompt, swarmDensity);
+    const taskPrompts = buildTaskPlan(prompt, swarmDensity, parsedPlanWorkflows);
     const promptInferredToolkits = inferRequestedToolkits(prompt);
+    const planInferredToolkits = collectPlanWorkflowToolkits(parsedPlanWorkflows);
     const subTaskInferredToolkits = taskPrompts.flatMap((step) => inferRequestedToolkits(step));
     const requestedToolkits = [
       ...new Set([
         ...providedRequestedToolkits,
+        ...planInferredToolkits,
         ...promptInferredToolkits,
         ...subTaskInferredToolkits
       ])
@@ -365,12 +735,22 @@ export async function POST(request: NextRequest) {
         data: {
           orgId,
           prompt,
-          status: FlowStatus.QUEUED,
+          status: launchReady ? FlowStatus.QUEUED : FlowStatus.DRAFT,
           progress: 0,
           predictedBurn,
           requiredSignatures
         }
       });
+
+      if (capturedApprovalUserIds.length > 0) {
+        await tx.flowApproval.createMany({
+          data: capturedApprovalUserIds.map((userId) => ({
+            flowId: created.id,
+            userId
+          })),
+          skipDuplicates: true
+        });
+      }
 
       for (let index = 0; index < taskPrompts.length; index += 1) {
         const stepPrompt = taskPrompts[index];
@@ -396,9 +776,13 @@ export async function POST(request: NextRequest) {
                 : assignmentPool.length > 0
                   ? assignmentPool[index % assignmentPool.length]
                   : null);
-        const taskRequestedToolkits = [
-          ...new Set([...requestedToolkits, ...inferRequestedToolkits(stepPrompt)])
-        ];
+        const stepRequestedToolkits = inferRequestedToolkits(stepPrompt);
+        const taskRequestedToolkits =
+          stepRequestedToolkits.length > 0
+            ? stepRequestedToolkits
+            : index === 0
+              ? requestedToolkits
+              : promptInferredToolkits;
         // eslint-disable-next-line no-await-in-loop
         await tx.task.create({
           data: {
@@ -427,7 +811,11 @@ export async function POST(request: NextRequest) {
           orgId,
           type: LogType.EXE,
           actor: "CONTROL_DECK",
-          message: `Flow ${created.id} queued. Burn=${predictedBurn}, signatures=${requiredSignatures}, tasks=${taskPrompts.length}, mode=${fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"}.`
+          message: `Flow ${created.id} ${
+            launchReady ? "queued" : "created in draft"
+          }. Burn=${predictedBurn}, signatures=${requiredSignatures}, approvalsCaptured=${approvalsCaptured}, mode=${
+            fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+          }, planWorkflows=${parsedPlanWorkflows.length}, permissionRequests=${permissionRequestCounts.total}/${permissionRequestCounts.approved}.`
         }
       });
 
@@ -462,11 +850,16 @@ export async function POST(request: NextRequest) {
           meta: {
             source: "control.launch",
             requiredSignatures,
+            approvalsCaptured,
             swarmDensity,
             taskCount: taskPrompts.length,
             requestedToolkits,
             initiatedByUserId,
-            executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+            launchReady,
+            executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+            planWorkflowCount: parsedPlanWorkflows.length,
+            permissionRequestCount: permissionRequestCounts.total,
+            approvedPermissionRequestCount: permissionRequestCounts.approved
           }
         },
         tx
@@ -485,10 +878,15 @@ export async function POST(request: NextRequest) {
             predictedBurn,
             monthlyBtuCap: org.monthlyBtuCap,
             requiredSignatures,
+            approvalsCaptured,
             taskCount: taskPrompts.length,
             requestedToolkits,
             initiatedByUserId,
-            executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
+            launchReady,
+            executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+            planWorkflowCount: parsedPlanWorkflows.length,
+            permissionRequestCount: permissionRequestCounts.total,
+            approvedPermissionRequestCount: permissionRequestCounts.approved
           }
         },
         tx
@@ -538,75 +936,84 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const publish = await publishInngestEvent("vorldx/flow.launched", {
-      flowId: flow.id,
-      orgId,
-      prompt,
-      swarmDensity,
-      predictedBurn,
-      requiredSignatures,
-      taskCount: taskPrompts.length,
-      requestedToolkits,
-      initiatedByUserId,
-      executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-      orgExecutionMode
-    });
-
+    let publish: { ok: boolean; message?: string } = { ok: true };
     let localKickWarning: string | undefined;
-    try {
-      const response = await fetch(`${request.nextUrl.origin}/api/inngest`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...buildInternalApiHeaders()
-        },
-        body: JSON.stringify([
-          {
-            name: "vorldx/flow.launched",
-            data: {
-              flowId: flow.id,
-              orgId,
-              prompt,
-              swarmDensity,
-              predictedBurn,
-              requiredSignatures,
-              taskCount: taskPrompts.length,
-              requestedToolkits,
-              initiatedByUserId,
-              executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-              orgExecutionMode
+    if (launchReady) {
+      publish = await publishInngestEvent("vorldx/flow.launched", {
+        flowId: flow.id,
+        orgId,
+        prompt,
+        swarmDensity,
+        predictedBurn,
+        requiredSignatures,
+        taskCount: taskPrompts.length,
+        requestedToolkits,
+        initiatedByUserId,
+        executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+        orgExecutionMode,
+        planWorkflowCount: parsedPlanWorkflows.length,
+        permissionRequestCount: permissionRequestCounts.total,
+        approvedPermissionRequestCount: permissionRequestCounts.approved
+      });
+
+      try {
+        const response = await fetch(`${request.nextUrl.origin}/api/inngest`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            ...buildInternalApiHeaders()
+          },
+          body: JSON.stringify([
+            {
+              name: "vorldx/flow.launched",
+              data: {
+                flowId: flow.id,
+                orgId,
+                prompt,
+                swarmDensity,
+                predictedBurn,
+                requiredSignatures,
+                taskCount: taskPrompts.length,
+                requestedToolkits,
+                initiatedByUserId,
+                executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+                orgExecutionMode,
+                planWorkflowCount: parsedPlanWorkflows.length,
+                permissionRequestCount: permissionRequestCounts.total,
+                approvedPermissionRequestCount: permissionRequestCounts.approved
+              }
             }
-          }
-        ]),
-        cache: "no-store"
-      });
+          ]),
+          cache: "no-store"
+        });
 
-      if (!response.ok) {
-        const detail = await response.text();
-        localKickWarning = `Local worker kick failed (${response.status}): ${detail.slice(0, 140)}`;
+        if (!response.ok) {
+          const detail = await response.text();
+          localKickWarning = `Local worker kick failed (${response.status}): ${detail.slice(0, 140)}`;
+        }
+      } catch (error) {
+        localKickWarning = error instanceof Error ? error.message : "Local worker kick failed.";
       }
-    } catch (error) {
-      localKickWarning = error instanceof Error ? error.message : "Local worker kick failed.";
-    }
 
-    if (!publish.ok) {
-      await prisma.log.create({
-        data: {
-          orgId,
-          type: LogType.NET,
-          actor: "INNGEST_PUBLISHER",
-          message: `Flow ${flow.id} queued but Inngest publish failed: ${publish.message}`
-        }
-      });
-    } else {
-      await prisma.log.create({
-        data: {
-          orgId,
-          type: LogType.NET,
-          actor: "INNGEST_PUBLISHER",
-          message: `Flow ${flow.id} launch event published to Inngest.`
-        }
-      });
+      if (!publish.ok) {
+        await prisma.log.create({
+          data: {
+            orgId,
+            type: LogType.NET,
+            actor: "INNGEST_PUBLISHER",
+            message: `Flow ${flow.id} queued but Inngest publish failed: ${publish.message}`
+          }
+        });
+      } else {
+        await prisma.log.create({
+          data: {
+            orgId,
+            type: LogType.NET,
+            actor: "INNGEST_PUBLISHER",
+            message: `Flow ${flow.id} launch event published to Inngest.`
+          }
+        });
+      }
     }
 
     await publishRealtimeEvent({
@@ -617,7 +1024,21 @@ export async function POST(request: NextRequest) {
         status: flow.status,
         predictedBurn: flow.predictedBurn,
         requiredSignatures: flow.requiredSignatures,
-        approvalsProvided
+        approvalsProvided: approvalsCaptured,
+        launchReady,
+        permissionRequestCount: permissionRequestCounts.total,
+        approvedPermissionRequestCount: permissionRequestCounts.approved
+      }
+    });
+
+    await publishRealtimeEvent({
+      orgId,
+      event: "signature.captured",
+      payload: {
+        flowId: flow.id,
+        requiredSignatures: flow.requiredSignatures,
+        approvalsProvided: approvalsCaptured,
+        userId: access.actor.userId
       }
     });
 
@@ -627,7 +1048,10 @@ export async function POST(request: NextRequest) {
       payload: {
         flowId: flow.id,
         requiredSignatures: flow.requiredSignatures,
-        approvalsProvided
+        approvalsProvided: approvalsCaptured,
+        launchReady,
+        permissionRequestCount: permissionRequestCounts.total,
+        approvedPermissionRequestCount: permissionRequestCounts.approved
       }
     });
 
@@ -639,14 +1063,24 @@ export async function POST(request: NextRequest) {
           status: flow.status,
           predictedBurn: flow.predictedBurn,
           requiredSignatures: flow.requiredSignatures,
+          approvalsCaptured,
           ...(directionId ? { directionId } : {}),
           ...(planId ? { planId } : {}),
           ...(fallbackPlanId ? { fallbackPlanId } : {}),
           taskCount: taskPrompts.length,
+          planWorkflowCount: parsedPlanWorkflows.length,
+          permissionRequestCount: permissionRequestCounts.total,
+          approvedPermissionRequestCount: permissionRequestCounts.approved,
           executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
           orgExecutionMode
         },
-        warning: [publish.ok ? undefined : publish.message, localKickWarning]
+        warning: [
+          launchReady
+            ? undefined
+            : `Flow is waiting for additional signatures (${approvalsCaptured}/${requiredSignatures}).`,
+          publish.ok ? undefined : publish.message,
+          localKickWarning
+        ]
           .filter(Boolean)
           .join(" | ") || undefined
       },

@@ -57,33 +57,20 @@ export function buildGmailPlannerPrompt(input: {
   providedInput: Record<string, unknown>;
 }) {
   const systemPrompt = [
-    "You are a Gmail intent planner for a production agent.",
-    "Return ONLY valid JSON. No markdown, no prose outside JSON.",
-    "Schema:",
-    "{",
-    '  "intent": "send_email" | "summarize_emails" | "search_emails" | "read_email" | "unknown",',
-    '  "needs": string[],',
-    '  "args": object,',
-    '  "requires_confirmation": boolean,',
-    '  "assistant_message": string',
-    "}",
+    "Map Gmail requests to JSON.",
+    "Return JSON only (no markdown):",
+    '{"intent":"send_email|summarize_emails|search_emails|read_email|unknown","needs":[],"args":{},"requires_confirmation":false,"assistant_message":""}',
     "Rules:",
-    "1) Never invent recipient_email.",
-    "2) If user wants to send email and recipient email is missing, include recipient_email in needs.",
-    "3) If user references a person name without an email for send flow, include recipient_email in needs.",
-    "4) For send_email set requires_confirmation=true.",
-    "5) Keep assistant_message concise and actionable.",
-    "6) Put parsed values in args when available (recipient_email, recipient_name, query, message_id, limit, tone, context)."
+    "- Never invent recipient_email.",
+    "- send_email requires_confirmation must be true.",
+    "- If send target is missing, include recipient_email in needs.",
+    "- Keep assistant_message concise."
   ].join("\n");
 
   const userPrompt = [
-    "User prompt:",
-    input.prompt,
-    "",
-    "Already provided structured input (JSON):",
-    JSON.stringify(input.providedInput ?? {}, null, 2),
-    "",
-    "Return JSON now."
+    `Prompt: ${input.prompt}`,
+    `Input JSON: ${JSON.stringify(input.providedInput ?? {})}`,
+    "JSON:"
   ].join("\n");
 
   return { systemPrompt, userPrompt };

@@ -19,10 +19,32 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { createDeterministicEmbedding, toPgVectorLiteral } from "@/lib/ai/embeddings";
 import {
+  persistMemoryCandidate,
+  persistSemanticFactsFromText,
+  summarizeAndArchiveAgentMemory,
+  upsertAgentMemory
+} from "@/lib/agent/memory";
+import {
   estimateDelegationOverheadUsd,
   estimateTaskExecutionCostUsd,
   getAgentBudgetSnapshot
 } from "@/lib/agent/orchestration/budget";
+import {
+  buildMeetingDetailsEmailTemplate,
+  buildMeetingNotificationTemplate,
+  extractDurationMinutes as extractMeetingDurationMinutes,
+  extractFirstEmail as extractPromptEmail,
+  extractFirstPhoneNumber as extractPromptPhoneNumber,
+  extractLabeledValue as extractPromptLabelValue,
+  parseMeetingIntent,
+  shouldSendMeetingDetailsEmail as shouldSendMeetingDetailsEmailDeterministic,
+  shouldSendMeetingNotification as shouldSendMeetingNotificationDeterministic
+} from "@/lib/agent/orchestration/meeting-workflow";
+import {
+  filterToolCatalogForPrompt,
+  inferDeterministicHumanInputReason,
+  shouldBypassLlmToolRouter
+} from "@/lib/agent/orchestration/tool-router";
 import { inferUnverifiedExternalActionClaim } from "@/lib/agent/hallucination-guard";
 import { assessTaskComplexity } from "@/lib/agent/orchestration/complexity";
 import { buildAgentContextPack } from "@/lib/agent/orchestration/context-compiler";
@@ -102,6 +124,17 @@ function parsePositiveEnvInt(name: string, fallback: number) {
   return Math.floor(raw);
 }
 
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") {
+    return fallback;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 const TASK_CONTEXT_PREVIEW_CHARS = parsePositiveEnvInt(
   "TASK_CONTEXT_PREVIEW_CHARS",
   2800
@@ -110,12 +143,22 @@ const TASK_CONTEXT_FALLBACK_FILE_COUNT = parsePositiveEnvInt(
   "TASK_CONTEXT_FALLBACK_FILE_COUNT",
   1
 );
-const TOOL_ACTION_CATALOG_LIMIT = parsePositiveEnvInt("TOOL_ACTION_CATALOG_LIMIT", 40);
-const TOOL_BINDING_CONTEXT_LIMIT = parsePositiveEnvInt("TOOL_BINDING_CONTEXT_LIMIT", 30);
+const TOOL_ACTION_CATALOG_LIMIT = parsePositiveEnvInt("TOOL_ACTION_CATALOG_LIMIT", 14);
+const TOOL_BINDING_CONTEXT_LIMIT = parsePositiveEnvInt("TOOL_BINDING_CONTEXT_LIMIT", 12);
 const TOOL_RESULT_CONTEXT_MAX_CHARS = parsePositiveEnvInt(
   "TOOL_RESULT_CONTEXT_MAX_CHARS",
-  3200
+  1600
 );
+const TOOL_ROUTER_MAX_OUTPUT_TOKENS = parsePositiveEnvInt("TOOL_ROUTER_MAX_OUTPUT_TOKENS", 120);
+const TOOL_ROUTER_ENABLE_LLM = parseBooleanEnv("TOOL_ROUTER_ENABLE_LLM", true);
+const INTERNAL_FETCH_TIMEOUT_MS = parsePositiveEnvInt("INTERNAL_FETCH_TIMEOUT_MS", 20_000);
+const TOOL_EXECUTION_USER_CANDIDATE_LIMIT = parsePositiveEnvInt(
+  "TOOL_EXECUTION_USER_CANDIDATE_LIMIT",
+  3
+);
+const DNA_MEMORY_CHUNK_MAX_CHARS = parsePositiveEnvInt("DNA_MEMORY_CHUNK_MAX_CHARS", 900);
+const DNA_MEMORY_CHUNK_OVERLAP_CHARS = parsePositiveEnvInt("DNA_MEMORY_CHUNK_OVERLAP_CHARS", 120);
+const DNA_MEMORY_CHUNK_MAX_ITEMS = parsePositiveEnvInt("DNA_MEMORY_CHUNK_MAX_ITEMS", 24);
 
 function asString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -137,6 +180,57 @@ function truncateText(value: string, maxChars: number) {
     return value;
   }
   return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function splitIntoMemoryChunks(input: {
+  text: string;
+  maxChars?: number;
+  overlapChars?: number;
+  maxChunks?: number;
+}) {
+  const text = input.text.replace(/\r/g, "").trim();
+  if (!text) {
+    return [] as string[];
+  }
+
+  const maxChars = Math.max(260, input.maxChars ?? DNA_MEMORY_CHUNK_MAX_CHARS);
+  const overlapChars = Math.max(0, Math.min(maxChars - 80, input.overlapChars ?? DNA_MEMORY_CHUNK_OVERLAP_CHARS));
+  const maxChunks = Math.max(1, input.maxChunks ?? DNA_MEMORY_CHUNK_MAX_ITEMS);
+  const chunks: string[] = [];
+  let start = 0;
+
+  while (start < text.length && chunks.length < maxChunks) {
+    let end = Math.min(text.length, start + maxChars);
+    if (end < text.length) {
+      const window = text.slice(start, end);
+      const preferredBreaks = [
+        window.lastIndexOf("\n\n"),
+        window.lastIndexOf("\n"),
+        window.lastIndexOf(". "),
+        window.lastIndexOf(" ")
+      ].filter((value) => value >= Math.floor(maxChars * 0.55));
+      if (preferredBreaks.length > 0) {
+        end = start + Math.max(...preferredBreaks) + 1;
+      }
+    }
+
+    const chunk = text.slice(start, end).trim();
+    if (chunk.length >= 80 || chunks.length === 0) {
+      chunks.push(chunk);
+    }
+
+    if (end >= text.length) {
+      break;
+    }
+
+    const nextStart = Math.max(start + 1, end - overlapChars);
+    if (nextStart <= start) {
+      break;
+    }
+    start = nextStart;
+  }
+
+  return chunks;
 }
 
 function sanitizeToolValueForContext(value: unknown, depth = 0): unknown {
@@ -202,8 +296,56 @@ function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue;
 }
 
+async function persistMemoryCandidateSafe(
+  input: Parameters<typeof persistMemoryCandidate>[0]
+) {
+  try {
+    await persistMemoryCandidate(input);
+  } catch {
+    // Memory persistence is best-effort and must not block task execution.
+  }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = INTERNAL_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      cache: "no-store"
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function normalizeToolkitList(value: string[]) {
   return [...new Set(value.map((item) => item.trim().toLowerCase()).filter(Boolean))];
+}
+
+function canonicalToolkitForExecutionLookup(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "googlemeet" || normalized === "gmeet") {
+    return "gmeet";
+  }
+  return normalized;
+}
+
+function toolkitExecutionLookupVariants(value: string) {
+  const canonical = canonicalToolkitForExecutionLookup(value);
+  if (canonical === "gmeet") {
+    return ["googlemeet", "gmeet"];
+  }
+  return [canonical];
+}
+
+function toolkitMatchesForExecution(left: string, right: string) {
+  return canonicalToolkitForExecutionLookup(left) === canonicalToolkitForExecutionLookup(right);
+}
+
+function requestedToolkitIncludesForExecution(requestedToolkits: string[], toolkit: string) {
+  return requestedToolkits.some((candidate) => toolkitMatchesForExecution(candidate, toolkit));
 }
 
 function parseTaskStage(value: string) {
@@ -211,6 +353,44 @@ function parseTaskStage(value: string) {
   if (upper === "PLANNING") return "PLANNING" as const;
   if (upper === "EXECUTION") return "EXECUTION" as const;
   return "GENERAL" as const;
+}
+
+interface WorkflowStepBreakdown {
+  step: string;
+  model: string | null;
+  provider: string | null;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  retryCount: number;
+  fallbackCount: number;
+  tool: string | null;
+  success: boolean;
+}
+
+function summarizeWorkflowBreakdown(workflowId: string, steps: WorkflowStepBreakdown[]) {
+  const promptTokens = steps.reduce((sum, step) => sum + Math.max(0, step.promptTokens), 0);
+  const completionTokens = steps.reduce(
+    (sum, step) => sum + Math.max(0, step.completionTokens),
+    0
+  );
+  const totalTokens = steps.reduce((sum, step) => sum + Math.max(0, step.totalTokens), 0);
+  const retryCount = steps.reduce((sum, step) => sum + Math.max(0, step.retryCount), 0);
+  const fallbackCount = steps.reduce((sum, step) => sum + Math.max(0, step.fallbackCount), 0);
+  return {
+    workflowId,
+    steps,
+    totals: {
+      stepCount: steps.length,
+      modelCalls: steps.filter((step) => step.totalTokens > 0).length,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      retryCount,
+      fallbackCount
+    }
+  };
 }
 
 function parseAgentBudgetLimitUsd(scope: unknown): number | null {
@@ -552,6 +732,23 @@ function parseRequestedToolkitsFromTrace(trace: unknown) {
     .filter(Boolean))];
 }
 
+function toolkitSetSignature(toolkits: string[]) {
+  return [...new Set(normalizeToolkitList(toolkits).map(canonicalToolkitForExecutionLookup))]
+    .sort()
+    .join(",");
+}
+
+function resolveTaskRequestedToolkits(input: {
+  traceToolkits: string[];
+  promptToolkits: string[];
+}) {
+  const promptToolkits = normalizeToolkitList(input.promptToolkits);
+  if (promptToolkits.length > 0) {
+    return promptToolkits;
+  }
+  return normalizeToolkitList(input.traceToolkits);
+}
+
 function inferDelegationSpecialty(taskPrompt: string, requestedToolkits: string[]) {
   const lower = taskPrompt.toLowerCase();
   const toolkitLabel = requestedToolkits.length > 0 ? requestedToolkits.join(", ") : "none";
@@ -583,11 +780,11 @@ function buildChildAgentCriticalRules(taskPrompt: string, requestedToolkits: str
 }
 
 function shouldSendMeetingDetailsEmail(prompt: string) {
-  const normalized = prompt.toLowerCase();
-  const mentionsMeeting = /\b(meet|meeting)\b/.test(normalized);
-  const asksToSend = /\b(send|mail|email|share)\b/.test(normalized);
-  const asksForDetails = /\b(details?|invite|invitation|link)\b/.test(normalized);
-  return mentionsMeeting && asksToSend && asksForDetails;
+  return shouldSendMeetingDetailsEmailDeterministic(prompt);
+}
+
+function shouldSendMeetingNotification(prompt: string) {
+  return shouldSendMeetingNotificationDeterministic(prompt);
 }
 
 function extractMeetingUriFromToolData(data: Record<string, unknown> | null | undefined) {
@@ -605,30 +802,36 @@ function buildMeetingDetailsEmail(input: {
   meetingCode?: string;
   prompt: string;
 }) {
-  const safeCode = input.meetingCode?.trim() ?? "";
-  const subject = safeCode
-    ? `Google Meet details (${safeCode})`
-    : "Google Meet details";
-  const body = [
-    "Hello,",
-    "",
-    "Your Google Meet meeting has been created.",
-    `Meeting link: ${input.meetingUri}`,
-    ...(safeCode ? [`Meeting code: ${safeCode}`] : []),
-    "",
-    "Requested task:",
-    input.prompt.slice(0, 500),
-    "",
-    "Regards,",
-    "VorldX Agent"
-  ].join("\n");
+  const parsed = parseMeetingIntent(input.prompt);
+  return buildMeetingDetailsEmailTemplate({
+    recipient: input.recipient,
+    meetingUri: input.meetingUri,
+    meetingCode: input.meetingCode,
+    meetingTopic: parsed.topic,
+    durationMinutes: parsed.durationMinutes,
+    prompt: input.prompt
+  });
+}
 
-  return {
-    to: input.recipient,
-    recipient_email: input.recipient,
-    subject,
-    body
-  };
+function extractFirstPhoneNumber(value: string) {
+  return extractPromptPhoneNumber(value);
+}
+
+function buildMeetingNotification(input: {
+  recipientPhone: string;
+  meetingUri: string;
+  meetingCode?: string;
+  prompt: string;
+}) {
+  const parsed = parseMeetingIntent(input.prompt);
+  return buildMeetingNotificationTemplate({
+    recipientPhone: input.recipientPhone,
+    meetingUri: input.meetingUri,
+    meetingCode: input.meetingCode,
+    meetingTopic: parsed.topic,
+    durationMinutes: parsed.durationMinutes,
+    prompt: input.prompt
+  });
 }
 
 interface AgentToolActionRequest {
@@ -640,6 +843,20 @@ interface AgentToolActionRequest {
 interface ToolInferenceResult {
   action: AgentToolActionRequest | null;
   reason?: string;
+  metrics?: ToolInferenceMetrics;
+}
+
+interface ToolInferenceMetrics {
+  mode: "heuristic" | "llm" | "none";
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  costUsd: number | null;
+  provider: string | null;
+  model: string | null;
+  fallbackUsed: boolean;
+  catalogSize: number;
 }
 
 interface AgentToolBindingSummary {
@@ -674,35 +891,272 @@ interface ToolActionExecutionFailure {
 
 type ToolActionExecutionResult = ToolActionExecutionSuccess | ToolActionExecutionFailure;
 
-function escapeRegex(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function toToolCollectionItems(data: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const direct = data[key];
+    if (Array.isArray(direct)) {
+      return direct.map((item) => asRecord(item));
+    }
+
+    if (direct && typeof direct === "object") {
+      const record = asRecord(direct);
+      for (const nestedKey of [
+        "items",
+        "results",
+        "records",
+        "participants",
+        "meetings",
+        "conferenceRecords"
+      ]) {
+        const nested = record[nestedKey];
+        if (Array.isArray(nested)) {
+          return nested.map((item) => asRecord(item));
+        }
+      }
+    }
+  }
+
+  return [] as Record<string, unknown>[];
+}
+
+function inferToolItemCount(data: Record<string, unknown>) {
+  const rawCount = asNumber(data.count) ?? asNumber(data.total) ?? asNumber(data.size);
+  if (typeof rawCount === "number") {
+    return Math.max(0, Math.floor(rawCount));
+  }
+
+  const itemCollections = toToolCollectionItems(data, [
+    "items",
+    "results",
+    "records",
+    "meetings",
+    "conferenceRecords",
+    "participants",
+    "emails"
+  ]);
+  if (itemCollections.length > 0) {
+    return itemCollections.length;
+  }
+
+  return 0;
+}
+
+function normalizeToolDataForModelContext(input: {
+  toolkit: string;
+  action: string;
+  data: Record<string, unknown>;
+}) {
+  const toolkit = input.toolkit.toLowerCase();
+  const action = input.action.toUpperCase();
+  const data = asRecord(input.data);
+
+  if (toolkit === "gmail") {
+    if (action === "SEND_EMAIL") {
+      return {
+        to: asString(data.to),
+        subject: truncateText(asString(data.subject), 120),
+        delivered: data.delivered === true
+      };
+    }
+    if (action === "READ_EMAIL") {
+      const email = asRecord(data.email);
+      return {
+        email: {
+          id: asString(email.id),
+          from: asString(email.from),
+          subject: truncateText(asString(email.subject), 140),
+          snippet: truncateText(asString(email.snippet), 220)
+        }
+      };
+    }
+
+    const emails = Array.isArray(data.emails) ? data.emails : [];
+    return {
+      count: inferToolItemCount(data),
+      query: asString(data.query),
+      summary: truncateText(asString(data.summary), 320),
+      emails: emails.slice(0, 3).map((item) => {
+        const email = asRecord(item);
+        return {
+          id: asString(email.id),
+          from: asString(email.from),
+          subject: truncateText(asString(email.subject), 120),
+          snippet: truncateText(asString(email.snippet), 180)
+        };
+      })
+    };
+  }
+
+  if (toolkit === "googlemeet" || toolkit === "zoom") {
+    const participants = toToolCollectionItems(data, [
+      "participants",
+      "attendees",
+      "members",
+      "participantList"
+    ]);
+    return {
+      meetingUri:
+        extractMeetingUriFromToolData(data) ||
+        asString(data.join_url) ||
+        asString(data.joinUrl),
+      meetingCode:
+        asString(data.meetingCode) ||
+        asString(data.meeting_code) ||
+        asString(asRecord(data.meeting).meetingCode),
+      count: inferToolItemCount(data),
+      participants: participants.slice(0, 5).map((item) => formatParticipantLabel(item))
+    };
+  }
+
+  return sanitizeToolValueForContext(data);
+}
+
+function formatParticipantLabel(item: Record<string, unknown>) {
+  const candidate =
+    asString(item.displayName) ||
+    asString(item.name) ||
+    asString(item.email) ||
+    asString(item.userEmail) ||
+    asString(item.participant) ||
+    asString(item.id);
+  return candidate || null;
+}
+
+function buildDeterministicToolSummary(input: {
+  prompt: string;
+  primaryToolSuccess: ToolActionExecutionSuccess | null;
+  followupToolActionSuccess: ToolActionExecutionSuccess | null;
+  notificationToolActionSuccess: ToolActionExecutionSuccess | null;
+}) {
+  const primary = input.primaryToolSuccess;
+  if (!primary) {
+    return null;
+  }
+
+  const promptLower = input.prompt.toLowerCase();
+  const action = primary.action.toUpperCase();
+  const toolkit = primary.toolkit.toLowerCase();
+  const data = asRecord(primary.data);
+
+  if (toolkit === "gmail" && action === "SEND_EMAIL") {
+    const recipient = asString(data.to);
+    return recipient ? `Confirmation email sent to ${recipient}.` : "Confirmation email sent.";
+  }
+
+  if (toolkit === "gmail") {
+    if (action === "SUMMARIZE_EMAILS") {
+      const summary = asString(data.summary);
+      if (summary) {
+        return summary;
+      }
+      const count = inferToolItemCount(data);
+      return `Prepared a summary for ${count} email(s).`;
+    }
+
+    if (action === "SEARCH_EMAILS" || action === "LIST_RECENT_EMAILS") {
+      const count = inferToolItemCount(data);
+      return `Found ${count} email(s).`;
+    }
+
+    if (action === "READ_EMAIL") {
+      const email = asRecord(data.email);
+      const subject = asString(email.subject);
+      return subject ? `Email read: ${subject}.` : "Email read.";
+    }
+  }
+
+  if (toolkit === "googlemeet" || toolkit === "zoom") {
+    const meetingUri =
+      extractMeetingUriFromToolData(data) ||
+      asString(data.join_url) ||
+      asString(data.joinUrl) ||
+      asString(data.start_url) ||
+      asString(data.startUrl);
+    const meetingCode =
+      asString(data.meetingCode) ||
+      asString(data.meeting_code) ||
+      asString(asRecord(data.meeting).meetingCode) ||
+      asString(asRecord(data.meeting).meeting_code);
+
+    if (/\b(create|schedule|add)\b/.test(action.toLowerCase())) {
+      const sentFollowupEmail =
+        Boolean(input.followupToolActionSuccess) &&
+        input.followupToolActionSuccess?.toolkit.toLowerCase() === "gmail" &&
+        input.followupToolActionSuccess?.action.toUpperCase() === "SEND_EMAIL";
+      const recipient =
+        sentFollowupEmail && input.followupToolActionSuccess
+          ? asString(asRecord(input.followupToolActionSuccess.data).to)
+          : "";
+
+      const segments = [
+        meetingUri ? `Meeting created. Link: ${meetingUri}` : "Meeting created."
+      ];
+      if (meetingCode) {
+        segments.push(`Code: ${meetingCode}.`);
+      }
+      if (sentFollowupEmail) {
+        segments.push(
+          recipient ? `Confirmation email sent to ${recipient}.` : "Confirmation email sent."
+        );
+      }
+      const sentNotification =
+        Boolean(input.notificationToolActionSuccess) &&
+        canonicalToolkitForExecutionLookup(
+          input.notificationToolActionSuccess?.toolkit ?? ""
+        ) === "whatsapp";
+      const notifiedTarget =
+        sentNotification && input.notificationToolActionSuccess
+          ? asString(
+              asRecord(input.notificationToolActionSuccess.data).to ||
+                asRecord(input.notificationToolActionSuccess.data).phone_number ||
+                asRecord(input.notificationToolActionSuccess.data).recipient_phone
+            )
+          : "";
+      if (sentNotification) {
+        segments.push(
+          notifiedTarget
+            ? `WhatsApp notification sent to ${notifiedTarget}.`
+            : "WhatsApp notification sent."
+        );
+      }
+      return segments.join(" ");
+    }
+
+    const participantItems = toToolCollectionItems(data, [
+      "participants",
+      "attendees",
+      "members",
+      "participantList"
+    ]);
+    if (participantItems.length > 0 || /\bparticipant\b/.test(action.toLowerCase()) || /\bparticipants?\b/.test(promptLower)) {
+      if (participantItems.length === 0) {
+        return "No participants were found for this meeting.";
+      }
+      const labels = participantItems
+        .map((item) => formatParticipantLabel(item))
+        .filter((value): value is string => Boolean(value))
+        .slice(0, 6);
+      if (labels.length > 0) {
+        return `Found ${participantItems.length} participant(s): ${labels.join(", ")}${participantItems.length > labels.length ? ", ..." : ""}.`;
+      }
+      return `Found ${participantItems.length} participant(s).`;
+    }
+
+    const count = inferToolItemCount(data);
+    if (count > 0 || /\b(list|get|fetch|view|search)\b/.test(action.toLowerCase())) {
+      return `Retrieved ${count} meeting record(s).`;
+    }
+  }
+
+  return null;
 }
 
 function extractFirstEmail(value: string) {
-  const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  return match?.[0]?.trim() ?? "";
+  return extractPromptEmail(value);
 }
 
 function extractLabeledValue(prompt: string, labels: string[]) {
-  const labelsPattern = labels.map((label) => escapeRegex(label)).join("|");
-  const pattern = new RegExp(
-    `(?:\\*{1,2})?(?:${labelsPattern})(?:\\*{1,2})?\\s*[:\\-]\\s*(.+)`,
-    "i"
-  );
-  const line = prompt
-    .split(/\r?\n/g)
-    .map((item) => item.trim())
-    .find((item) => pattern.test(item));
-  if (!line) {
-    return "";
-  }
-
-  const match = line.match(pattern);
-  if (!match?.[1]) {
-    return "";
-  }
-
-  return match[1].trim().replace(/^["'`]+|["'`]+$/g, "").trim();
+  return extractPromptLabelValue(prompt, labels);
 }
 
 function tokenizeToolText(value: string) {
@@ -734,24 +1188,26 @@ function findBindingByKeywordSets(bindings: AgentToolBindingSummary[], keywordSe
   return null;
 }
 
+function pickWhatsappSendBinding(bindings: AgentToolBindingSummary[]) {
+  const whatsappBindings = bindings.filter(
+    (binding) => canonicalToolkitForExecutionLookup(binding.toolkit) === "whatsapp"
+  );
+  if (whatsappBindings.length === 0) {
+    return null;
+  }
+  return (
+    findBindingByKeywordSets(whatsappBindings, [
+      ["send", "message"],
+      ["whatsapp", "send"],
+      ["send", "text"],
+      ["message"],
+      ["send"]
+    ]) ?? whatsappBindings[0]
+  );
+}
+
 function extractDurationMinutes(prompt: string) {
-  const labeled = extractLabeledValue(prompt, ["duration", "length"]);
-  const candidate = labeled || prompt;
-  const match = candidate.match(/(\d{1,3})\s*(minutes?|mins?|hours?|hrs?)/i);
-  if (!match?.[1]) {
-    return null;
-  }
-
-  const amount = Number.parseInt(match[1], 10);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return null;
-  }
-
-  const unit = (match[2] ?? "").toLowerCase();
-  if (unit.startsWith("hour") || unit.startsWith("hr")) {
-    return Math.min(8 * 60, amount * 60);
-  }
-  return Math.min(24 * 60, amount);
+  return extractMeetingDurationMinutes(prompt);
 }
 
 function buildZoomCreateArguments(prompt: string) {
@@ -770,6 +1226,43 @@ function buildZoomCreateArguments(prompt: string) {
     ...(timezone ? { timezone } : {}),
     ...(duration ? { duration } : {})
   };
+}
+
+function buildMeetingLookupArguments(prompt: string) {
+  const labeledValue =
+    extractLabeledValue(prompt, [
+      "conference record",
+      "conference id",
+      "meeting id",
+      "meeting code",
+      "meeting uri",
+      "meeting link",
+      "code"
+    ]) || "";
+
+  const inlineCode = prompt.match(/\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b/i)?.[0] ?? "";
+  const inlineUri = prompt.match(/https?:\/\/meet\.google\.com\/[a-z0-9-]+/i)?.[0] ?? "";
+  const candidate = labeledValue || inlineUri || inlineCode;
+  if (!candidate) {
+    return {};
+  }
+
+  const args: Record<string, unknown> = {};
+  const meetingUri = candidate.match(/https?:\/\/meet\.google\.com\/[a-z0-9-]+/i)?.[0] ?? "";
+  const meetingCode = candidate.match(/\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b/i)?.[0] ?? "";
+
+  if (meetingUri) {
+    args.meetingUri = meetingUri;
+  }
+  if (meetingCode) {
+    args.meetingCode = meetingCode.toLowerCase();
+  }
+
+  if (!args.meetingUri && !args.meetingCode) {
+    args.query = candidate.trim();
+  }
+
+  return args;
 }
 
 function inferZoomToolAction(prompt: string, toolBindings: AgentToolBindingSummary[]) {
@@ -851,18 +1344,25 @@ function inferGoogleMeetToolAction(prompt: string, toolBindings: AgentToolBindin
     }
   }
 
-  const listIntent = /\b(list|get|show|fetch|check|view|recent|upcoming)\b/.test(normalized);
+  const listIntent =
+    /\b(list|get|show|fetch|check|view|recent|upcoming|find|search)\b/.test(normalized) ||
+    /\bparticipants?\b/.test(normalized);
   if (listIntent) {
     const listBinding = findBindingByKeywordSets(meetBindings, [
+      ["get", "participants"],
       ["list", "conference", "records"],
+      ["get", "conference", "record"],
       ["get", "meet"],
       ["list", "participants"]
     ]);
     if (listBinding) {
+      const listArgs = /\bparticipants?\b/.test(normalized)
+        ? buildMeetingLookupArguments(prompt)
+        : {};
       return {
         toolkit: "googlemeet",
         action: listBinding.slug.toUpperCase(),
-        arguments: {}
+        arguments: listArgs
       } satisfies AgentToolActionRequest;
     }
   }
@@ -884,7 +1384,9 @@ function inferReadOnlyGenericToolAction(
   }
 
   const promptTokens = new Set(tokenizeToolText(prompt));
-  const candidates = toolBindings.filter((binding) => requestedToolkits.includes(binding.toolkit));
+  const candidates = toolBindings.filter((binding) =>
+    requestedToolkitIncludesForExecution(requestedToolkits, binding.toolkit)
+  );
   if (candidates.length === 0) {
     return null;
   }
@@ -979,6 +1481,13 @@ function inferAgentToolActionHeuristic(
   const sendIntent =
     /\b(send|compose)\b/.test(normalized) && /\b(?:email|mail)\b/.test(normalized);
   if (hasMailContext && sendIntent) {
+    const hasMeetingCreateIntent =
+      /\b(set up|setup|schedule|book|arrange|create|plan)\b[\s\S]{0,80}\b(meeting|call|invite|invitation|session)\b/i.test(
+        normalized
+      ) ||
+      /\b(meeting|call|invite|invitation|session)\b[\s\S]{0,80}\b(set up|setup|schedule|book|arrange|create|plan)\b/i.test(
+        normalized
+      );
     const recipientCandidate =
       extractFirstEmail(prompt) || extractLabeledValue(prompt, ["recipient", "to"]);
     const recipient = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientCandidate)
@@ -1000,8 +1509,61 @@ function inferAgentToolActionHeuristic(
       };
     }
 
+    if (recipient && !hasMeetingCreateIntent && shouldSendMeetingDetailsEmail(prompt)) {
+      const promptMeetingUri =
+        prompt.match(
+          /https?:\/\/(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|calendar\.google\.com)\/[^\s)]+/i
+        )?.[0] ?? "";
+      const generatedDraft = buildMeetingDetailsEmail({
+        recipient,
+        meetingUri:
+          promptMeetingUri || "Meeting link will be shared after scheduling confirmation.",
+        prompt
+      });
+
+      return {
+        toolkit: "gmail",
+        action: "SEND_EMAIL",
+        arguments: {
+          to: recipient,
+          recipient_email: recipient,
+          subject: subject || generatedDraft.subject,
+          body: body || generatedDraft.body
+        }
+      };
+    }
+
     // Do not fall back to mailbox-read actions for incomplete send requests.
     // Missing structured send fields should route through HUMAN_INPUT instead.
+    return null;
+  }
+
+  const whatsappRequested = requestedToolkits.some(
+    (toolkit) => canonicalToolkitForExecutionLookup(toolkit) === "whatsapp"
+  );
+  const whatsappSendIntent =
+    /\b(send|share|notify|message|text|ping|alert)\b/.test(normalized) &&
+    /\b(whatsapp|notification|message|text|update)\b/.test(normalized);
+  if (whatsappRequested && whatsappSendIntent) {
+    const sendBinding = pickWhatsappSendBinding(toolBindings);
+    if (sendBinding) {
+      const recipientPhone = extractFirstPhoneNumber(prompt);
+      const messageBody = extractLabeledValue(prompt, ["message", "body", "content", "text"]);
+      if (recipientPhone && messageBody) {
+        return {
+          toolkit: sendBinding.toolkit,
+          action: sendBinding.slug.toUpperCase(),
+          arguments: {
+            to: recipientPhone,
+            phone_number: recipientPhone,
+            recipient_phone: recipientPhone,
+            message: messageBody,
+            text: messageBody,
+            body: messageBody
+          }
+        };
+      }
+    }
     return null;
   }
 
@@ -1108,33 +1670,133 @@ async function inferAgentToolAction(
     runtimeAgent: RuntimeAgentProfile;
   }
 ): Promise<ToolInferenceResult> {
+  const candidateBindings = input.toolBindings.filter(
+    (binding) =>
+      input.requestedToolkits.length === 0 ||
+      requestedToolkitIncludesForExecution(input.requestedToolkits, binding.toolkit)
+  );
+
   const heuristic = inferAgentToolActionHeuristic(
     input.prompt,
     input.requestedToolkits,
     input.toolBindings
   );
   if (heuristic) {
-    return { action: heuristic };
+    return {
+      action: heuristic,
+      metrics: {
+        mode: "heuristic",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: candidateBindings.length
+      }
+    };
   }
 
-  const candidateBindings = input.toolBindings.filter(
-    (binding) =>
-      input.requestedToolkits.length === 0 || input.requestedToolkits.includes(binding.toolkit)
-  );
+  const deterministicHumanInputReason = inferDeterministicHumanInputReason({
+    prompt: input.prompt,
+    requestedToolkits: input.requestedToolkits
+  });
+  if (deterministicHumanInputReason) {
+    return {
+      action: null,
+      reason: deterministicHumanInputReason,
+      metrics: {
+        mode: "heuristic",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: candidateBindings.length
+      }
+    };
+  }
+
   if (candidateBindings.length === 0) {
-    return { action: null };
+    return {
+      action: null,
+      metrics: {
+        mode: "none",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: 0
+      }
+    };
   }
 
-  try {
-    const runtime = await getOrgLlmRuntime(input.orgId);
-    const actionCatalog = candidateBindings
-      .slice(0, Math.max(1, TOOL_ACTION_CATALOG_LIMIT))
-      .map((binding) => ({
+  const routerBypass = shouldBypassLlmToolRouter({
+    prompt: input.prompt,
+    requestedToolkits: input.requestedToolkits,
+    candidateBindings
+  });
+  if (routerBypass.bypass) {
+    return {
+      action: null,
+      metrics: {
+        mode: "none",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: Math.min(candidateBindings.length, Math.max(1, TOOL_ACTION_CATALOG_LIMIT))
+      }
+    };
+  }
+
+  if (!TOOL_ROUTER_ENABLE_LLM) {
+    return {
+      action: null,
+      metrics: {
+        mode: "none",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: Math.min(candidateBindings.length, Math.max(1, TOOL_ACTION_CATALOG_LIMIT))
+      }
+    };
+  }
+
+  const inferenceStartedAt = Date.now();
+  const filteredBindings = filterToolCatalogForPrompt({
+    prompt: input.prompt,
+    bindings: candidateBindings,
+    maxItems: Math.max(1, TOOL_ACTION_CATALOG_LIMIT)
+  });
+  const actionCatalog = filteredBindings
+    .map((binding) => ({
       toolkit: binding.toolkit,
       action: binding.slug.toUpperCase(),
       name: binding.name,
-      description: binding.description
-      }));
+      description: truncateText(binding.description, 160)
+    }));
+
+  try {
+    const runtime = await getOrgLlmRuntime(input.orgId);
 
     const execution = await executeSwarmAgent({
       taskId: `tool-router-${Date.now()}`,
@@ -1144,40 +1806,49 @@ async function inferAgentToolAction(
       contextBlocks: [],
       organizationRuntime: runtime,
       systemPromptOverride: [
-        "You are a deterministic tool-action router for the workflow engine.",
-        "Select exactly one best tool action from the provided catalog if tool execution is needed now.",
-        "Never invent tool actions. Only use action values from the catalog.",
-        "Return strict JSON only, no markdown, no commentary.",
-        "Response schema:",
-        '{"mode":"EXECUTE","toolkit":"<slug>","action":"<ACTION_SLUG>","arguments":{},"reason":"..."}',
-        '{"mode":"HUMAN_INPUT","reason":"...","missing":["field1","field2"]}',
-        '{"mode":"NONE","reason":"..."}',
-        "If prompt lacks required parameters for a write/destructive action, return HUMAN_INPUT.",
-        "Prefer least-risk action that still satisfies the request."
+        "Route the prompt to one catalog action or request human input.",
+        "Return JSON only.",
+        'Schema: {"mode":"EXECUTE|HUMAN_INPUT|NONE","toolkit":"","action":"","arguments":{},"reason":"","missing":[]}',
+        "Use only actions from the catalog.",
+        "If required params are missing for write/destructive actions, return HUMAN_INPUT."
       ].join("\n"),
       userPromptOverride: [
-        `Task prompt:\n${input.prompt}`,
-        "",
+        `Prompt: ${input.prompt}`,
         `Requested toolkits: ${input.requestedToolkits.join(", ") || "none"}`,
-        "",
-        "Action catalog (JSON):",
-        JSON.stringify(actionCatalog)
+        `Catalog: ${JSON.stringify(actionCatalog)}`,
+        "JSON:"
       ].join("\n"),
-      maxOutputTokens: 260
+      maxOutputTokens: TOOL_ROUTER_MAX_OUTPUT_TOKENS
     });
+    const metrics: ToolInferenceMetrics = {
+      mode: "llm",
+      promptTokens: execution.tokenUsage?.promptTokens ?? 0,
+      completionTokens: execution.tokenUsage?.completionTokens ?? 0,
+      totalTokens: execution.tokenUsage?.totalTokens ?? 0,
+      latencyMs:
+        typeof execution.trace.durationMs === "number"
+          ? execution.trace.durationMs
+          : Date.now() - inferenceStartedAt,
+      costUsd:
+        typeof execution.billing?.totalCostUsd === "number" ? execution.billing.totalCostUsd : 0,
+      provider: execution.usedProvider ?? null,
+      model: execution.usedModel ?? null,
+      fallbackUsed: execution.fallbackUsed,
+      catalogSize: actionCatalog.length
+    };
 
     if (!execution.ok || !execution.outputText) {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     const parsed = parseJsonObjectFromText(execution.outputText);
     if (!parsed) {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     const mode = asString(parsed.mode).toUpperCase();
     if (mode === "NONE") {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     if (mode === "HUMAN_INPUT") {
@@ -1189,43 +1860,61 @@ async function inferAgentToolAction(
       const reason = asString(parsed.reason) || "Tool action needs additional human input.";
       return {
         action: null,
-        reason: missing.length > 0 ? `${reason} Missing: ${missing.join(", ")}` : reason
+        reason: missing.length > 0 ? `${reason} Missing: ${missing.join(", ")}` : reason,
+        metrics
       };
     }
 
     if (mode !== "EXECUTE") {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     const toolkit = asString(parsed.toolkit).toLowerCase();
     const action = asString(parsed.action).toUpperCase();
     if (!toolkit || !action) {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     const binding = candidateBindings.find(
-      (item) => item.toolkit === toolkit && item.slug.toUpperCase() === action
+      (item) =>
+        toolkitMatchesForExecution(item.toolkit, toolkit) && item.slug.toUpperCase() === action
     );
     if (!binding) {
-      return { action: null };
+      return { action: null, metrics };
     }
 
     if (isDestructiveToolAction(action, binding) && !hasExplicitDestructiveIntent(input.prompt)) {
       return {
         action: null,
-        reason: `Action ${action} is destructive. Explicit user confirmation is required before execution.`
+        reason: `Action ${action} is destructive. Explicit user confirmation is required before execution.`,
+        metrics
       };
     }
 
     return {
       action: {
-        toolkit,
+        toolkit: binding.toolkit,
         action,
         arguments: normalizeToolArguments(parsed.arguments)
-      }
+      },
+      metrics
     };
   } catch {
-    return { action: null };
+    return {
+      action: null,
+      metrics: {
+        mode: "none",
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: Date.now() - inferenceStartedAt,
+        costUsd: 0,
+        provider: null,
+        model: null,
+        fallbackUsed: false,
+        catalogSize: actionCatalog.length
+      }
+    };
   }
 }
 
@@ -1346,33 +2035,99 @@ function resolveAgentExecutionKey() {
   return resolveInternalApiKey();
 }
 
-async function resolveExecutionUserId(orgId: string, preferredUserId?: string | null) {
-  if (preferredUserId) {
-    const membership = await prisma.orgMember.findFirst({
-      where: {
-        orgId,
-        userId: preferredUserId
-      },
-      select: {
-        userId: true
-      }
-    });
-    if (membership?.userId) {
-      return membership.userId;
-    }
-  }
-
-  const fallback = await prisma.orgMember.findFirst({
-    where: { orgId },
+async function listExecutionUserCandidates(input: {
+  orgId: string;
+  preferredUserId?: string | null;
+  requestedToolkits: string[];
+}) {
+  const memberships = await prisma.orgMember.findMany({
+    where: { orgId: input.orgId },
     orderBy: {
       createdAt: "asc"
     },
     select: {
-      userId: true
+      userId: true,
+      createdAt: true
     }
   });
 
-  return fallback?.userId ?? null;
+  if (memberships.length === 0) {
+    return [] as string[];
+  }
+
+  const preferredUserId = asString(input.preferredUserId);
+  const requestedToolkits = normalizeToolkitList(input.requestedToolkits);
+
+  if (requestedToolkits.length === 0) {
+    const ordered = [...memberships].sort((a, b) => {
+      const aPreferred = preferredUserId.length > 0 && a.userId === preferredUserId;
+      const bPreferred = preferredUserId.length > 0 && b.userId === preferredUserId;
+      if (aPreferred !== bPreferred) {
+        return aPreferred ? -1 : 1;
+      }
+      return a.createdAt.getTime() - b.createdAt.getTime();
+    });
+    return [...new Set(ordered.map((item) => item.userId))];
+  }
+
+  const requestedCanonical = [...new Set(requestedToolkits.map(canonicalToolkitForExecutionLookup))];
+  const requestedVariants = [
+    ...new Set(requestedCanonical.flatMap((toolkit) => toolkitExecutionLookupVariants(toolkit)))
+  ];
+
+  const activeConnections = await prisma.userIntegration.findMany({
+    where: {
+      userId: {
+        in: memberships.map((item) => item.userId)
+      },
+      provider: "composio",
+      status: "ACTIVE",
+      toolkit: {
+        in: requestedVariants
+      },
+      OR: [{ orgId: input.orgId }, { orgId: null }]
+    },
+    select: {
+      userId: true,
+      toolkit: true
+    }
+  });
+
+  const coverageByUser = new Map<string, Set<string>>();
+  for (const connection of activeConnections) {
+    const canonicalToolkit = canonicalToolkitForExecutionLookup(connection.toolkit);
+    const set = coverageByUser.get(connection.userId) ?? new Set<string>();
+    set.add(canonicalToolkit);
+    coverageByUser.set(connection.userId, set);
+  }
+
+  const requestedCount = requestedCanonical.length;
+  const ranked = memberships
+    .map((membership) => {
+      const coverage = coverageByUser.get(membership.userId)?.size ?? 0;
+      const preferred = preferredUserId.length > 0 && membership.userId === preferredUserId;
+      return {
+        userId: membership.userId,
+        createdAt: membership.createdAt,
+        coverage,
+        preferred,
+        fullyCovered: requestedCount > 0 && coverage >= requestedCount
+      };
+    })
+    .sort((a, b) => {
+      if (a.fullyCovered !== b.fullyCovered) {
+        return a.fullyCovered ? -1 : 1;
+      }
+      if (a.coverage !== b.coverage) {
+        return b.coverage - a.coverage;
+      }
+      if (a.preferred !== b.preferred) {
+        return a.preferred ? -1 : 1;
+      }
+      return a.createdAt.getTime() - b.createdAt.getTime();
+    });
+
+  return [...new Set(ranked.map((item) => item.userId))];
 }
 
 function buildVirtualMainAgent(orgId: string) {
@@ -1578,6 +2333,29 @@ async function executeTaskById(
     return { ok: true, ignored: true, reason: "Task is already terminal." };
   }
 
+  if (task.status === TaskStatus.QUEUED) {
+    const claim = await prisma.task.updateMany({
+      where: {
+        id: task.id,
+        flowId: task.flowId,
+        status: TaskStatus.QUEUED
+      },
+      data: {
+        status: TaskStatus.RUNNING,
+        isPausedForInput: false,
+        humanInterventionReason: null
+      }
+    });
+
+    if (claim.count === 0) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "Task execution already claimed by another worker."
+      };
+    }
+  }
+
   let agent = task.agent;
   if (!agent) {
     agent =
@@ -1645,15 +2423,34 @@ async function executeTaskById(
 
   let traceRecord = asRecord(task.executionTrace);
   const traceToolkits = parseRequestedToolkitsFromTrace(task.executionTrace);
-  const promptToolkits = inferRequestedToolkits(task.prompt);
-  const requestedToolkits = [...new Set([...traceToolkits, ...promptToolkits])];
+  const promptWithoutToolkitMarker = task.prompt.replace(/\|\s*toolkits?\s*:[^\n|]+/gi, " ");
+  const semanticPromptToolkits = inferRequestedToolkits(promptWithoutToolkitMarker);
+  const promptToolkits =
+    semanticPromptToolkits.length > 0
+      ? semanticPromptToolkits
+      : inferRequestedToolkits(task.prompt);
+  const requestedToolkits = resolveTaskRequestedToolkits({
+    traceToolkits,
+    promptToolkits
+  });
 
-  const hasToolAccessLedger = Boolean(asRecord(traceRecord.toolAccessLedger).requestedAt);
-  if (requestedToolkits.length > 0 && !hasToolAccessLedger) {
+  const existingToolAccessLedger = asRecord(traceRecord.toolAccessLedger);
+  const hasToolAccessLedger = Boolean(existingToolAccessLedger.requestedAt);
+  const existingLedgerToolkits = Array.isArray(existingToolAccessLedger.requestedToolkits)
+    ? existingToolAccessLedger.requestedToolkits
+        .map((item) => (typeof item === "string" ? item.trim().toLowerCase() : ""))
+        .filter(Boolean)
+    : [];
+  const shouldRefreshToolAccessLedger =
+    requestedToolkits.length > 0 &&
+    (!hasToolAccessLedger ||
+      toolkitSetSignature(existingLedgerToolkits) !== toolkitSetSignature(requestedToolkits));
+  if (shouldRefreshToolAccessLedger) {
     const toolAccessLedger = {
       requestedAt: new Date().toISOString(),
       requestedToolkits,
-      action: "TASK_EXECUTION"
+      action: "TASK_EXECUTION",
+      source: promptToolkits.length > 0 ? "prompt_inference" : "trace_fallback"
     };
     traceRecord = {
       ...traceRecord,
@@ -1698,60 +2495,92 @@ async function executeTaskById(
 
   const traceInitiatedByUserId =
     typeof traceRecord.initiatedByUserId === "string" ? traceRecord.initiatedByUserId.trim() : "";
-  const executionUserId = await resolveExecutionUserId(
+  const preferredExecutionUserId = orchestratorUserIdHint || traceInitiatedByUserId || null;
+  const executionUserCandidates = await listExecutionUserCandidates({
     orgId,
-    orchestratorUserIdHint || traceInitiatedByUserId || null
-  );
+    preferredUserId: preferredExecutionUserId,
+    requestedToolkits
+  });
+  let executionUserId: string | null = executionUserCandidates[0] ?? null;
 
   let toolBindings: AgentToolBindingSummary[] = [];
-  if (requestedToolkits.length > 0 && !executionUserId) {
-    const integrationError = {
-      code: "INTEGRATION_NOT_CONNECTED" as const,
-      toolkit: requestedToolkits[0],
-      action: "TASK_EXECUTION"
-    };
-    return handleEvent({
-      name: "vorldx/task.paused",
-      data: {
-        orgId,
-        taskId: task.id,
-        reason: `Tool integration "${requestedToolkits[0]}" is required before this task can continue.`,
-        integrationError,
-        executionTrace: {
-          requestedToolkits,
-          integrationError
-        }
-      }
-    }, origin);
-  }
-
-  if (requestedToolkits.length > 0 && executionUserId) {
-    try {
-      const toolsForAgent = await getToolsForAgent({
-        userId: executionUserId,
-        orgId,
-        requestedToolkits,
+  if (requestedToolkits.length > 0) {
+    if (executionUserCandidates.length === 0) {
+      const integrationError = {
+        code: "INTEGRATION_NOT_CONNECTED" as const,
+        toolkit: requestedToolkits[0],
         action: "TASK_EXECUTION"
-      });
+      };
+      return handleEvent({
+        name: "vorldx/task.paused",
+        data: {
+          orgId,
+          taskId: task.id,
+          reason: `Tool integration "${requestedToolkits[0]}" is required before this task can continue.`,
+          integrationError,
+          executionTrace: {
+            requestedToolkits,
+            integrationError
+          }
+        }
+      }, origin);
+    }
 
-      if (!toolsForAgent.ok && toolsForAgent.error) {
+    const executionCandidateWindow = executionUserCandidates.slice(
+      0,
+      Math.max(1, TOOL_EXECUTION_USER_CANDIDATE_LIMIT)
+    );
+    let lastIntegrationError: {
+      code: "INTEGRATION_NOT_CONNECTED";
+      toolkit: string;
+      action: string;
+      connectUrl?: string;
+    } | null = null;
+    let lastIntegrationFailure = "";
+    let resolvedExecutionUserId: string | null = null;
+
+    for (const candidateUserId of executionCandidateWindow) {
+      try {
+        const toolsForAgent = await getToolsForAgent({
+          userId: candidateUserId,
+          orgId,
+          requestedToolkits,
+          action: "TASK_EXECUTION"
+        });
+
+        if (!toolsForAgent.ok && toolsForAgent.error) {
+          lastIntegrationError = toolsForAgent.error;
+          continue;
+        }
+
+        resolvedExecutionUserId = candidateUserId;
+        toolBindings = toolsForAgent.bindings;
+        break;
+      } catch (error) {
+        lastIntegrationFailure =
+          error instanceof Error ? error.message : "Integration resolver unavailable.";
+      }
+    }
+
+    executionUserId = resolvedExecutionUserId;
+    if (!executionUserId) {
+      if (lastIntegrationError) {
         return handleEvent({
           name: "vorldx/task.paused",
           data: {
             orgId,
             taskId: task.id,
-            reason: `Tool integration "${toolsForAgent.error.toolkit}" is not connected.`,
-            integrationError: toolsForAgent.error,
+            reason: `Tool integration "${lastIntegrationError.toolkit}" is not connected.`,
+            integrationError: lastIntegrationError,
             executionTrace: {
               requestedToolkits,
-              integrationError: toolsForAgent.error
+              executionUserCandidates: executionCandidateWindow,
+              integrationError: lastIntegrationError
             }
           }
         }, origin);
       }
 
-      toolBindings = toolsForAgent.bindings;
-    } catch (error) {
       const toolkit = requestedToolkits[0] ?? "unknown";
       return handleEvent({
         name: "vorldx/task.paused",
@@ -1766,8 +2595,8 @@ async function executeTaskById(
           },
           executionTrace: {
             requestedToolkits,
-            integrationFailure:
-              error instanceof Error ? error.message : "Integration resolver unavailable."
+            executionUserCandidates: executionCandidateWindow,
+            integrationFailure: lastIntegrationFailure || "Integration resolver unavailable."
           }
         }
       }, origin);
@@ -1808,6 +2637,7 @@ async function executeTaskById(
     prompt: task.prompt,
     mode: executionMode,
     agentId: logicalAgent.id,
+    userId: executionUserId,
     parentRunId: asString(asRecord(asRecord(task.executionTrace).agentRuntime).agentRunId) || null,
     requiredToolkits: requestedToolkits,
     budgetSnapshot
@@ -1985,7 +2815,8 @@ async function executeTaskById(
       contextPack: toInputJsonValue({
         summary: contextPack.summary,
         delegatedTo: activeLogicalAgent.id,
-        executionMode: contextPack.executionMode
+        executionMode: contextPack.executionMode,
+        contextSelectionTrace: contextPack.selectionTrace ?? null
       }),
       decisionType: effectiveDecision.decision,
       decisionReason: effectiveDecision.reason,
@@ -2009,13 +2840,42 @@ async function executeTaskById(
       memoryHighlights: contextPack.memoryHighlights,
       dnaHighlights: contextPack.dnaHighlights,
       executionMode: contextPack.executionMode,
-      budgetSnapshot: contextPack.budgetSnapshot
+      budgetSnapshot: contextPack.budgetSnapshot,
+      contextSelectionTrace: contextPack.selectionTrace ?? null
     }),
     decisionType: effectiveDecision.decision,
     decisionReason: effectiveDecision.reason,
     executionMode,
     budgetBefore: budgetSnapshot.remainingBudgetUsd,
     estimatedCostUsd: effectiveDecision.estimatedCostUsd
+  });
+
+  await persistMemoryCandidateSafe({
+    orgId,
+    userId: executionUserId,
+    agentId: activeLogicalAgent.id,
+    sessionId: task.flowId,
+    projectId: task.flowId,
+    source: "agent_decision",
+    memoryType: "TASK",
+    visibility: "SHARED",
+    tags: ["decision", effectiveDecision.decision.toLowerCase()],
+    importanceHint: 0.72,
+    summary: `${effectiveDecision.decision}: ${truncateText(effectiveDecision.reason, 180)}`,
+    content: [
+      `Task prompt: ${truncateText(task.prompt, 1200)}`,
+      `Decision: ${effectiveDecision.decision}`,
+      `Reason: ${truncateText(effectiveDecision.reason, 500)}`,
+      `Execution mode: ${executionMode}`,
+      `Required toolkits: ${requestedToolkits.join(", ") || "none"}`
+    ].join("\\n"),
+    metadata: toInputJsonValue({
+      flowId: task.flowId,
+      taskId: task.id,
+      agentRunId: agentRun.id,
+      estimatedCostUsd: effectiveDecision.estimatedCostUsd,
+      estimatedDelegationCostUsd: effectiveDecision.estimatedDelegationCostUsd
+    })
   });
 
   if (createdDelegatorRun && parentRunId) {
@@ -2061,6 +2921,8 @@ async function executeTaskById(
     }
   }
 
+  const workflowSteps: WorkflowStepBreakdown[] = [];
+
   if (
     effectiveDecision.decision === AgentDecisionType.HALT_BUDGET ||
     effectiveDecision.decision === AgentDecisionType.HALT_POLICY ||
@@ -2070,6 +2932,31 @@ async function executeTaskById(
       effectiveDecision.decision === AgentDecisionType.HALT_BUDGET
         ? `Budget policy halted execution: ${effectiveDecision.reason}`
         : effectiveDecision.reason;
+
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "agent_halt",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: ["halt", effectiveDecision.decision.toLowerCase(), "human_touch"],
+      importanceHint: 0.86,
+      summary: truncateText(reason, 220),
+      content: [
+        `Task ${task.id} paused before execution.`,
+        `Decision: ${effectiveDecision.decision}`,
+        `Reason: ${truncateText(reason, 1000)}`
+      ].join("\\n"),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        policyDecision: effectiveDecision
+      })
+    });
 
     await createApprovalCheckpoint({
       orgId,
@@ -2139,6 +3026,35 @@ async function executeTaskById(
   const inferredToolAction = inferredToolPlan.action;
   let toolActionExecution: ToolActionExecutionResult | null = null;
 
+  if (inferredToolPlan.metrics) {
+    try {
+      await prisma.log.create({
+        data: {
+          orgId,
+          type: LogType.EXE,
+          actor: "TOOL_ROUTER",
+          message: `task=${task.id}; mode=${inferredToolPlan.metrics.mode}; tokens=${inferredToolPlan.metrics.totalTokens}; latencyMs=${inferredToolPlan.metrics.latencyMs}; provider=${inferredToolPlan.metrics.provider ?? "none"}; model=${inferredToolPlan.metrics.model ?? "none"}; catalogSize=${inferredToolPlan.metrics.catalogSize}`
+        }
+      });
+    } catch {
+      // Router telemetry is best-effort only.
+    }
+
+    workflowSteps.push({
+      step: "tool_router",
+      model: inferredToolPlan.metrics.model,
+      provider: inferredToolPlan.metrics.provider,
+      promptTokens: inferredToolPlan.metrics.promptTokens,
+      completionTokens: inferredToolPlan.metrics.completionTokens,
+      totalTokens: inferredToolPlan.metrics.totalTokens,
+      latencyMs: inferredToolPlan.metrics.latencyMs,
+      retryCount: inferredToolPlan.metrics.fallbackUsed ? 1 : 0,
+      fallbackCount: inferredToolPlan.metrics.fallbackUsed ? 1 : 0,
+      tool: null,
+      success: Boolean(inferredToolAction) || !inferredToolPlan.reason
+    });
+  }
+
   if (inferredToolPlan.reason) {
     const reason = inferredToolPlan.reason;
     await createApprovalCheckpoint({
@@ -2152,7 +3068,8 @@ async function executeTaskById(
         decision: AgentDecisionType.ASK_HUMAN
       }),
       metadata: toInputJsonValue({
-        requestedToolkits
+        requestedToolkits,
+        toolInferenceMetrics: inferredToolPlan.metrics ?? null
       })
     });
 
@@ -2173,6 +3090,7 @@ async function executeTaskById(
         reason,
         executionTrace: {
           policyDecision: effectiveDecision,
+          toolInferenceMetrics: inferredToolPlan.metrics ?? null,
           agentRunId: agentRun.id
         }
       }
@@ -2228,10 +3146,11 @@ async function executeTaskById(
     }, origin);
   }
 
+  const primaryToolStartedAt = inferredToolAction ? Date.now() : 0;
   if (inferredToolAction && executionUserId && origin) {
     try {
       const internalKey = resolveAgentExecutionKey();
-      const executeResponse = await fetch(`${origin}/api/agent/tools/execute`, {
+      const executeResponse = await fetchWithTimeout(`${origin}/api/agent/tools/execute`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -2245,8 +3164,7 @@ async function executeTaskById(
           action: inferredToolAction.action,
           arguments: inferredToolAction.arguments,
           taskId: task.id
-        }),
-        cache: "no-store"
+        })
       });
 
       const executePayload = (await executeResponse.json().catch(() => null)) as
@@ -2320,11 +3238,32 @@ async function executeTaskById(
     }
   }
 
+  if (inferredToolAction) {
+    workflowSteps.push({
+      step: "tool_execute_primary",
+      model: null,
+      provider: null,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs: primaryToolStartedAt > 0 ? Date.now() - primaryToolStartedAt : 0,
+      retryCount:
+        toolActionExecution && typeof toolActionExecution.attempts === "number"
+          ? Math.max(0, toolActionExecution.attempts - 1)
+          : 0,
+      fallbackCount: 0,
+      tool: `${inferredToolAction.toolkit}:${inferredToolAction.action}`,
+      success: toolActionExecution?.ok === true
+    });
+  }
+
   let followupToolActionExecution: ToolActionExecutionResult | null = null;
+  let notificationToolActionExecution: ToolActionExecutionResult | null = null;
   const primaryToolSuccess = toolActionExecution?.ok
     ? (toolActionExecution as ToolActionExecutionSuccess)
     : null;
   const recipientEmail = extractFirstEmail(task.prompt);
+  const recipientPhone = extractFirstPhoneNumber(task.prompt);
   const meetingUri =
     primaryToolSuccess && primaryToolSuccess.toolkit === "googlemeet"
       ? extractMeetingUriFromToolData(primaryToolSuccess.data)
@@ -2335,12 +3274,28 @@ async function executeTaskById(
       executionUserId &&
       recipientEmail &&
       shouldSendMeetingDetailsEmail(task.prompt) &&
-      requestedToolkits.includes("gmail") &&
+      requestedToolkitIncludesForExecution(requestedToolkits, "gmail") &&
       primaryToolSuccess &&
       primaryToolSuccess.toolkit === "googlemeet" &&
       primaryToolSuccess.action.includes("CREATE") &&
       meetingUri
     );
+  const whatsappBinding = pickWhatsappSendBinding(toolBindings);
+  const notificationIntentRequested = Boolean(
+    origin &&
+    executionUserId &&
+    shouldSendMeetingNotification(task.prompt) &&
+    requestedToolkitIncludesForExecution(requestedToolkits, "whatsapp") &&
+    primaryToolSuccess &&
+    primaryToolSuccess.toolkit === "googlemeet" &&
+    primaryToolSuccess.action.includes("CREATE") &&
+    meetingUri
+  );
+  const shouldAttemptMeetingNotification = Boolean(
+    notificationIntentRequested && recipientPhone && whatsappBinding
+  );
+  const followupToolStartedAt = shouldAttemptMeetingEmail ? Date.now() : 0;
+  const notificationToolStartedAt = shouldAttemptMeetingNotification ? Date.now() : 0;
 
   if (shouldAttemptMeetingEmail && executionUserId && origin && recipientEmail) {
     const sendMarkerKey = `flow.meeting-email.sent.${task.flowId}.${recipientEmail.toLowerCase()}`;
@@ -2366,7 +3321,7 @@ async function executeTaskById(
 
       try {
         const internalKey = resolveAgentExecutionKey();
-        const executeResponse = await fetch(`${origin}/api/agent/tools/execute`, {
+        const executeResponse = await fetchWithTimeout(`${origin}/api/agent/tools/execute`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -2380,8 +3335,7 @@ async function executeTaskById(
             action: "SEND_EMAIL",
             arguments: emailArguments,
             taskId: task.id
-          }),
-          cache: "no-store"
+          })
         });
 
         const executePayload = (await executeResponse.json().catch(() => null)) as
@@ -2470,6 +3424,25 @@ async function executeTaskById(
     }
   }
 
+  if (shouldAttemptMeetingEmail) {
+    workflowSteps.push({
+      step: "tool_execute_followup_email",
+      model: null,
+      provider: null,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs: followupToolStartedAt > 0 ? Date.now() - followupToolStartedAt : 0,
+      retryCount:
+        followupToolActionExecution && typeof followupToolActionExecution.attempts === "number"
+          ? Math.max(0, followupToolActionExecution.attempts - 1)
+          : 0,
+      fallbackCount: 0,
+      tool: "gmail:SEND_EMAIL",
+      success: followupToolActionExecution?.ok === true
+    });
+  }
+
   if (followupToolActionExecution && !followupToolActionExecution.ok) {
     const reason = `Meeting details email failed: ${followupToolActionExecution.error.message}`;
     await createApprovalCheckpoint({
@@ -2503,6 +3476,270 @@ async function executeTaskById(
         executionTrace: {
           policyDecision: effectiveDecision,
           followupToolActionExecution,
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
+
+  if (notificationIntentRequested && !recipientPhone) {
+    const reason =
+      "WhatsApp notification requested but recipient phone is missing. Provide phone number to continue.";
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      metadata: toInputJsonValue({
+        requestedToolkits,
+        requiredField: "recipient_phone"
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        reason,
+        requestedToolkits
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          missingInput: "recipient_phone",
+          agentRunId: agentRun.id
+        }
+      }
+    }, origin);
+  }
+
+  if (notificationIntentRequested && !whatsappBinding) {
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason: 'Tool integration "whatsapp" is not connected.',
+        integrationError: {
+          code: "INTEGRATION_NOT_CONNECTED",
+          toolkit: "whatsapp",
+          action: "SEND_MESSAGE"
+        },
+        executionTrace: {
+          requestedToolkits,
+          integrationError: {
+            code: "INTEGRATION_NOT_CONNECTED",
+            toolkit: "whatsapp",
+            action: "SEND_MESSAGE"
+          }
+        }
+      }
+    }, origin);
+  }
+
+  if (shouldAttemptMeetingNotification && executionUserId && origin && recipientPhone && whatsappBinding) {
+    const recipientKey = recipientPhone.replace(/[^+\d]/g, "");
+    const sendMarkerKey = `flow.meeting-notification.sent.${task.flowId}.${recipientKey}`;
+    const alreadySent = await prisma.memoryEntry.findFirst({
+      where: {
+        orgId,
+        flowId: task.flowId,
+        tier: MemoryTier.WORKING,
+        key: sendMarkerKey,
+        redactedAt: null
+      },
+      select: { id: true }
+    });
+
+    if (!alreadySent) {
+      const meetingCode = asString(asRecord(primaryToolSuccess?.data).meetingCode);
+      const notificationArguments = buildMeetingNotification({
+        recipientPhone,
+        meetingUri,
+        ...(meetingCode ? { meetingCode } : {}),
+        prompt: task.prompt
+      });
+
+      try {
+        const internalKey = resolveAgentExecutionKey();
+        const executeResponse = await fetchWithTimeout(`${origin}/api/agent/tools/execute`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...buildInternalApiHeaders(),
+            ...(internalKey ? { "x-agent-exec-key": internalKey } : {})
+          },
+          body: JSON.stringify({
+            orgId,
+            userId: executionUserId,
+            toolkit: whatsappBinding.toolkit,
+            action: whatsappBinding.slug.toUpperCase(),
+            arguments: {
+              ...notificationArguments,
+              meeting_uri: meetingUri,
+              meeting_link: meetingUri,
+              ...(recipientEmail
+                ? { recipient_email: recipientEmail, email: recipientEmail }
+                : {})
+            },
+            taskId: task.id
+          })
+        });
+
+        const executePayload = (await executeResponse.json().catch(() => null)) as
+          | {
+              ok?: boolean;
+              result?: ToolActionExecutionResult;
+              error?: {
+                code?: string;
+                message?: string;
+                toolkit?: string;
+                action?: string;
+                connectUrl?: string;
+              };
+              attempts?: number;
+            }
+          | null;
+
+        if (!executeResponse.ok || !executePayload?.ok || !executePayload.result) {
+          const integrationError =
+            executePayload?.error?.code === "INTEGRATION_NOT_CONNECTED"
+              ? {
+                  code: "INTEGRATION_NOT_CONNECTED" as const,
+                  toolkit: executePayload.error.toolkit || whatsappBinding.toolkit,
+                  action: executePayload.error.action || whatsappBinding.slug.toUpperCase(),
+                  ...(executePayload.error.connectUrl
+                    ? { connectUrl: executePayload.error.connectUrl }
+                    : {})
+                }
+              : null;
+
+          if (integrationError) {
+            return handleEvent({
+              name: "vorldx/task.paused",
+              data: {
+                orgId,
+                taskId: task.id,
+                reason: `Tool integration "${integrationError.toolkit}" is not connected.`,
+                integrationError,
+                executionTrace: {
+                  requestedToolkits,
+                  integrationError
+                }
+              }
+            }, origin);
+          }
+
+          notificationToolActionExecution = {
+            ok: false,
+            attempts: executePayload?.attempts ?? 1,
+            error: {
+              code: executePayload?.error?.code || "TOOLS_UNAVAILABLE",
+              message: executePayload?.error?.message || "Follow-up notification execution failed.",
+              toolkit: whatsappBinding.toolkit,
+              action: whatsappBinding.slug.toUpperCase()
+            }
+          };
+        } else {
+          notificationToolActionExecution = executePayload.result;
+          await prisma.memoryEntry.create({
+            data: {
+              orgId,
+              flowId: task.flowId,
+              taskId: task.id,
+              tier: MemoryTier.WORKING,
+              key: sendMarkerKey,
+              value: toInputJsonValue({
+                sentAt: new Date().toISOString(),
+                recipientPhone,
+                meetingUri,
+                action: whatsappBinding.slug.toUpperCase()
+              })
+            }
+          });
+        }
+      } catch (error) {
+        notificationToolActionExecution = {
+          ok: false,
+          attempts: 1,
+          error: {
+            code: "TOOLS_UNAVAILABLE",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Follow-up notification execution failed.",
+            toolkit: whatsappBinding.toolkit,
+            action: whatsappBinding.slug.toUpperCase()
+          }
+        };
+      }
+    }
+  }
+
+  if (notificationIntentRequested) {
+    workflowSteps.push({
+      step: "tool_execute_followup_notification",
+      model: null,
+      provider: null,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs: notificationToolStartedAt > 0 ? Date.now() - notificationToolStartedAt : 0,
+      retryCount:
+        notificationToolActionExecution && typeof notificationToolActionExecution.attempts === "number"
+          ? Math.max(0, notificationToolActionExecution.attempts - 1)
+          : 0,
+      fallbackCount: 0,
+      tool: whatsappBinding
+        ? `${whatsappBinding.toolkit}:${whatsappBinding.slug.toUpperCase()}`
+        : "whatsapp:SEND_MESSAGE",
+      success: notificationToolActionExecution?.ok === true
+    });
+  }
+
+  if (notificationToolActionExecution && !notificationToolActionExecution.ok) {
+    const reason = `Meeting notification failed: ${notificationToolActionExecution.error.message}`;
+    await createApprovalCheckpoint({
+      orgId,
+      flowId: task.flowId,
+      taskId: task.id,
+      agentId: activeLogicalAgent.id,
+      agentRunId: agentRun.id,
+      reason,
+      metadata: toInputJsonValue({
+        notificationToolActionExecution
+      })
+    });
+
+    await finalizeAgentRun({
+      runId: agentRun.id,
+      status: AgentStatus.WAITING_HUMAN,
+      budgetAfter: budgetSnapshot.remainingBudgetUsd,
+      metadata: toInputJsonValue({
+        reason,
+        notificationToolActionExecution
+      })
+    });
+
+    return handleEvent({
+      name: "vorldx/task.paused",
+      data: {
+        orgId,
+        taskId: task.id,
+        reason,
+        executionTrace: {
+          policyDecision: effectiveDecision,
+          notificationToolActionExecution,
           agentRunId: agentRun.id
         }
       }
@@ -2640,6 +3877,12 @@ async function executeTaskById(
   const followupToolActionFailure = followupToolActionExecution && !followupToolActionExecution.ok
     ? (followupToolActionExecution as ToolActionExecutionFailure)
     : null;
+  const notificationToolActionSuccess = notificationToolActionExecution?.ok
+    ? (notificationToolActionExecution as ToolActionExecutionSuccess)
+    : null;
+  const notificationToolActionFailure = notificationToolActionExecution && !notificationToolActionExecution.ok
+    ? (notificationToolActionExecution as ToolActionExecutionFailure)
+    : null;
 
   const toolActionContextBlocks =
     toolActionSuccess
@@ -2652,7 +3895,11 @@ async function executeTaskById(
               toolkit: toolActionSuccess.toolkit,
               action: toolActionSuccess.action,
               toolSlug: toolActionSuccess.toolSlug,
-              data: toolActionSuccess.data
+              data: normalizeToolDataForModelContext({
+                toolkit: toolActionSuccess.toolkit,
+                action: toolActionSuccess.action,
+                data: toolActionSuccess.data
+              })
             })
           }
         ]
@@ -2680,7 +3927,11 @@ async function executeTaskById(
               toolkit: followupToolActionSuccess.toolkit,
               action: followupToolActionSuccess.action,
               toolSlug: followupToolActionSuccess.toolSlug,
-              data: followupToolActionSuccess.data
+              data: normalizeToolDataForModelContext({
+                toolkit: followupToolActionSuccess.toolkit,
+                action: followupToolActionSuccess.action,
+                data: followupToolActionSuccess.data
+              })
             })
           }
         ]
@@ -2696,27 +3947,302 @@ async function executeTaskById(
           }
         ]
       : [];
+  const notificationToolActionContextBlocks =
+    notificationToolActionSuccess
+      ? [
+          {
+            id: "composio-tool-action-notification-result",
+            name: "Executed Notification Tool Result",
+            amnesiaProtected: false,
+            content: toContextJson({
+              toolkit: notificationToolActionSuccess.toolkit,
+              action: notificationToolActionSuccess.action,
+              toolSlug: notificationToolActionSuccess.toolSlug,
+              data: normalizeToolDataForModelContext({
+                toolkit: notificationToolActionSuccess.toolkit,
+                action: notificationToolActionSuccess.action,
+                data: notificationToolActionSuccess.data
+              })
+            })
+          }
+        ]
+      : [];
+  const notificationToolActionErrorContextBlocks =
+    notificationToolActionFailure
+      ? [
+          {
+            id: "composio-tool-action-notification-error",
+            name: "Notification Tool Action Error",
+            amnesiaProtected: false,
+            content: toContextJson(notificationToolActionFailure.error, 1400)
+          }
+        ]
+      : [];
 
   const taskExecutionMaxOutputTokens =
     executionMode === "ECO" ? 420 : executionMode === "TURBO" ? 900 : 650;
-
-  const execution = await executeSwarmAgent({
-    taskId: task.id,
-    flowId: task.flowId,
+  const deterministicToolSummary = buildDeterministicToolSummary({
     prompt: task.prompt,
-    agent: runtimeAgent,
-    contextBlocks: [
-      ...context.contextBlocks,
-      ...contextPack.blocks,
-      ...integrationContextBlocks,
-      ...toolActionContextBlocks,
-      ...toolActionErrorContextBlocks,
-      ...followupToolActionContextBlocks,
-      ...followupToolActionErrorContextBlocks
-    ],
-    organizationRuntime: await getOrgLlmRuntime(orgId),
-    maxOutputTokens: taskExecutionMaxOutputTokens
+    primaryToolSuccess: toolActionSuccess,
+    followupToolActionSuccess,
+    notificationToolActionSuccess
   });
+  const deterministicResponseUsed = Boolean(deterministicToolSummary);
+
+  const execution = deterministicToolSummary
+    ? {
+        ok: true as const,
+        outputText: deterministicToolSummary,
+        fallbackUsed: false,
+        usedProvider: "deterministic",
+        usedModel: "none",
+        apiSource: "none" as const,
+        tokenUsage: {
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0
+        },
+        billing: {
+          mode: "BYOK" as const,
+          plan: "STARTER" as const,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          baseCostUsd: 0,
+          serviceFeeUsd: 0,
+          totalCostUsd: 0
+        },
+        trace: {
+          mode: "deterministic_tool_short_circuit",
+          reason: "tool output already provides final user-facing response",
+          toolAction: toolActionSuccess
+            ? {
+                toolkit: toolActionSuccess.toolkit,
+                action: toolActionSuccess.action
+              }
+            : null,
+          followupToolAction: followupToolActionSuccess
+            ? {
+                toolkit: followupToolActionSuccess.toolkit,
+                action: followupToolActionSuccess.action
+              }
+            : null,
+          notificationToolAction: notificationToolActionSuccess
+            ? {
+                toolkit: notificationToolActionSuccess.toolkit,
+                action: notificationToolActionSuccess.action
+              }
+            : null,
+          durationMs: 0
+        }
+      }
+    : await executeSwarmAgent({
+        taskId: task.id,
+        flowId: task.flowId,
+        prompt: task.prompt,
+        agent: runtimeAgent,
+        contextBlocks: [
+          ...context.contextBlocks,
+          ...contextPack.blocks,
+          ...integrationContextBlocks,
+          ...toolActionContextBlocks,
+          ...toolActionErrorContextBlocks,
+          ...followupToolActionContextBlocks,
+          ...followupToolActionErrorContextBlocks,
+          ...notificationToolActionContextBlocks,
+          ...notificationToolActionErrorContextBlocks
+        ],
+        organizationRuntime: await getOrgLlmRuntime(orgId),
+        maxOutputTokens: taskExecutionMaxOutputTokens
+      });
+  workflowSteps.push({
+    step: deterministicResponseUsed ? "deterministic_tool_response" : "agent_response",
+    model: execution.usedModel ?? null,
+    provider: execution.usedProvider ?? null,
+    promptTokens: execution.tokenUsage?.promptTokens ?? 0,
+    completionTokens: execution.tokenUsage?.completionTokens ?? 0,
+    totalTokens: execution.tokenUsage?.totalTokens ?? 0,
+    latencyMs:
+      typeof execution.trace.durationMs === "number" ? execution.trace.durationMs : 0,
+    retryCount: execution.fallbackUsed ? 1 : 0,
+    fallbackCount: execution.fallbackUsed ? 1 : 0,
+    tool: null,
+    success: execution.ok
+  });
+  const workflowTelemetry = summarizeWorkflowBreakdown(agentRun.id, workflowSteps);
+
+  const primaryToolResultNormalized = toolActionSuccess
+    ? normalizeToolDataForModelContext({
+        toolkit: toolActionSuccess.toolkit,
+        action: toolActionSuccess.action,
+        data: toolActionSuccess.data
+      })
+    : null;
+  const followupToolResultNormalized = followupToolActionSuccess
+    ? normalizeToolDataForModelContext({
+        toolkit: followupToolActionSuccess.toolkit,
+        action: followupToolActionSuccess.action,
+        data: followupToolActionSuccess.data
+      })
+    : null;
+  const notificationToolResultNormalized = notificationToolActionSuccess
+    ? normalizeToolDataForModelContext({
+        toolkit: notificationToolActionSuccess.toolkit,
+        action: notificationToolActionSuccess.action,
+        data: notificationToolActionSuccess.data
+      })
+    : null;
+
+  if (toolActionSuccess && primaryToolResultNormalized) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "tool_result_primary",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: [
+        "tool_result",
+        toolActionSuccess.toolkit.toLowerCase(),
+        toolActionSuccess.action.toLowerCase()
+      ],
+      importanceHint: 0.74,
+      summary: `${toolActionSuccess.toolkit}:${toolActionSuccess.action} completed`,
+      content: toContextJson({
+        toolkit: toolActionSuccess.toolkit,
+        action: toolActionSuccess.action,
+        data: primaryToolResultNormalized
+      }, 1800),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        toolSlug: toolActionSuccess.toolSlug
+      })
+    });
+  }
+
+  if (followupToolActionSuccess && followupToolResultNormalized) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "tool_result_followup",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: [
+        "tool_result",
+        "followup",
+        followupToolActionSuccess.toolkit.toLowerCase(),
+        followupToolActionSuccess.action.toLowerCase()
+      ],
+      importanceHint: 0.68,
+      summary: `${followupToolActionSuccess.toolkit}:${followupToolActionSuccess.action} completed`,
+      content: toContextJson({
+        toolkit: followupToolActionSuccess.toolkit,
+        action: followupToolActionSuccess.action,
+        data: followupToolResultNormalized
+      }, 1600),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        toolSlug: followupToolActionSuccess.toolSlug
+      })
+    });
+  }
+
+  if (notificationToolActionSuccess && notificationToolResultNormalized) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "tool_result_notification",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: [
+        "tool_result",
+        "notification",
+        notificationToolActionSuccess.toolkit.toLowerCase(),
+        notificationToolActionSuccess.action.toLowerCase()
+      ],
+      importanceHint: 0.66,
+      summary: `${notificationToolActionSuccess.toolkit}:${notificationToolActionSuccess.action} completed`,
+      content: toContextJson(
+        {
+          toolkit: notificationToolActionSuccess.toolkit,
+          action: notificationToolActionSuccess.action,
+          data: notificationToolResultNormalized
+        },
+        1600
+      ),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        toolSlug: notificationToolActionSuccess.toolSlug
+      })
+    });
+  }
+
+  if (toolActionFailure) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "tool_error_primary",
+      memoryType: "WORKING",
+      visibility: "SHARED",
+      tags: [
+        "tool_error",
+        toolActionFailure.error.toolkit.toLowerCase(),
+        toolActionFailure.error.action.toLowerCase()
+      ],
+      importanceHint: 0.82,
+      summary: truncateText(toolActionFailure.error.message, 220),
+      content: toContextJson(toolActionFailure.error, 1400),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id
+      })
+    });
+  }
+
+  if (notificationToolActionFailure) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "tool_error_notification",
+      memoryType: "WORKING",
+      visibility: "SHARED",
+      tags: [
+        "tool_error",
+        "notification",
+        notificationToolActionFailure.error.toolkit.toLowerCase(),
+        notificationToolActionFailure.error.action.toLowerCase()
+      ],
+      importanceHint: 0.78,
+      summary: truncateText(notificationToolActionFailure.error.message, 220),
+      content: toContextJson(notificationToolActionFailure.error, 1400),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id
+      })
+    });
+  }
 
   const executionTrace = {
     ...execution.trace,
@@ -2726,8 +4252,57 @@ async function executeTaskById(
     requestedToolkits,
     inferredToolAction,
     toolInferenceReason: inferredToolPlan.reason ?? null,
+    toolInferenceMetrics: inferredToolPlan.metrics ?? null,
+    deterministicToolResponseUsed: deterministicResponseUsed,
     toolActionExecution: sanitizeToolValueForContext(toolActionExecution),
     followupToolActionExecution: sanitizeToolValueForContext(followupToolActionExecution),
+    notificationToolActionExecution: sanitizeToolValueForContext(notificationToolActionExecution),
+    workflowTelemetry,
+    workflowState: {
+      request: {
+        prompt: task.prompt,
+        requestedToolkits
+      },
+      context: {
+        summary: contextPack.summary,
+        selectionTrace: contextPack.selectionTrace ?? null
+      },
+      entities: {
+        recipientEmail: recipientEmail || null,
+        recipientPhone: recipientPhone || null,
+        meetingUri: meetingUri || null
+      },
+      decisions: {
+        delegation: {
+          decision: effectiveDecision.decision,
+          reason: effectiveDecision.reason,
+          targetRole: effectiveDecision.targetRole
+        },
+        toolRouter: {
+          inferredToolAction,
+          reason: inferredToolPlan.reason ?? null
+        }
+      },
+      tool_results_raw: {
+        primary: sanitizeToolValueForContext(toolActionExecution),
+        followup: sanitizeToolValueForContext(followupToolActionExecution),
+        notification: sanitizeToolValueForContext(notificationToolActionExecution)
+      },
+      tool_results_normalized: {
+        primary: primaryToolResultNormalized,
+        followup: followupToolResultNormalized,
+        notification: notificationToolResultNormalized
+      },
+      agent_outputs: {
+        deterministicToolSummary: deterministicToolSummary ?? null
+      },
+      final_output: execution.ok ? (execution.outputText?.slice(0, 1400) ?? "") : null,
+      metadata: {
+        taskId: task.id,
+        flowId: task.flowId,
+        agentRunId: agentRun.id
+      }
+    },
     toolBindings: toolBindings.map((item) => ({
       toolkit: item.toolkit,
       slug: item.slug
@@ -2744,6 +4319,7 @@ async function executeTaskById(
       estimatedSelfCostUsd,
       estimatedDelegationCostUsd,
       contextSummary: contextPack.summary,
+      contextSelectionTrace: contextPack.selectionTrace ?? null,
       memoryHighlights: contextPack.memoryHighlights,
       dnaHighlights: contextPack.dnaHighlights,
       sharedBrainFromMain: sharedBrain.inherited,
@@ -2751,8 +4327,44 @@ async function executeTaskById(
     }
   };
 
+  try {
+    await prisma.log.create({
+      data: {
+        orgId,
+        type: LogType.EXE,
+        actor: "WORKFLOW_TELEMETRY",
+        message: `task=${task.id}; workflowId=${workflowTelemetry.workflowId}; modelCalls=${workflowTelemetry.totals.modelCalls}; totalTokens=${workflowTelemetry.totals.totalTokens}; promptTokens=${workflowTelemetry.totals.promptTokens}; completionTokens=${workflowTelemetry.totals.completionTokens}; retryCount=${workflowTelemetry.totals.retryCount}; fallbackCount=${workflowTelemetry.totals.fallbackCount}`
+      }
+    });
+  } catch {
+    // Workflow telemetry logging is best-effort only.
+  }
+
   if (!execution.ok) {
     const errorText = execution.error ?? "Agent execution failed.";
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "agent_execution_error",
+      memoryType: "WORKING",
+      visibility: "SHARED",
+      tags: ["error", "execution"],
+      importanceHint: 0.88,
+      summary: truncateText(errorText, 220),
+      content: [
+        `Task ${task.id} execution failed.`,
+        `Error: ${truncateText(errorText, 1200)}`
+      ].join("\\n"),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id
+      })
+    });
+
     const requiresHumanTouch = /missing|invalid|unauthorized|forbidden|not found|quota|model|401|403|404|429/i.test(
       errorText.toLowerCase()
     );
@@ -2811,6 +4423,30 @@ async function executeTaskById(
   const outputText = execution.outputText?.trim() ?? "";
   const humanInputReason = inferHumanInputReasonFromOutput(outputText);
   if (humanInputReason) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "human_touch_required",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: ["human_touch", "approval_required"],
+      importanceHint: 0.9,
+      summary: truncateText(humanInputReason, 220),
+      content: [
+        `Task ${task.id} requires human input.`,
+        `Reason: ${truncateText(humanInputReason, 900)}`,
+        `Output preview: ${truncateText(outputText, 600)}`
+      ].join("\\n"),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id
+      })
+    });
+
     await createApprovalCheckpoint({
       orgId,
       flowId: task.flowId,
@@ -2852,6 +4488,31 @@ async function executeTaskById(
     toolActionExecution
   });
   if (unverifiedActionReason) {
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "hallucination_guard_pause",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: ["hallucination_guard", "human_touch"],
+      importanceHint: 0.92,
+      summary: truncateText(unverifiedActionReason, 220),
+      content: [
+        `Task ${task.id} paused by hallucination guard.`,
+        `Reason: ${truncateText(unverifiedActionReason, 900)}`,
+        `Output preview: ${truncateText(outputText, 600)}`
+      ].join("\\n"),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        requestedToolkits
+      })
+    });
+
     await createApprovalCheckpoint({
       orgId,
       flowId: task.flowId,
@@ -2933,6 +4594,52 @@ async function executeTaskById(
         })
       }
     });
+
+    await persistMemoryCandidateSafe({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "final_output",
+      memoryType: "EPISODIC",
+      visibility: "SHARED",
+      tags: [
+        "final_output",
+        executionMode.toLowerCase(),
+        deterministicResponseUsed ? "deterministic" : "llm"
+      ],
+      importanceHint: 0.86,
+      summary: truncateText(outputText, 260),
+      content: outputText.slice(0, 4000),
+      metadata: toInputJsonValue({
+        flowId: task.flowId,
+        taskId: task.id,
+        agentRunId: agentRun.id,
+        outputFileId,
+        provider: execution.usedProvider ?? null,
+        model: execution.usedModel ?? null,
+        tokenUsage: execution.tokenUsage ?? null
+      })
+    });
+
+    await persistSemanticFactsFromText({
+      orgId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      source: "final_output",
+      text: `${task.prompt}\\n${outputText}`
+    }).catch(() => []);
+
+    await summarizeAndArchiveAgentMemory({
+      orgId,
+      sessionId: task.flowId,
+      projectId: task.flowId,
+      userId: executionUserId,
+      agentId: activeLogicalAgent.id
+    }).catch(() => null);
   }
 
   const tokenInput =
@@ -3187,15 +4894,27 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
     const resumedAgentId = asString(runtimeTrace.logicalAgentId);
     const resumedAgentRunId = asString(runtimeTrace.agentRunId);
 
+    let resumeClaimed = false;
     await prisma.$transaction(async (tx) => {
-      await tx.task.update({
-        where: { id: taskId },
+      const taskResumeClaim = await tx.task.updateMany({
+        where: {
+          id: taskId,
+          flowId: task.flowId,
+          status: {
+            in: [TaskStatus.QUEUED, TaskStatus.PAUSED]
+          }
+        },
         data: {
           status: TaskStatus.RUNNING,
           isPausedForInput: false,
           humanInterventionReason: null
         }
       });
+
+      resumeClaimed = taskResumeClaim.count > 0;
+      if (!resumeClaimed) {
+        return;
+      }
 
       await tx.flow.update({
         where: { id: task.flowId },
@@ -3238,6 +4957,14 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         }
       });
     });
+
+    if (!resumeClaimed) {
+      return {
+        ok: true,
+        ignored: true,
+        reason: "task.resumed already processed."
+      };
+    }
 
     await publishRealtimeEvent({
       orgId,
@@ -3653,6 +5380,15 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
     const embedding = createDeterministicEmbedding(stableSource, 1536);
     const vectorLiteral = toPgVectorLiteral(embedding);
     const digest = createHash("sha256").update(stableSource).digest("hex");
+    const knowledgeChunks =
+      !file.isAmnesiaProtected && sourceText
+        ? splitIntoMemoryChunks({
+            text: sourceText,
+            maxChars: DNA_MEMORY_CHUNK_MAX_CHARS,
+            overlapChars: DNA_MEMORY_CHUNK_OVERLAP_CHARS,
+            maxChunks: DNA_MEMORY_CHUNK_MAX_ITEMS
+          })
+        : [];
 
     const amnesiaProof = file.isAmnesiaProtected
       ? await createJoltProofStub({
@@ -3750,6 +5486,52 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         tx
       );
     });
+
+    if (knowledgeChunks.length > 0) {
+      const fileTag = `file:${file.id}`;
+      try {
+        await prisma.agentMemory.updateMany({
+          where: {
+            orgId,
+            source: "dna_chunk",
+            archivedAt: null,
+            tags: { has: fileTag }
+          },
+          data: {
+            archivedAt: new Date()
+          }
+        });
+      } catch {
+        // Best-effort archival; fresh chunk upserts continue.
+      }
+
+      for (let index = 0; index < knowledgeChunks.length; index += 1) {
+        const chunk = knowledgeChunks[index];
+        if (!chunk) continue;
+        // eslint-disable-next-line no-await-in-loop
+        await upsertAgentMemory({
+          orgId,
+          content: chunk,
+          summary: truncateText(
+            `DNA ${file.name} chunk ${index + 1}/${knowledgeChunks.length}`,
+            220
+          ),
+          memoryType: "SEMANTIC",
+          visibility: "SHARED",
+          source: "dna_chunk",
+          tags: ["hub", "dna", "chunk", fileTag],
+          metadata: toInputJsonValue({
+            fileId: file.id,
+            fileName: file.name,
+            chunkIndex: index,
+            chunkTotal: knowledgeChunks.length,
+            embeddingDigest: digest
+          }),
+          importance: 0.62,
+          recency: 1
+        }).catch(() => null);
+      }
+    }
 
     await publishRealtimeEvent({
       orgId,

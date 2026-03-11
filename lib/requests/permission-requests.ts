@@ -17,6 +17,8 @@ export interface PermissionRequestRecord {
   id: string;
   orgId: string;
   direction: string;
+  directionId: string | null;
+  planId: string | null;
   requestedByUserId: string;
   requestedByEmail: string;
   targetRole: "FOUNDER" | "ADMIN" | "EMPLOYEE";
@@ -66,6 +68,14 @@ function parseRequest(orgId: string, raw: unknown): PermissionRequestRecord {
     id: typeof data.id === "string" ? data.id : randomUUID(),
     orgId,
     direction: typeof data.direction === "string" ? data.direction : "",
+    directionId:
+      typeof data.directionId === "string" && data.directionId.trim().length > 0
+        ? data.directionId.trim()
+        : null,
+    planId:
+      typeof data.planId === "string" && data.planId.trim().length > 0
+        ? data.planId.trim()
+        : null,
     requestedByUserId:
       typeof data.requestedByUserId === "string" ? data.requestedByUserId : "",
     requestedByEmail:
@@ -138,6 +148,8 @@ export async function clearOrgPermissionRequests(orgId: string) {
 export async function createPermissionRequests(input: {
   orgId: string;
   direction: string;
+  directionId?: string | null;
+  planId?: string | null;
   requestedByUserId: string;
   requestedByEmail: string;
   items: Array<{
@@ -171,6 +183,8 @@ export async function createPermissionRequests(input: {
         id: randomUUID(),
         orgId: input.orgId,
         direction: input.direction.trim(),
+        directionId: input.directionId?.trim() || null,
+        planId: input.planId?.trim() || null,
         requestedByUserId: input.requestedByUserId,
         requestedByEmail: input.requestedByEmail.trim().toLowerCase(),
         targetRole: item.targetRole,

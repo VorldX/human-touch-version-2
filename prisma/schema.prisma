@@ -102,6 +102,18 @@ enum MemoryTier {
   AGENT
 }
 
+enum AgentMemoryType {
+  WORKING
+  EPISODIC
+  SEMANTIC
+  TASK
+}
+
+enum AgentMemoryVisibility {
+  PRIVATE
+  SHARED
+}
+
 enum SpendEventType {
   PREDICTED_BURN
   ACTUAL_BURN
@@ -161,6 +173,7 @@ model User {
   complianceActions           ComplianceAudit[]    @relation("HumanActorAudits")
   resolvedApprovalCheckpoints ApprovalCheckpoint[] @relation("ApprovalResolvedByUser")
   memoryEntries               MemoryEntry[]
+  agentMemories               AgentMemory[]
   createdAt                   DateTime             @default(now())
   updatedAt                   DateTime             @updatedAt
 
@@ -213,6 +226,7 @@ model Organization {
   approvalCheckpoints ApprovalCheckpoint[]
   capabilityGrants    CapabilityGrant[]
   hubFileLocks        HubFileLock[]
+  agentMemories       AgentMemory[]
   createdAt           DateTime              @default(now())
   updatedAt           DateTime              @updatedAt
 }
@@ -465,6 +479,43 @@ model MemoryEntry {
   @@index([userId])
 }
 
+model AgentMemory {
+  id          String                @id @default(cuid())
+  orgId       String
+  userId      String?
+  agentId     String?
+  sessionId   String?
+  projectId   String?
+  content     String
+  summary     String?
+  embedding   Unsupported("vector(1536)")?
+  memoryType  AgentMemoryType       @default(EPISODIC)
+  visibility  AgentMemoryVisibility @default(PRIVATE)
+  tags        String[]              @default([])
+  source      String
+  timestamp   DateTime              @default(now())
+  importance  Float                 @default(0.5)
+  recency     Float                 @default(1)
+  metadata    Json?
+  contentHash String
+  archivedAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+  org         Organization          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user        User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+  agent       Agent?                @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, timestamp(sort: Desc)])
+  @@index([orgId, sessionId, timestamp(sort: Desc)])
+  @@index([orgId, userId, timestamp(sort: Desc)])
+  @@index([orgId, agentId, timestamp(sort: Desc)])
+  @@index([orgId, projectId, timestamp(sort: Desc)])
+  @@index([orgId, memoryType, timestamp(sort: Desc)])
+  @@index([orgId, visibility, timestamp(sort: Desc)])
+  @@index([orgId, archivedAt])
+  @@index([orgId, contentHash])
+}
+
 model SpendEvent {
   id        String         @id @default(cuid())
   orgId     String
@@ -543,6 +594,7 @@ model Agent {
   delegationsFrom     AgentDelegation[]    @relation("DelegationFromAgent")
   delegationsTo       AgentDelegation[]    @relation("DelegationToAgent")
   approvalCheckpoints ApprovalCheckpoint[]
+  agentMemories       AgentMemory[]
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
 

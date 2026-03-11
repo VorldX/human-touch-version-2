@@ -132,6 +132,11 @@ export interface UserIntegrationStore {
     provider: string;
     orgId?: string;
   }): Promise<ConnectionSummary[]>;
+  listByOrg?(input: {
+    orgId: string;
+    provider: string;
+    toolkits?: string[];
+  }): Promise<ConnectionSummary[]>;
   findByConnection(input: {
     userId: string;
     provider: string;
@@ -182,6 +187,9 @@ interface ComposioServiceCoreConfig {
   connectUrlForToolkit: (toolkit: string) => string;
   customAuthConfigs?: Record<string, CustomToolkitAuthConfig>;
   now?: () => number;
+  connectionCacheTtlMs?: number;
+  toolCatalogCacheTtlMs?: number;
+  allowOrgToolkitFallback?: boolean;
 }
 
 export class ComposioServiceError extends Error {
@@ -223,6 +231,39 @@ function normalizeStatus(value: unknown) {
   const status = asString(value).toUpperCase();
   if (!status) return "UNKNOWN";
   return status;
+}
+
+const ACTIVE_CONNECTION_STATUSES = new Set([
+  "ACTIVE",
+  "SUCCESS",
+  "CONNECTED",
+  "COMPLETED",
+  "AUTHORIZED",
+  "AUTHENTICATED",
+  "ENABLED",
+  "OK"
+]);
+
+const DISCONNECTED_CONNECTION_STATUSES = new Set([
+  "DISCONNECTED",
+  "REVOKED",
+  "DELETED",
+  "REMOVED"
+]);
+
+export function normalizeConnectionStatus(value: unknown) {
+  const status = normalizeStatus(value);
+  if (ACTIVE_CONNECTION_STATUSES.has(status)) {
+    return "ACTIVE";
+  }
+  if (DISCONNECTED_CONNECTION_STATUSES.has(status)) {
+    return "DISCONNECTED";
+  }
+  return status;
+}
+
+export function isConnectedIntegrationStatus(value: unknown) {
+  return normalizeConnectionStatus(value) === "ACTIVE";
 }
 
 function humanizeToolkit(slug: string) {
@@ -281,10 +322,82 @@ function callbackMetadata(params: URLSearchParams) {
   return out;
 }
 
+function disconnectNotFoundError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const statusCandidates = [
+    record.status,
+    record.statusCode,
+    asRecord(record.error).status,
+    asRecord(record.response).status
+  ];
+  if (statusCandidates.some((value) => Number(value) === 404)) {
+    return true;
+  }
+
+  const message = [
+    asString(record.message),
+    asString(asRecord(record.error).message),
+    asString(asRecord(record.error).slug),
+    asString(asRecord(record.response).message),
+    asString(asRecord(asRecord(record.response).error).message),
+    asString(asRecord(asRecord(record.response).error).slug)
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return message.includes("not found") || message.includes("resourcenotfound");
+}
+
+function executeConnectionMissingError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const statusCandidates = [
+    record.status,
+    record.statusCode,
+    asRecord(record.error).status,
+    asRecord(record.response).status
+  ];
+  if (statusCandidates.some((value) => Number(value) === 404)) {
+    return true;
+  }
+
+  const message = [
+    asString(record.message),
+    asString(asRecord(record.error).message),
+    asString(asRecord(record.response).message),
+    asString(asRecord(asRecord(record.response).error).message)
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (!message) {
+    return false;
+  }
+
+  return (
+    message.includes("connected account") &&
+    (message.includes("not found") || message.includes("missing"))
+  );
+}
+
+const DEFAULT_CONNECTION_CACHE_TTL_MS = 30_000;
+const DEFAULT_TOOL_CATALOG_CACHE_TTL_MS = 5 * 60_000;
+
 export class ComposioServiceCore {
   private readonly enabled: boolean;
   private readonly provider: string;
+  private readonly allowlistedToolkitList: string[];
   private readonly allowlistedToolkits: Set<string>;
+  private readonly allowlistedCanonicalToolkits: Set<string>;
   private readonly callbackUrl: string;
   private readonly createClient: () => unknown;
   private readonly store: UserIntegrationStore;
@@ -293,11 +406,26 @@ export class ComposioServiceCore {
   private readonly connectUrlForToolkit: (toolkit: string) => string;
   private readonly customAuthConfigs: Map<string, CustomToolkitAuthConfig>;
   private readonly now: () => number;
+  private readonly connectionCacheTtlMs: number;
+  private readonly toolCatalogCacheTtlMs: number;
+  private readonly allowOrgToolkitFallback: boolean;
+  private readonly connectionCache = new Map<
+    string,
+    { expiresAt: number; connections: ConnectionSummary[] }
+  >();
+  private readonly toolCatalogCache = new Map<
+    string,
+    { expiresAt: number; bindings: ToolBinding[] }
+  >();
 
   constructor(config: ComposioServiceCoreConfig) {
     this.enabled = config.enabled;
     this.provider = config.provider;
-    this.allowlistedToolkits = new Set(config.allowlistedToolkits.map(normalizeToolkit));
+    this.allowlistedToolkitList = [...new Set(config.allowlistedToolkits.map(normalizeToolkit))];
+    this.allowlistedToolkits = new Set(this.allowlistedToolkitList);
+    this.allowlistedCanonicalToolkits = new Set(
+      this.allowlistedToolkitList.map(canonicalToolkitForCompare)
+    );
     this.callbackUrl = config.callbackUrl;
     this.createClient = config.createClient;
     this.store = config.store;
@@ -311,6 +439,15 @@ export class ComposioServiceCore {
       ])
     );
     this.now = config.now ?? (() => Date.now());
+    this.connectionCacheTtlMs =
+      typeof config.connectionCacheTtlMs === "number" && config.connectionCacheTtlMs > 0
+        ? config.connectionCacheTtlMs
+        : DEFAULT_CONNECTION_CACHE_TTL_MS;
+    this.toolCatalogCacheTtlMs =
+      typeof config.toolCatalogCacheTtlMs === "number" && config.toolCatalogCacheTtlMs > 0
+        ? config.toolCatalogCacheTtlMs
+        : DEFAULT_TOOL_CATALOG_CACHE_TTL_MS;
+    this.allowOrgToolkitFallback = config.allowOrgToolkitFallback === true;
   }
 
   isEnabled() {
@@ -322,14 +459,31 @@ export class ComposioServiceCore {
   }
 
   private assertToolkitAllowed(toolkit: string) {
-    const normalized = normalizeToolkit(toolkit);
-    if (!this.allowlistedToolkits.has(normalized)) {
+    const resolved = this.resolveAllowlistedToolkit(toolkit);
+    if (!resolved) {
       throw new ComposioServiceError(
         `Toolkit "${toolkit}" is not supported by this workspace.`,
         { code: "INVALID_TOOLKIT", status: 400 }
       );
     }
-    return normalized;
+    return resolved;
+  }
+
+  private resolveAllowlistedToolkit(toolkit: string) {
+    const normalized = normalizeToolkit(toolkit);
+    if (this.allowlistedToolkits.has(normalized)) {
+      return normalized;
+    }
+
+    const canonical = canonicalToolkitForCompare(normalized);
+    if (!this.allowlistedCanonicalToolkits.has(canonical)) {
+      return "";
+    }
+
+    const matched = this.allowlistedToolkitList.find(
+      (item) => canonicalToolkitForCompare(item) === canonical
+    );
+    return matched ?? "";
   }
 
   private async ensureAuthConfigId(client: ComposioClientLike, toolkit: string) {
@@ -392,8 +546,156 @@ export class ComposioServiceCore {
     return normalizeToolkit(asString(toolkit.slug));
   }
 
+  private connectionCacheKey(input: { userId: string; orgId: string }) {
+    return `${input.userId}::${input.orgId}`;
+  }
+
+  private toolCatalogCacheKey(input: {
+    userId: string;
+    orgId: string;
+    requestedToolkits: string[];
+  }) {
+    const requested = [...new Set(input.requestedToolkits.map(canonicalToolkitForCompare))].sort();
+    return `${input.userId}::${input.orgId}::${requested.join(",")}`;
+  }
+
+  private cloneConnections(connections: ConnectionSummary[]) {
+    return connections.map((item) => ({
+      ...item,
+      metadata: { ...item.metadata }
+    }));
+  }
+
+  private cloneBindings(bindings: ToolBinding[]) {
+    return bindings.map((binding) => ({ ...binding }));
+  }
+
+  private getCachedConnections(cacheKey: string) {
+    const cached = this.connectionCache.get(cacheKey);
+    if (!cached) {
+      return null;
+    }
+    if (cached.expiresAt <= this.now()) {
+      this.connectionCache.delete(cacheKey);
+      return null;
+    }
+    return this.cloneConnections(cached.connections);
+  }
+
+  private setCachedConnections(cacheKey: string, connections: ConnectionSummary[]) {
+    this.connectionCache.set(cacheKey, {
+      expiresAt: this.now() + this.connectionCacheTtlMs,
+      connections: this.cloneConnections(connections)
+    });
+  }
+
+  private getCachedToolBindings(cacheKey: string, allowStale = false) {
+    const cached = this.toolCatalogCache.get(cacheKey);
+    if (!cached) {
+      return null;
+    }
+    if (!allowStale && cached.expiresAt <= this.now()) {
+      return null;
+    }
+    return this.cloneBindings(cached.bindings);
+  }
+
+  private setCachedToolBindings(cacheKey: string, bindings: ToolBinding[]) {
+    this.toolCatalogCache.set(cacheKey, {
+      expiresAt: this.now() + this.toolCatalogCacheTtlMs,
+      bindings: this.cloneBindings(bindings)
+    });
+  }
+
+  private invalidateCachesForActor(input: { userId: string; orgId: string }) {
+    this.connectionCache.delete(this.connectionCacheKey(input));
+    const prefix = `${input.userId}::${input.orgId}::`;
+    for (const key of this.toolCatalogCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.toolCatalogCache.delete(key);
+      }
+    }
+  }
+
+  private async listOrgConnections(input: {
+    orgId: string;
+    toolkits?: string[];
+  }): Promise<ConnectionSummary[]> {
+    if (!this.store.listByOrg) {
+      return [];
+    }
+
+    const rows = await this.store.listByOrg({
+      orgId: input.orgId,
+      provider: this.provider,
+      ...(input.toolkits && input.toolkits.length > 0
+        ? { toolkits: [...new Set(input.toolkits.map(normalizeToolkit))] }
+        : {})
+    });
+
+    if (!input.toolkits || input.toolkits.length === 0) {
+      return rows;
+    }
+
+    const requestedCanonical = new Set(input.toolkits.map(canonicalToolkitForCompare));
+    return rows.filter((row) =>
+      requestedCanonical.has(canonicalToolkitForCompare(row.toolkit))
+    );
+  }
+
+  private async listActiveOrgConnections(input: {
+    orgId: string;
+    toolkits: string[];
+    excludeUserId?: string;
+  }) {
+    if (!this.allowOrgToolkitFallback) {
+      return [] as ConnectionSummary[];
+    }
+
+    const rows = await this.listOrgConnections({
+      orgId: input.orgId,
+      toolkits: input.toolkits
+    });
+
+    return rows
+      .filter((row) => isConnectedIntegrationStatus(row.status))
+      .filter((row) => !input.excludeUserId || row.userId !== input.excludeUserId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  private async resolveExecutionConnections(input: {
+    userId: string;
+    orgId: string;
+    toolkit: string;
+  }) {
+    const canonicalToolkit = canonicalToolkitForCompare(input.toolkit);
+    const userConnections = await this.getConnections({
+      userId: input.userId,
+      orgId: input.orgId
+    });
+    const direct = userConnections.find(
+      (item) =>
+        canonicalToolkitForCompare(item.toolkit) === canonicalToolkit &&
+        isConnectedIntegrationStatus(item.status)
+    );
+
+    if (direct) {
+      return [direct] as ConnectionSummary[];
+    }
+
+    const orgFallback = await this.listActiveOrgConnections({
+      orgId: input.orgId,
+      toolkits: [input.toolkit],
+      excludeUserId: input.userId
+    });
+
+    return orgFallback.filter(
+      (item) => canonicalToolkitForCompare(item.toolkit) === canonicalToolkit
+    );
+  }
+
   async listAvailableToolkits(userId: string): Promise<ToolkitSummary[]> {
-    const allowed = [...this.allowlistedToolkits];
+    const allowed = [...this.allowlistedToolkitList];
     if (!this.enabled) {
       return allowed.map((slug) => ({
         slug,
@@ -428,38 +730,45 @@ export class ComposioServiceCore {
 
     const accountItems = Array.isArray(accounts?.items) ? accounts.items : [];
     for (const account of accountItems) {
-      const toolkit = this.toolkitFromAccount(account);
+      const toolkit = this.resolveAllowlistedToolkit(this.toolkitFromAccount(account));
       if (!toolkit) continue;
       const connectionId = asString(account.id) || null;
-      const status = normalizeStatus(account.status);
-      const previous = accountsByToolkit.get(toolkit);
-      if (!previous || previous.status !== "ACTIVE") {
-        accountsByToolkit.set(toolkit, { status, connectionId });
+      const status = normalizeConnectionStatus(account.status);
+      const canonicalToolkit = canonicalToolkitForCompare(toolkit);
+      const previous = accountsByToolkit.get(canonicalToolkit);
+      if (!previous || !isConnectedIntegrationStatus(previous.status)) {
+        accountsByToolkit.set(canonicalToolkit, { status, connectionId });
       }
     }
 
     const list = Array.isArray(toolkitItems) ? toolkitItems : [];
-    const supported = list
-      .map((item) => {
-        const slug = normalizeToolkit(asString(item.slug));
-        if (!slug || !this.allowlistedToolkits.has(slug)) {
-          return null;
-        }
+    const supportedBySlug = new Map<string, ToolkitSummary>();
+    for (const item of list) {
+      const rawSlug = normalizeToolkit(asString(item.slug));
+      const slug = this.resolveAllowlistedToolkit(rawSlug);
+      if (!slug) {
+        continue;
+      }
 
-        const meta = asRecord(item.meta);
-        const account = accountsByToolkit.get(slug);
-        return {
-          slug,
-          name: asString(item.name) || humanizeToolkit(slug),
-          description: asString(meta.description),
-          logoUrl: asString(meta.logo) || null,
-          appUrl: asString(meta.appUrl) || null,
-          status: account?.status ?? "NOT_CONNECTED",
-          connected: account?.status === "ACTIVE",
-          connectionId: account?.connectionId ?? null
-        };
-      })
-      .filter((value): value is ToolkitSummary => Boolean(value));
+      const meta = asRecord(item.meta);
+      const account = accountsByToolkit.get(canonicalToolkitForCompare(slug));
+      const summary: ToolkitSummary = {
+        slug,
+        name: asString(item.name) || humanizeToolkit(slug),
+        description: asString(meta.description),
+        logoUrl: asString(meta.logo) || null,
+        appUrl: asString(meta.appUrl) || null,
+        status: account?.status ?? "NOT_CONNECTED",
+        connected: isConnectedIntegrationStatus(account?.status),
+        connectionId: account?.connectionId ?? null
+      };
+
+      const existing = supportedBySlug.get(slug);
+      if (!existing || !isConnectedIntegrationStatus(existing.status)) {
+        supportedBySlug.set(slug, summary);
+      }
+    }
+    const supported = [...supportedBySlug.values()];
 
     if (supported.length > 0) {
       return supported.sort((a, b) => a.name.localeCompare(b.name));
@@ -478,6 +787,12 @@ export class ComposioServiceCore {
   }
 
   async getConnections(input: { userId: string; orgId: string }): Promise<ConnectionSummary[]> {
+    const cacheKey = this.connectionCacheKey(input);
+    const cached = this.getCachedConnections(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     const rows = await this.store.listByUser({
       userId: input.userId,
       provider: this.provider,
@@ -485,41 +800,73 @@ export class ComposioServiceCore {
     });
 
     if (!this.enabled) {
+      this.setCachedConnections(cacheKey, rows);
       return rows;
     }
 
-    const client = this.createClient() as ComposioClientLike;
-    const remote = await client.connectedAccounts.list({
-      userIds: [this.composioUserId(input.userId)],
-      limit: 200
-    });
-
-    const items = Array.isArray(remote?.items) ? remote.items : [];
-    for (const item of items) {
-      const connectionId = asString(item.id);
-      const toolkit = this.toolkitFromAccount(item);
-      if (!connectionId || !toolkit || !this.allowlistedToolkits.has(toolkit)) {
-        continue;
-      }
-      const status = normalizeStatus(item.status);
-      await this.store.upsertByConnection({
-        userId: input.userId,
-        orgId: input.orgId,
-        provider: this.provider,
-        toolkit,
-        connectionId,
-        status,
-        metadata: {
-          remote: safeMetadata(item)
-        }
+    try {
+      const client = this.createClient() as ComposioClientLike;
+      const remote = await client.connectedAccounts.list({
+        userIds: [this.composioUserId(input.userId)],
+        limit: 200
       });
-    }
 
-    return this.store.listByUser({
-      userId: input.userId,
-      provider: this.provider,
-      orgId: input.orgId
-    });
+      const items = Array.isArray(remote?.items) ? remote.items : [];
+      const remoteConnectionIds = new Set<string>();
+      for (const item of items) {
+        const connectionId = asString(item.id);
+        const toolkit = this.resolveAllowlistedToolkit(this.toolkitFromAccount(item));
+        if (!connectionId || !toolkit) {
+          continue;
+        }
+        remoteConnectionIds.add(connectionId);
+        const status = normalizeConnectionStatus(item.status);
+        await this.store.upsertByConnection({
+          userId: input.userId,
+          orgId: input.orgId,
+          provider: this.provider,
+          toolkit,
+          connectionId,
+          status,
+          metadata: {
+            remote: safeMetadata(item)
+          }
+        });
+      }
+
+      // Reconcile stale local ACTIVE rows that no longer exist remotely.
+      for (const row of rows) {
+        if (
+          isConnectedIntegrationStatus(row.status) &&
+          row.connectionId &&
+          !remoteConnectionIds.has(row.connectionId)
+        ) {
+          await this.store.upsertByConnection({
+            userId: row.userId,
+            orgId: row.orgId ?? input.orgId,
+            provider: row.provider,
+            toolkit: row.toolkit,
+            connectionId: row.connectionId,
+            status: "DISCONNECTED",
+            metadata: mergeMetadata(row.metadata, {
+              remoteMissingAt: new Date(this.now()).toISOString()
+            })
+          });
+        }
+      }
+
+      const refreshed = await this.store.listByUser({
+        userId: input.userId,
+        provider: this.provider,
+        orgId: input.orgId
+      });
+      this.setCachedConnections(cacheKey, refreshed);
+      return refreshed;
+    } catch {
+      // Fall back to persisted state when Composio remote listing is unavailable.
+      this.setCachedConnections(cacheKey, rows);
+      return rows;
+    }
   }
 
   async createConnection(input: CreateConnectionInput) {
@@ -566,7 +913,8 @@ export class ComposioServiceCore {
       });
     }
 
-    const status = normalizeStatus(linked.status) || "INITIATED";
+    const linkedStatus = normalizeConnectionStatus(linked.status);
+    const status = linkedStatus === "UNKNOWN" ? "INITIATED" : linkedStatus;
     const stored = await this.store.upsertByConnection({
       userId: input.userId,
       orgId: input.orgId,
@@ -580,6 +928,7 @@ export class ComposioServiceCore {
         returnTo: input.returnTo
       }
     });
+    this.invalidateCachesForActor({ userId: input.userId, orgId: input.orgId });
 
     return {
       connectUrl: redirectUrl,
@@ -600,10 +949,19 @@ export class ComposioServiceCore {
 
     if (this.enabled) {
       const client = this.createClient() as ComposioClientLike;
-      await client.connectedAccounts.delete(input.connectionId);
+      try {
+        await client.connectedAccounts.delete(input.connectionId);
+      } catch (error) {
+        if (!disconnectNotFoundError(error)) {
+          throw new ComposioServiceError("Unable to disconnect app integration.", {
+            code: "COMPOSIO_DISCONNECT_FAILED",
+            status: 502
+          });
+        }
+      }
     }
 
-    return this.store.upsertByConnection({
+    const result = await this.store.upsertByConnection({
       userId: current.userId,
       orgId: current.orgId ?? undefined,
       provider: current.provider,
@@ -614,6 +972,8 @@ export class ComposioServiceCore {
         disconnectedAt: new Date(this.now()).toISOString()
       })
     });
+    this.invalidateCachesForActor({ userId: input.userId, orgId: input.orgId });
+    return result;
   }
 
   async handleOAuthCallback(input: {
@@ -654,7 +1014,8 @@ export class ComposioServiceCore {
 
     const parsedConnectionId = candidateConnectionId(input.params);
     const connectionId = parsedConnectionId || pending?.connectionId || `pending-${state.nonce}`;
-    const status = normalizeStatus(input.params.get("status")) || "ACTIVE";
+    const callbackStatus = normalizeConnectionStatus(input.params.get("status"));
+    const status = callbackStatus === "UNKNOWN" ? "ACTIVE" : callbackStatus;
 
     await this.store.upsertByConnection({
       userId: state.userId,
@@ -669,6 +1030,7 @@ export class ComposioServiceCore {
         completedAt: new Date(this.now()).toISOString()
       })
     });
+    this.invalidateCachesForActor({ userId: state.userId, orgId: state.orgId });
 
     return {
       ok: true,
@@ -686,9 +1048,13 @@ export class ComposioServiceCore {
     bindings: ToolBinding[];
     error?: IntegrationNotConnectedErrorShape;
   }> {
-    const requested = [...new Set(input.requestedToolkits.map(normalizeToolkit).filter(Boolean))].filter(
-      (item) => this.allowlistedToolkits.has(item)
-    );
+    const requested = [
+      ...new Set(
+        input.requestedToolkits
+          .map((item) => this.resolveAllowlistedToolkit(item))
+          .filter(Boolean)
+      )
+    ];
 
     if (requested.length === 0) {
       return { ok: true, requestedToolkits: [], bindings: [] };
@@ -700,12 +1066,22 @@ export class ComposioServiceCore {
     });
     const activeToolkits = new Set(
       connections
-        .filter((item) => normalizeStatus(item.status) === "ACTIVE")
+        .filter((item) => isConnectedIntegrationStatus(item.status))
         .map((item) => canonicalToolkitForCompare(item.toolkit))
     );
-    const missing = requested.filter(
-      (toolkit) => !activeToolkits.has(canonicalToolkitForCompare(toolkit))
-    );
+    let missing = requested.filter((toolkit) => !activeToolkits.has(canonicalToolkitForCompare(toolkit)));
+
+    if (missing.length > 0 && this.allowOrgToolkitFallback) {
+      const fallbackConnections = await this.listActiveOrgConnections({
+        orgId: input.orgId,
+        toolkits: missing,
+        excludeUserId: input.userId
+      });
+      for (const connection of fallbackConnections) {
+        activeToolkits.add(canonicalToolkitForCompare(connection.toolkit));
+      }
+      missing = requested.filter((toolkit) => !activeToolkits.has(canonicalToolkitForCompare(toolkit)));
+    }
 
     if (missing.length > 0) {
       return {
@@ -729,34 +1105,61 @@ export class ComposioServiceCore {
       };
     }
 
-    const client = this.createClient() as ComposioClientLike;
-    const rawTools = await client.tools.getRawComposioTools({
-      toolkits: requested,
-      limit: 100
+    const toolCacheKey = this.toolCatalogCacheKey({
+      userId: input.userId,
+      orgId: input.orgId,
+      requestedToolkits: requested
     });
+    const cachedBindings = this.getCachedToolBindings(toolCacheKey);
+    if (cachedBindings) {
+      return {
+        ok: true,
+        requestedToolkits: requested,
+        bindings: cachedBindings
+      };
+    }
 
-    const bindings = (Array.isArray(rawTools) ? rawTools : [])
-      .map((tool) => {
-        const toolkitRecord = asRecord(tool.toolkit);
-        const toolkit = normalizeToolkit(asString(toolkitRecord.slug));
-        const slug = asString(tool.slug);
-        if (!toolkit || !slug) {
-          return null;
-        }
+    try {
+      const client = this.createClient() as ComposioClientLike;
+      const rawTools = await client.tools.getRawComposioTools({
+        toolkits: requested,
+        limit: 100
+      });
+
+      const bindings = (Array.isArray(rawTools) ? rawTools : [])
+        .map((tool) => {
+          const toolkitRecord = asRecord(tool.toolkit);
+          const toolkit = normalizeToolkit(asString(toolkitRecord.slug));
+          const slug = asString(tool.slug);
+          if (!toolkit || !slug) {
+            return null;
+          }
+          return {
+            toolkit,
+            slug,
+            name: asString(tool.name) || slug,
+            description: asString(tool.description)
+          };
+        })
+        .filter((value): value is ToolBinding => Boolean(value));
+
+      this.setCachedToolBindings(toolCacheKey, bindings);
+      return {
+        ok: true,
+        requestedToolkits: requested,
+        bindings
+      };
+    } catch (error) {
+      const staleBindings = this.getCachedToolBindings(toolCacheKey, true);
+      if (staleBindings) {
         return {
-          toolkit,
-          slug,
-          name: asString(tool.name) || slug,
-          description: asString(tool.description)
+          ok: true,
+          requestedToolkits: requested,
+          bindings: staleBindings
         };
-      })
-      .filter((value): value is ToolBinding => Boolean(value));
-
-    return {
-      ok: true,
-      requestedToolkits: requested,
-      bindings
-    };
+      }
+      throw error;
+    }
   }
 
   async executeToolAction(input: {
@@ -769,22 +1172,28 @@ export class ComposioServiceCore {
   }): Promise<ToolExecutionResponse> {
     const toolkit = this.assertToolkitAllowed(input.toolkit);
     const normalizedSlug = asString(input.toolSlug).toUpperCase();
-    if (!normalizedSlug || !normalizedSlug.startsWith(`${toolkit.toUpperCase()}_`)) {
+    const allowedPrefixes = new Set([toolkit.toUpperCase()]);
+    if (canonicalToolkitForCompare(toolkit) === "gmeet") {
+      allowedPrefixes.add("GMEET");
+      allowedPrefixes.add("GOOGLEMEET");
+    }
+    const hasValidPrefix = [...allowedPrefixes].some((prefix) =>
+      normalizedSlug.startsWith(`${prefix}_`)
+    );
+    if (!normalizedSlug || !hasValidPrefix) {
       throw new ComposioServiceError(
         `Tool "${input.toolSlug}" is not valid for toolkit "${toolkit}".`,
         { code: "INVALID_TOOL_ACTION", status: 400 }
       );
     }
 
-    const connections = await this.getConnections({
+    const executionConnections = await this.resolveExecutionConnections({
       userId: input.userId,
-      orgId: input.orgId
+      orgId: input.orgId,
+      toolkit
     });
-    const active = connections.find(
-      (item) => item.toolkit === toolkit && normalizeStatus(item.status) === "ACTIVE"
-    );
 
-    if (!active) {
+    if (executionConnections.length === 0) {
       throw new ComposioServiceError(
         `Toolkit "${toolkit}" is not connected for this user.`,
         { code: "INTEGRATION_NOT_CONNECTED", status: 409 }
@@ -799,22 +1208,61 @@ export class ComposioServiceCore {
     }
 
     const client = this.createClient() as ComposioClientLike;
-    const response = await client.tools.execute(normalizedSlug, {
-      userId: this.composioUserId(input.userId),
-      connectedAccountId: active.connectionId,
-      arguments: input.arguments ?? {},
-      dangerouslySkipVersionCheck: true
-    });
+    let accountMissing = false;
 
-    return {
-      successful: Boolean(response?.successful),
-      error: asString(response?.error) || null,
-      data:
-        response?.data && typeof response.data === "object" && !Array.isArray(response.data)
-          ? (response.data as Record<string, unknown>)
-          : {},
-      logId: asString(response?.logId) || asString(response?.log_id) || null
-    };
+    for (const connection of executionConnections) {
+      try {
+        const response = await client.tools.execute(normalizedSlug, {
+          userId: this.composioUserId(connection.userId),
+          connectedAccountId: connection.connectionId,
+          arguments: input.arguments ?? {},
+          dangerouslySkipVersionCheck: true
+        });
+
+        return {
+          successful: Boolean(response?.successful),
+          error: asString(response?.error) || null,
+          data:
+            response?.data && typeof response.data === "object" && !Array.isArray(response.data)
+              ? (response.data as Record<string, unknown>)
+              : {},
+          logId: asString(response?.logId) || asString(response?.log_id) || null
+        };
+      } catch (error) {
+        if (!executeConnectionMissingError(error)) {
+          throw error;
+        }
+
+        accountMissing = true;
+        await this.store.upsertByConnection({
+          userId: connection.userId,
+          orgId: connection.orgId ?? input.orgId,
+          provider: connection.provider,
+          toolkit: connection.toolkit,
+          connectionId: connection.connectionId,
+          status: "DISCONNECTED",
+          metadata: mergeMetadata(connection.metadata, {
+            remoteMissingAt: new Date(this.now()).toISOString()
+          })
+        });
+        this.invalidateCachesForActor({
+          userId: connection.userId,
+          orgId: input.orgId
+        });
+      }
+    }
+
+    if (accountMissing) {
+      throw new ComposioServiceError(
+        `Toolkit "${toolkit}" requires reconnection.`,
+        { code: "INTEGRATION_NOT_CONNECTED", status: 409 }
+      );
+    }
+
+    throw new ComposioServiceError(
+      `Toolkit "${toolkit}" execution failed.`,
+      { code: "TOOL_EXECUTION_FAILED", status: 502 }
+    );
   }
 }
 
@@ -837,11 +1285,52 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
   }
 
   // High-signal intent mapping so natural language ("send email") can still trigger toolkit routing.
+  const hasMeetingCreateIntent =
+    /\b(set up|setup|schedule|book|arrange|create|plan)\b[\s\S]{0,80}\b(meeting|call|invite|invitation|session)\b/i.test(
+      normalizedPrompt
+    ) ||
+    /\b(meeting|call|invite|invitation|session)\b[\s\S]{0,80}\b(set up|setup|schedule|book|arrange|create|plan)\b/i.test(
+      normalizedPrompt
+    );
+  const hasMeetingShareIntent =
+    /\b(send|share|mail|email)\b/i.test(normalizedPrompt) &&
+    /\b(details?|invite|invitation|link|meeting)\b/i.test(normalizedPrompt);
+  const hasRecipientEmail = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(normalizedPrompt);
+
   if (
     allowlist.includes("gmail") &&
-    /\b(gmail|email|inbox|recipient|subject|send mail|compose mail)\b/i.test(normalizedPrompt)
+    (
+      /\b(gmail|email|inbox|recipient|subject|send mail|compose mail)\b/i.test(
+        normalizedPrompt
+      ) ||
+      (hasMeetingShareIntent && hasRecipientEmail)
+    )
   ) {
     requested.add("gmail");
+  }
+
+  if (
+    allowlist.includes("whatsapp") &&
+    (() => {
+      const explicitWhatsappChannel =
+        /\bwhatsapp\b/i.test(normalizedPrompt) ||
+        /\btext message\b/i.test(normalizedPrompt) ||
+        /\bchat message\b/i.test(normalizedPrompt) ||
+        /\bsms\b/i.test(normalizedPrompt);
+      const hasPhoneTarget =
+        /(?:\+?\d[\d\s().-]{7,}\d)/.test(normalizedPrompt) ||
+        /\b(phone|mobile|number|recipient_phone|phone_number)\b/i.test(normalizedPrompt);
+      const notificationIntent = /\b(send|share|notify|message|text|ping|alert)\b/i.test(
+        normalizedPrompt
+      );
+      const notificationLanguage = /\b(notification|update|status|reminder|follow[-\s]?up|text|message)\b/i.test(
+        normalizedPrompt
+      );
+
+      return explicitWhatsappChannel || (hasPhoneTarget && notificationIntent && notificationLanguage);
+    })()
+  ) {
+    requested.add("whatsapp");
   }
 
   if (
@@ -853,14 +1342,20 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
 
   if (
     preferredGoogleMeetToolkit &&
-    /\b(gmeet|google meet|googlemeet|meet\.google\.com)\b/i.test(normalizedPrompt)
+    (
+      /\b(gmeet|google meet|googlemeet|meet\.google\.com)\b/i.test(normalizedPrompt) ||
+      hasMeetingCreateIntent
+    )
   ) {
     requested.add(preferredGoogleMeetToolkit);
   }
 
   if (
     allowlist.includes("googlecalendar") &&
-    /\b(calendar|schedule|availability|meeting invite)\b/i.test(normalizedPrompt)
+    (
+      /\b(calendar|schedule|availability|meeting invite)\b/i.test(normalizedPrompt) ||
+      hasMeetingCreateIntent
+    )
   ) {
     requested.add("googlecalendar");
   }

@@ -2,12 +2,13 @@ export const dynamic = "force-dynamic";
 
 import { randomUUID } from "node:crypto";
 
-import { LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
+import { AgentRole, LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
 import { selectCompanyContext } from "@/lib/ai/context-selector";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
+import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
 import { prisma } from "@/lib/db/prisma";
 import { createDirection } from "@/lib/direction/directions";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
@@ -73,10 +74,37 @@ interface ModelPlanResponse {
   permissions: PermissionHint[];
 }
 
-const MAX_DIRECTION_CHARS = 2200;
-const MAX_HUMAN_PLAN_CHARS = 3200;
-const MAX_HISTORY_ITEM_CHARS = 1200;
-const MAX_HISTORY_TOTAL_CHARS = 7000;
+function mapAutoSquadRoleToAgentRole(role: string): AgentRole {
+  const normalized = role.toLowerCase();
+  if (/\b(main|boss|orchestrator)\b/.test(normalized)) {
+    return AgentRole.MAIN;
+  }
+  if (/\b(manager|lead|strategist|head)\b/.test(normalized)) {
+    return AgentRole.MANAGER;
+  }
+  return AgentRole.WORKER;
+}
+
+function buildAutoSquadAgentInstructions(input: {
+  role: string;
+  expertise: string;
+  direction: string;
+}) {
+  return {
+    prompt: `You are ${input.role}. Execute your assigned scope for this direction: ${input.direction}`,
+    responsibilities: [
+      `Primary expertise: ${input.expertise}`,
+      "Report concise progress updates with blockers and next actions.",
+      "Do not claim external execution without tool evidence.",
+      "Request approval when policy or sensitive actions require human touch."
+    ]
+  };
+}
+
+const MAX_DIRECTION_CHARS = 1800;
+const MAX_HUMAN_PLAN_CHARS = 1800;
+const MAX_HISTORY_ITEM_CHARS = 600;
+const MAX_HISTORY_TOTAL_CHARS = 2400;
 
 function positiveEnvInt(name: string, fallback: number) {
   const parsed = Number(process.env[name]);
@@ -88,15 +116,15 @@ function positiveEnvInt(name: string, fallback: number) {
 
 const MAX_PROMPT_COMPANY_CONTEXT_CHARS = positiveEnvInt(
   "DIRECTION_PLAN_SELECTED_CONTEXT_MAX_CHARS",
-  2600
+  1400
 );
 const MAX_CONTEXT_SELECTOR_CHUNK_CHARS = positiveEnvInt(
   "DIRECTION_CONTEXT_SELECTOR_CHUNK_CHARS",
-  700
+  420
 );
 const DIRECTION_PLAN_MAX_OUTPUT_TOKENS = positiveEnvInt(
   "DIRECTION_PLAN_MAX_OUTPUT_TOKENS",
-  680
+  480
 );
 
 function cleanText(value: unknown) {
@@ -122,7 +150,7 @@ function safeHistory(value: unknown) {
       return { role, content };
     })
     .filter((item): item is { role: string; content: string } => Boolean(item))
-    .slice(-12);
+    .slice(-6);
 
   let totalChars = history.reduce((sum, entry) => sum + entry.content.length, 0);
   while (history.length > 1 && totalChars > MAX_HISTORY_TOTAL_CHARS) {
@@ -503,9 +531,14 @@ export async function POST(request: NextRequest) {
     })
   ]);
 
-  const personnelSummary = personnel
-    .map((item) => `${item.type}:${item.role}:${item.name}`)
-    .join(", ");
+  const personnelSummary = [
+    ...new Set(
+      personnel
+        .slice(0, 12)
+        .map((item) => `${item.type}:${item.role}`)
+        .filter(Boolean)
+    )
+  ].join(", ");
 
   let companyContext = "";
   let contextSelection: ReturnType<typeof selectCompanyContext>["trace"] | null = null;
@@ -530,72 +563,28 @@ export async function POST(request: NextRequest) {
   }
 
   const modelPrompt = [
-    "You are preparing implementation plans for a direction.",
     `Direction: ${direction}`,
-    humanPlan ? `Human Proposed Plan: ${humanPlan}` : "Human Proposed Plan: (none provided)",
-    "",
+    humanPlan ? `Human plan input: ${humanPlan}` : "Human plan input: none",
     history.length > 0
       ? [
-          "Recent Conversation:",
+          "Recent conversation:",
           ...history.map(
             (item) => `${item.role === "owner" ? "Owner" : "Organization"}: ${item.content}`
           )
         ].join("\n")
-      : "Recent Conversation: (none)",
+      : "Recent conversation: none",
+    `Organization: ${org.name}`,
+    personnelSummary ? `Personnel roles: ${personnelSummary}` : "Personnel roles: unknown",
+    companyContext ? `Company context excerpt:\n${companyContext}` : "Company context: unavailable",
     "",
-    `Organization Name: ${org.name}`,
-    personnelSummary
-      ? `Available Personnel (role map): ${personnelSummary}`
-      : "Available Personnel: unknown",
+    "Return STRICT JSON only (no markdown) with keys:",
+    "analysis, directionGiven, primaryPlan, fallbackPlan, permissions.",
     "",
-    companyContext
-      ? ["Company Data Context (selector-brain curated, authoritative excerpt):", companyContext].join("\n")
-      : "Company Data Context: unavailable.",
-    "",
-    "Return STRICT JSON with this schema:",
-    "{",
-    '  "analysis": "short reasoning summary",',
-    '  "directionGiven": "refined direction paragraph",',
-    '  "primaryPlan": {',
-    '    "summary": "text",',
-    '    "workflows": [',
-    "      {",
-    '        "title": "workflow title",',
-    '        "goal": "workflow goal",',
-    '        "tasks": [',
-    "          {",
-    '            "title": "task title",',
-    '            "ownerRole": "EMPLOYEE/ADMIN/FOUNDER",',
-    '            "subtasks": ["subtask 1"],',
-    '            "tools": ["tool name"],',
-    '            "requiresApproval": true,',
-    '            "approvalRole": "ADMIN",',
-    '            "approvalReason": "why approval needed"',
-    "          }",
-    "        ]",
-    "      }",
-    "    ],",
-    '    "risks": ["risk"],',
-    '    "successMetrics": ["metric"]',
-    "  },",
-    '  "fallbackPlan": {',
-    '    "summary": "text",',
-    '    "workflows": [],',
-    '    "risks": [],',
-    '    "successMetrics": []',
-    "  },",
-    '  "permissions": [',
-    "    {",
-    '      "area": "scope area",',
-    '      "requestedFromRole": "ADMIN/FOUNDER/EMPLOYEE",',
-    '      "reason": "why permission required",',
-    '      "workflowTitle": "workflow title",',
-    '      "taskTitle": "task title"',
-    "    }",
-    "  ]",
-    "}",
-    "",
-    "Do not include markdown. JSON only."
+    "Shape requirements:",
+    "- primaryPlan/fallbackPlan => {summary, workflows, risks, successMetrics}",
+    "- workflows => [{title, goal, tasks}]",
+    "- tasks => [{title, ownerRole, subtasks, tools, requiresApproval, approvalRole, approvalReason}]",
+    "- permissions => [{area, requestedFromRole, reason, workflowTitle, taskTitle}]"
   ].join("\n");
 
   const runtime = await getOrgLlmRuntime(orgId);
@@ -638,15 +627,11 @@ export async function POST(request: NextRequest) {
           }
         }
       : {}),
-    systemPromptOverride: [
-      `You are the Main Agent planner for organization ${org.name}.`,
-      "Produce complete, auditable implementation plans with realistic dependency and approval mapping.",
-      "Do not fabricate capabilities, tool availability, approvals, or execution outcomes.",
-      companyContext
-        ? "Company Data Context is selector-curated and provided in the user prompt; use it as authoritative scope."
-        : "If Company Data Context is unavailable, mark assumptions explicitly.",
-      "When required information is missing, mark explicit assumptions and risk notes."
-    ].join("\n"),
+    systemPromptOverride: buildOrganizationMainAgentPrompt({
+      orgName: org.name,
+      mode: "planning",
+      contextAvailable: Boolean(companyContext)
+    }),
     userPromptOverride: modelPrompt,
     maxOutputTokens: DIRECTION_PLAN_MAX_OUTPUT_TOKENS
   });
@@ -739,36 +724,80 @@ export async function POST(request: NextRequest) {
           role: true
         }
       });
-      const existingRoleSet = new Set(
-        existingAiRoles.map((item) => item.role.trim().toLowerCase()).filter(Boolean)
-      );
+      const existingRoleToPersonnelId = new Map<string, string>();
+      for (const item of existingAiRoles) {
+        const roleKey = item.role.trim().toLowerCase();
+        if (!roleKey || existingRoleToPersonnelId.has(roleKey)) {
+          continue;
+        }
+        existingRoleToPersonnelId.set(roleKey, item.id);
+      }
 
       for (const template of autoSquadInference.templates) {
         const roleKey = template.role.trim().toLowerCase();
-        if (!roleKey || existingRoleSet.has(roleKey)) {
+        if (!roleKey) {
           continue;
         }
 
+        let personnelIdForRole = existingRoleToPersonnelId.get(roleKey) ?? null;
+        if (!personnelIdForRole) {
+          // eslint-disable-next-line no-await-in-loop
+          const created = await tx.personnel.create({
+            data: {
+              orgId,
+              type: PersonnelType.AI,
+              name: template.name,
+              role: template.role,
+              expertise: template.expertise,
+              autonomyScore: template.autonomyScore,
+              status: PersonnelStatus.IDLE
+            },
+            select: {
+              id: true,
+              name: true,
+              role: true
+            }
+          });
+          autoSquadResult.created.push(created);
+          personnelIdForRole = created.id;
+          existingRoleToPersonnelId.set(roleKey, created.id);
+        }
+
+        // Ensure each auto-squad personnel row has an executable Agent profile.
         // eslint-disable-next-line no-await-in-loop
-        const created = await tx.personnel.create({
-          data: {
+        const existingAgentProfile = await tx.agent.findFirst({
+          where: {
             orgId,
-            type: PersonnelType.AI,
-            name: template.name,
-            role: template.role,
-            expertise: template.expertise,
-            autonomyScore: template.autonomyScore,
-            status: PersonnelStatus.IDLE
+            personnelId: personnelIdForRole
           },
           select: {
-            id: true,
-            name: true,
-            role: true
+            id: true
           }
         });
-
-        autoSquadResult.created.push(created);
-        existingRoleSet.add(roleKey);
+        if (!existingAgentProfile) {
+          // eslint-disable-next-line no-await-in-loop
+          await tx.agent.create({
+            data: {
+              orgId,
+              personnelId: personnelIdForRole,
+              role: mapAutoSquadRoleToAgentRole(template.role),
+              name: template.name,
+              goal: directionGiven.slice(0, 1200),
+              allowedTools: requiredToolkits,
+              instructions: buildAutoSquadAgentInstructions({
+                role: template.role,
+                expertise: template.expertise,
+                direction: directionGiven.slice(0, 900)
+              }),
+              metadata: {
+                creationSource: "direction_plan_auto_squad",
+                source: "control_direction_plan",
+                domain: autoSquadInference.domain ?? "general",
+                templateRole: template.role
+              }
+            }
+          });
+        }
       }
 
       if (autoSquadResult.created.length > 0) {
@@ -817,6 +846,8 @@ export async function POST(request: NextRequest) {
     const permissionRequests = await createPermissionRequests({
       orgId,
       direction: directionGiven,
+      directionId: directionRecord.id,
+      planId: planRecord.id,
       requestedByUserId: access.actor.userId,
       requestedByEmail: access.actor.email,
       items: dedupedPermissions.map((item) => ({

@@ -49,8 +49,31 @@ const TOOL_ACTIONS: Record<string, Record<string, AgentToolActionDefinition>> = 
 const RETRY_ATTEMPTS = 2;
 const MAX_EMAIL_BODY_CHARS = 4000;
 
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+const AGENT_TOOL_SUMMARY_USE_LLM = parseBooleanEnv("AGENT_TOOL_SUMMARY_USE_LLM", false);
+
 function asText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function canonicalToolkitForCompare(toolkit: string) {
+  const normalized = toolkit.trim().toLowerCase();
+  if (normalized === "googlemeet" || normalized === "gmeet") {
+    return "gmeet";
+  }
+  return normalized;
+}
+
+function toolkitMatches(left: string, right: string) {
+  return canonicalToolkitForCompare(left) === canonicalToolkitForCompare(right);
 }
 
 function truncate(value: string | null | undefined, maxChars: number) {
@@ -94,6 +117,13 @@ function summarizeEmailLines(emails: GmailEmailRecord[]) {
       return `${index + 1}. ${subject} from ${from}${snippet ? ` - ${snippet}` : ""}`;
     })
     .join("\n");
+}
+
+function shouldUseLlmSummary(prompt: string) {
+  if (!AGENT_TOOL_SUMMARY_USE_LLM) {
+    return false;
+  }
+  return /\b(detailed|analy[sz]e|insight|priority|sentiment|themes?)\b/i.test(prompt);
 }
 
 const summarizerAgentSelect = {
@@ -366,6 +396,7 @@ async function executeNamedGmailAction(input: {
   if (action === "SUMMARIZE_EMAILS") {
     const query = asText(input.arguments.query || input.arguments.search_query);
     const limit = normalizeLimit(input.arguments.limit ?? 10, 10);
+    const prompt = asText(input.arguments.prompt) || "Summarize my recent emails.";
     const listed = query
       ? await searchEmails({
           userId: input.userId,
@@ -379,12 +410,14 @@ async function executeNamedGmailAction(input: {
           max: limit
         });
 
-    const summary = await summarizeEmailsWithLlm({
-      orgId: input.orgId,
-      prompt: asText(input.arguments.prompt) || "Summarize my recent emails.",
-      ...(query ? { query } : {}),
-      emails: listed.emails
-    });
+    const summary = shouldUseLlmSummary(prompt)
+      ? await summarizeEmailsWithLlm({
+          orgId: input.orgId,
+          prompt,
+          ...(query ? { query } : {}),
+          emails: listed.emails
+        })
+      : summarizeEmailLines(listed.emails);
 
     return {
       toolSlug: listed.toolSlug,
@@ -426,7 +459,7 @@ function resolveActionConfig(input: {
   availableSlugs: Set<string>;
 }) {
   const toolkit = input.toolkit.toLowerCase();
-  const normalizedAction = input.action.trim().toUpperCase();
+  const normalizedAction = input.action.trim().toUpperCase().replace(/[^A-Z0-9_]+/g, "_");
   const byName = TOOL_ACTIONS[toolkit]?.[normalizedAction];
   if (byName) {
     return {
@@ -435,12 +468,19 @@ function resolveActionConfig(input: {
     };
   }
 
-  if (
-    normalizedAction.startsWith(`${toolkit.toUpperCase()}_`) &&
-    input.availableSlugs.has(normalizedAction)
-  ) {
+  if (input.availableSlugs.has(normalizedAction)) {
     return {
       toolSlug: normalizedAction,
+      arguments: input.arguments
+    };
+  }
+
+  const suffixMatches = [...input.availableSlugs].filter((slug) =>
+    slug.endsWith(`_${normalizedAction}`)
+  );
+  if (suffixMatches.length === 1) {
+    return {
+      toolSlug: suffixMatches[0],
       arguments: input.arguments
     };
   }
@@ -528,7 +568,7 @@ export async function executeAgentTool(input: ExecuteAgentToolInput): Promise<Ex
 
   const availableSlugs = new Set(
     toolsForAgent.bindings
-      .filter((item) => item.toolkit === toolkit)
+      .filter((item) => toolkitMatches(item.toolkit, toolkit))
       .map((item) => item.slug.toUpperCase())
   );
   const actionConfig = usesNamedGmailAction

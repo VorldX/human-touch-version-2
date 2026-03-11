@@ -1,14 +1,28 @@
 export const dynamic = "force-dynamic";
 
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 
 import { selectCompanyContext } from "@/lib/ai/context-selector";
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
+import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
+import { executeAgentTool } from "@/lib/agent/tools/execute";
+import { featureFlags } from "@/lib/config/feature-flags";
 import { prisma } from "@/lib/db/prisma";
+import {
+  inferDirectionChatGmailIntent,
+  isCapabilityOverviewRequest,
+  isSimpleGreeting
+} from "@/lib/direction/chat-routing";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
+import { maybeRunSwarmOrganizationGraph } from "@/lib/langgraph/swarm-organization-entry";
+import { isOrganizationGraphEnabledForActor } from "@/lib/langgraph/utils/feature-gating";
+import {
+  composioAllowlistedToolkits,
+  isConnectedIntegrationStatus
+} from "@/lib/integrations/composio/service";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface DirectionMessageInput {
@@ -26,9 +40,9 @@ interface DirectionIntentRouting {
   cadenceHint?: "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
 }
 
-const MAX_OWNER_MESSAGE_CHARS = 2000;
-const MAX_HISTORY_ITEM_CHARS = 1200;
-const MAX_HISTORY_TOTAL_CHARS = 7000;
+const MAX_OWNER_MESSAGE_CHARS = 1400;
+const MAX_HISTORY_ITEM_CHARS = 600;
+const MAX_HISTORY_TOTAL_CHARS = 2400;
 
 function positiveEnvInt(name: string, fallback: number) {
   const parsed = Number(process.env[name]);
@@ -40,16 +54,30 @@ function positiveEnvInt(name: string, fallback: number) {
 
 const MAX_PROMPT_COMPANY_CONTEXT_CHARS = positiveEnvInt(
   "DIRECTION_CHAT_SELECTED_CONTEXT_MAX_CHARS",
-  2200
+  1200
 );
 const MAX_CONTEXT_SELECTOR_CHUNK_CHARS = positiveEnvInt(
   "DIRECTION_CONTEXT_SELECTOR_CHUNK_CHARS",
-  700
+  420
 );
 const DIRECTION_CHAT_MAX_OUTPUT_TOKENS = positiveEnvInt(
   "DIRECTION_CHAT_MAX_OUTPUT_TOKENS",
   420
 );
+const PERMISSION_REQUEST_KEY_PREFIX = "org.request.permission.";
+
+const GREETING_RESPONSES = [
+  "Hello. I am the Organization for VorldX.io, an advanced technology platform building intelligent digital ecosystems. How may I assist you?",
+  "Hello. Welcome to VorldX.io, an advanced technology platform building intelligent digital ecosystems. How may I assist you today?",
+  "Greetings. I am the Organization for VorldX.io, here to help you explore our intelligent digital ecosystem. How may I assist you?",
+  "Hello. You are connected with VorldX.io, an advanced platform for intelligent digital ecosystems. How may I assist you?",
+  "Welcome to VorldX.io. I am the Organization for our intelligent digital ecosystem platform. How may I assist you today?",
+  "Hello. This is VorldX.io, an advanced technology platform focused on building intelligent digital ecosystems. How may I assist you?",
+  "Greetings from VorldX.io. I am the Organization for our advanced intelligent digital ecosystem platform. How may I assist you today?",
+  "Hello and welcome to VorldX.io. I am the Organization for our platform building intelligent digital ecosystems. How may I assist you?",
+  "Hello. You have reached VorldX.io, an advanced technology platform creating intelligent digital ecosystems. How may I assist you today?",
+  "Welcome. I am the Organization for VorldX.io, where we build intelligent digital ecosystems through advanced technology. How may I assist you?"
+] as const;
 
 function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -61,6 +89,193 @@ function clampText(value: string, maxChars: number) {
   }
   return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
 }
+
+function summarizeGmailToolResponse(input: {
+  action: string;
+  data: Record<string, unknown>;
+}) {
+  const action = input.action.toUpperCase();
+  const data = input.data;
+
+  if (action === "SEND_EMAIL") {
+    const recipient = cleanText(data.to);
+    const subject = cleanText(data.subject);
+    if (recipient && subject) {
+      return `Email sent to ${recipient} with subject "${subject}".`;
+    }
+    if (recipient) {
+      return `Email sent to ${recipient}.`;
+    }
+    return "Email sent successfully.";
+  }
+
+  if (action === "SUMMARIZE_EMAILS") {
+    const summary = cleanText(data.summary);
+    if (summary) {
+      return summary;
+    }
+    return "I checked Gmail, but no summary content was returned.";
+  }
+
+  const rawEmails = Array.isArray(data.emails) ? data.emails : [];
+  const emails = rawEmails
+    .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+    .filter((item): item is Record<string, unknown> => Boolean(item));
+  const countRaw = typeof data.count === "number" ? data.count : emails.length;
+  const count = Number.isFinite(countRaw) ? Math.max(0, Math.floor(countRaw)) : emails.length;
+  if (count === 0 || emails.length === 0) {
+    return "I checked Gmail and found no matching emails.";
+  }
+
+  const preview = emails.slice(0, 5).map((email, index) => {
+    const subject = cleanText(email.subject) || "(no subject)";
+    const from = cleanText(email.from) || "unknown sender";
+    const snippet = cleanText(email.snippet);
+    return `${index + 1}. ${subject} from ${from}${snippet ? ` - ${snippet}` : ""}`;
+  });
+  const header =
+    action === "SEARCH_EMAILS"
+      ? `I searched Gmail and found ${count} matching email(s).`
+      : `I checked Gmail and found ${count} recent email(s).`;
+
+  return `${header}\n${preview.join("\n")}`;
+}
+
+function missingGmailSendFields(args: Record<string, unknown>) {
+  const to = cleanText(args.to || args.recipient_email);
+  const subject = cleanText(args.subject);
+  const body = cleanText(args.body || args.content);
+  const missing: string[] = [];
+  if (!to) missing.push("recipient email");
+  if (!subject) missing.push("subject");
+  if (!body) missing.push("body");
+  return missing;
+}
+
+function pickGreetingResponse() {
+  return GREETING_RESPONSES[randomInt(0, GREETING_RESPONSES.length)];
+}
+
+function toolkitLabel(slug: string) {
+  return slug
+    .split(/[-_]/g)
+    .map((part) => (part.length > 0 ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(" ");
+}
+
+async function buildCapabilityOverviewReply(input: {
+  orgId: string;
+  userId: string;
+  orgName: string;
+}) {
+  const [
+    aiPersonnelCount,
+    agentProfileCount,
+    pendingApprovalCheckpointCount,
+    pendingPermissionRequestCount,
+    integrationRows
+  ] = await Promise.all([
+    prisma.personnel.count({
+      where: {
+        orgId: input.orgId,
+        type: "AI",
+        status: {
+          not: "DISABLED"
+        }
+      }
+    }),
+    prisma.agent.count({
+      where: {
+        orgId: input.orgId,
+        status: {
+          in: ["ACTIVE", "PAUSED", "WAITING_HUMAN"]
+        }
+      }
+    }),
+    prisma.approvalCheckpoint.count({
+      where: {
+        orgId: input.orgId,
+        status: "PENDING"
+      }
+    }),
+    prisma.memoryEntry.count({
+      where: {
+        orgId: input.orgId,
+        key: {
+          startsWith: PERMISSION_REQUEST_KEY_PREFIX
+        },
+        redactedAt: null
+      }
+    }),
+    prisma.userIntegration.findMany({
+      where: {
+        userId: input.userId,
+        OR: [{ orgId: input.orgId }, { orgId: null }]
+      },
+      select: {
+        toolkit: true,
+        status: true,
+        updatedAt: true
+      },
+      orderBy: {
+        updatedAt: "desc"
+      },
+      take: 300
+    })
+  ]);
+
+  const preferredByToolkit = new Map<string, string>();
+  for (const row of integrationRows) {
+    const toolkit = row.toolkit.trim().toLowerCase();
+    if (!toolkit) continue;
+    const current = preferredByToolkit.get(toolkit);
+    if (!current || !isConnectedIntegrationStatus(current)) {
+      preferredByToolkit.set(toolkit, row.status);
+    }
+  }
+
+  const connectedToolkits = [...preferredByToolkit.entries()]
+    .filter((entry) => isConnectedIntegrationStatus(entry[1]))
+    .map((entry) => entry[0])
+    .sort((a, b) => a.localeCompare(b));
+
+  const langgraphEnabled = isOrganizationGraphEnabledForActor({
+    featureEnabled: featureFlags.langgraphOrganizationTeams,
+    orgAllowlist: featureFlags.langgraphOrganizationOrgAllowlist,
+    userAllowlist: featureFlags.langgraphOrganizationUserAllowlist,
+    orgId: input.orgId,
+    userId: input.userId
+  });
+
+  const memoryEnabled = featureFlags.agentLongTermMemory && featureFlags.agentContextRag;
+  const allowlisted = composioAllowlistedToolkits();
+
+  const connectedLabel =
+    connectedToolkits.length > 0
+      ? connectedToolkits.slice(0, 8).map((slug) => toolkitLabel(slug)).join(", ")
+      : "none";
+  const allowlistedPreview = allowlisted.slice(0, 10).map((slug) => toolkitLabel(slug)).join(", ");
+
+  const reply = [
+    `As ${input.orgName}, I can operate in chat mode and execution mode.`,
+    `Chat mode: direct answers plus deterministic Gmail actions (list/search/summarize/send) when connected.`,
+    `Execution mode: plan -> approvals -> queued multi-agent mission flow.`,
+    `Current workspace status:`,
+    `- AI personnel: ${aiPersonnelCount}; active agent profiles: ${agentProfileCount}.`,
+    `- Connected toolkits: ${connectedLabel}.`,
+    `- Pending approvals: ${pendingApprovalCheckpointCount}; pending permission requests: ${pendingPermissionRequestCount}.`,
+    `- LangGraph team orchestration: ${langgraphEnabled ? "enabled" : "disabled"}.`,
+    `- Long-term memory + RAG: ${memoryEnabled ? "enabled" : "disabled"}.`,
+    `Allowlisted toolkits include: ${allowlistedPreview}.`,
+    `If you want execution now, give the exact outcome and deadline and I will route it into a launchable plan.`
+  ].join("\n");
+
+  return {
+    reply,
+    toolkitHints: connectedToolkits
+  };
+}
+
 function safeHistory(value: unknown): DirectionMessageInput[] {
   if (!Array.isArray(value)) return [];
   const history: DirectionMessageInput[] = [];
@@ -73,7 +288,7 @@ function safeHistory(value: unknown): DirectionMessageInput[] {
     history.push({ role, content });
   }
 
-  const sliced = history.slice(-12);
+  const sliced = history.slice(-6);
   let totalChars = sliced.reduce((sum, entry) => sum + entry.content.length, 0);
   while (sliced.length > 1 && totalChars > MAX_HISTORY_TOTAL_CHARS) {
     const dropped = sliced.shift();
@@ -109,6 +324,7 @@ function inferToolkitHints(text: string) {
   const lower = text.toLowerCase();
   const compact = lower.replace(/[^a-z0-9]/g, "");
   const requested = new Set<string>();
+  const escapeRegex = (input: string) => input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const toolkitAliases: Record<string, string[]> = {
     gmail: ["gmail", "email", "inbox", "mailbox"],
@@ -148,7 +364,12 @@ function inferToolkitHints(text: string) {
       const normalizedAlias = alias.trim().toLowerCase();
       if (!normalizedAlias) return false;
       const compactAlias = normalizedAlias.replace(/[^a-z0-9]/g, "");
-      return lower.includes(normalizedAlias) || (compactAlias && compact.includes(compactAlias));
+      const shortAlias = compactAlias.length > 0 && compactAlias.length <= 2;
+      if (shortAlias) {
+        const bounded = new RegExp(`(?:^|\\W)${escapeRegex(normalizedAlias)}(?:$|\\W)`, "i");
+        return bounded.test(lower);
+      }
+      return lower.includes(normalizedAlias) || (compactAlias.length >= 4 && compact.includes(compactAlias));
     });
     if (matched) {
       requested.add(toolkit);
@@ -361,6 +582,181 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Keep greeting UX deterministic and low-cost: rotate only for first-turn simple greetings.
+    if (history.length === 0 && isSimpleGreeting(message)) {
+      return NextResponse.json({
+        ok: true,
+        reply: pickGreetingResponse(),
+        directionCandidate: "",
+        intentRouting: {
+          route: "CHAT_RESPONSE",
+          reason: "First-message greeting detected.",
+          toolkitHints: [],
+          squadRoleHints: []
+        },
+        model: {
+          provider: null,
+          name: null,
+          source: "greeting-rotation"
+        },
+        tokenUsage: null,
+        billing: null,
+        contextSelection: null
+      });
+    }
+
+    if (isCapabilityOverviewRequest(message)) {
+      const capability = await buildCapabilityOverviewReply({
+        orgId,
+        userId: access.actor.userId,
+        orgName: org.name
+      });
+      return NextResponse.json({
+        ok: true,
+        reply: capability.reply,
+        directionCandidate: "",
+        intentRouting: {
+          route: "CHAT_RESPONSE",
+          reason: "Deterministic capability overview requested.",
+          toolkitHints: capability.toolkitHints,
+          squadRoleHints: []
+        },
+        model: {
+          provider: null,
+          name: null,
+          source: "capability-overview"
+        },
+        tokenUsage: null,
+        billing: null,
+        contextSelection: null
+      });
+    }
+
+    const organizationGraphResult = await maybeRunSwarmOrganizationGraph({
+      orgId,
+      userId: access.actor.userId,
+      sessionId: `direction-chat:${orgId}:${access.actor.userId}`,
+      userRequest: message
+    });
+    if (organizationGraphResult.handled) {
+      return NextResponse.json({
+        ok: true,
+        reply: organizationGraphResult.reply,
+        directionCandidate: "",
+        intentRouting: {
+          route: "CHAT_RESPONSE",
+          reason: organizationGraphResult.reason,
+          toolkitHints: [],
+          squadRoleHints: []
+        },
+        model: {
+          provider: null,
+          name: null,
+          source: "langgraph-organization"
+        },
+        tokenUsage: null,
+        billing: null,
+        contextSelection: null,
+        organizationGraph: {
+          graphRunId: organizationGraphResult.graphRunId,
+          requestType: organizationGraphResult.requestType,
+          createdAgentCount: organizationGraphResult.createdAgentCount,
+          reusedAgentCount: organizationGraphResult.reusedAgentCount,
+          approvalPendingCount: organizationGraphResult.approvalPendingCount,
+          warnings: organizationGraphResult.warnings
+        }
+      });
+    }
+
+    const gmailIntent = inferDirectionChatGmailIntent(message);
+    if (gmailIntent) {
+      if (gmailIntent.action === "SEND_EMAIL") {
+        const missing = missingGmailSendFields(gmailIntent.arguments);
+        if (missing.length > 0) {
+          return NextResponse.json({
+            ok: true,
+            reply: `To send the email, I still need: ${missing.join(", ")}.`,
+            directionCandidate: "",
+            intentRouting: {
+              route: "CHAT_RESPONSE",
+              reason: "Deterministic Gmail send intent detected with missing required fields.",
+              toolkitHints: ["gmail"],
+              squadRoleHints: []
+            },
+            model: {
+              provider: null,
+              name: null,
+              source: "tool-execution"
+            },
+            tokenUsage: null,
+            billing: null,
+            contextSelection: null
+          });
+        }
+      }
+
+      const toolResult = await executeAgentTool({
+        orgId,
+        userId: access.actor.userId,
+        toolkit: "gmail",
+        action: gmailIntent.action,
+        arguments: gmailIntent.arguments,
+        taskId: `direction-chat-gmail-${randomUUID().slice(0, 8)}`
+      });
+
+      if (!toolResult.ok) {
+        const reason =
+          toolResult.error.code === "INTEGRATION_NOT_CONNECTED"
+            ? "Gmail is not connected for this workspace user. Please reconnect Gmail and retry."
+            : toolResult.error.code === "INVALID_TOOL_ACTION" &&
+                gmailIntent.action === "SEND_EMAIL"
+              ? `Email send requires recipient email, subject, and body. ${toolResult.error.message}`
+            : toolResult.error.message || "Gmail action failed.";
+        return NextResponse.json({
+          ok: true,
+          reply: reason,
+          directionCandidate: "",
+          intentRouting: {
+            route: "CHAT_RESPONSE",
+            reason: "Deterministic Gmail tool intent detected.",
+            toolkitHints: ["gmail"],
+            squadRoleHints: []
+          },
+          model: {
+            provider: null,
+            name: null,
+            source: "tool-execution"
+          },
+          tokenUsage: null,
+          billing: null,
+          contextSelection: null
+        });
+      }
+
+      return NextResponse.json({
+        ok: true,
+        reply: summarizeGmailToolResponse({
+          action: gmailIntent.action,
+          data: toolResult.data
+        }),
+        directionCandidate: "",
+        intentRouting: {
+          route: "CHAT_RESPONSE",
+          reason: "Deterministic Gmail tool intent detected.",
+          toolkitHints: ["gmail"],
+          squadRoleHints: []
+        },
+        model: {
+          provider: null,
+          name: null,
+          source: "tool-execution"
+        },
+        tokenUsage: null,
+        billing: null,
+        contextSelection: null
+      });
+    }
+
     const mainAgent =
       (await prisma.personnel.findFirst({
         where: {
@@ -442,18 +838,17 @@ export async function POST(request: NextRequest) {
     });
 
     const userPrompt = [
-      "Owner-to-organization conversation transcript:",
-      ...history.map((entry) => `${entry.role === "owner" ? "Owner" : "Organization"}: ${entry.content}`),
+      "Conversation:",
+      ...history.map(
+        (entry) => `${entry.role === "owner" ? "Owner" : "Organization"}: ${entry.content}`
+      ),
       `Owner: ${message}`,
       "",
-      companyContext
-        ? ["Company Data Context (selector-brain curated, authoritative excerpt):", companyContext].join("\n")
-        : "Company Data Context: unavailable.",
+      companyContext ? `Company context excerpt:\n${companyContext}` : "Company context: unavailable.",
       "",
-      "Respond as the Main Agent representing the organization.",
       preIntentRouting.route === "PLAN_REQUIRED"
-        ? "Give a concise answer and end with a concrete section titled 'Direction:' that can be executed by agents."
-        : "Give a concise direct chat answer. Do not append a synthetic 'Direction:' section unless the user explicitly asks for planning/execution."
+        ? "Reply concisely and end with a `Direction:` section with executable wording."
+        : "Reply concisely as normal chat. Do not append `Direction:` unless execution/planning is explicit."
     ].join("\n");
 
     const organizationRuntime = await getOrgLlmRuntime(orgId);
@@ -496,20 +891,12 @@ export async function POST(request: NextRequest) {
             }
           }
         : {}),
-      systemPromptOverride: [
-        `You are the Main Agent for organization ${org.name}.`,
-        "You represent the company as a coherent operating intelligence.",
-        "Speak clearly, avoid hype, and produce execution-ready guidance.",
-        "Do not fabricate facts, metrics, IDs, links, or completion claims.",
-        "Ground responses only in conversation + provided company context.",
-        companyContext
-          ? "Company Data Context is selector-curated and provided in the user prompt; use it as authoritative scope."
-          : "If Company Data Context is unavailable, ask for missing details instead of guessing.",
-        "If information is missing, explicitly say what is unknown and ask for clarification.",
-        preIntentRouting.route === "PLAN_REQUIRED"
-          ? "End with a 'Direction:' section."
-          : "Keep this as a normal conversational response unless planning/execution intent is explicit."
-      ].join("\n"),
+      systemPromptOverride: buildOrganizationMainAgentPrompt({
+        orgName: org.name,
+        mode: "chat",
+        contextAvailable: Boolean(companyContext),
+        includeDirectionSection: preIntentRouting.route === "PLAN_REQUIRED"
+      }),
       userPromptOverride: userPrompt,
       maxOutputTokens: DIRECTION_CHAT_MAX_OUTPUT_TOKENS
     });

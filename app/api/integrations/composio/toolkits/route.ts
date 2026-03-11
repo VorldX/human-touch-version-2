@@ -7,6 +7,7 @@ import {
   composioAllowlistedToolkits,
   composioIntegrationEnabled,
   getConnections,
+  isConnectedIntegrationStatus,
   listAvailableToolkits
 } from "@/lib/integrations/composio/service";
 import { resolveIntegrationActor } from "@/lib/integrations/composio/request-context";
@@ -55,7 +56,7 @@ export async function GET(request: NextRequest) {
     >();
     for (const connection of connections) {
       const current = preferredByToolkit.get(connection.toolkit);
-      if (!current || current.status !== "ACTIVE") {
+      if (!current || !isConnectedIntegrationStatus(current.status)) {
         preferredByToolkit.set(connection.toolkit, {
           status: connection.status,
           connectionId: connection.connectionId
@@ -68,7 +69,7 @@ export async function GET(request: NextRequest) {
       return {
         ...toolkit,
         status: preferred?.status ?? toolkit.status,
-        connected: (preferred?.status ?? toolkit.status) === "ACTIVE",
+        connected: isConnectedIntegrationStatus(preferred?.status ?? toolkit.status),
         connectionId: preferred?.connectionId ?? toolkit.connectionId
       };
     });

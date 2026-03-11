@@ -52,6 +52,7 @@ import { SettingsConsole } from "@/components/settings/settings-console";
 import { SquadConsole } from "@/components/squad/squad-console";
 import { NotificationStack } from "@/components/system/notification-stack";
 import { WorkflowConsole } from "@/components/workflow/workflow-console";
+import { classifyEmailDraftReply } from "@/lib/agent/run/email-request-parser";
 import { getRealtimeClient } from "@/lib/realtime/client";
 import type { AppTheme } from "@/lib/store/vorldx-store";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
@@ -430,6 +431,8 @@ interface PermissionRequestItem {
   id: string;
   orgId: string;
   direction: string;
+  directionId: string | null;
+  planId: string | null;
   requestedByUserId: string;
   requestedByEmail: string;
   targetRole: "FOUNDER" | "ADMIN" | "EMPLOYEE";
@@ -451,6 +454,7 @@ interface DirectionPlanningResult {
   directionGiven: string;
   primaryPlan: DirectionExecutionPlan;
   fallbackPlan: DirectionExecutionPlan;
+  permissionRequests?: PermissionRequestItem[];
   requiredToolkits?: string[];
   autoSquad?: {
     triggered?: boolean;
@@ -573,6 +577,7 @@ function inferToolkitsFromDirectionPrompt(value: string) {
   const prompt = value.toLowerCase();
   const compactPrompt = prompt.replace(/[^a-z0-9]/g, "");
   const requested = new Set<string>();
+  const escapeRegex = (input: string) => input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const toolkitAliases: Record<string, string[]> = {
     gmail: ["gmail", "email", "mailbox", "inbox"],
     slack: ["slack", "channel", "workspace", "direct message", "dm"],
@@ -611,11 +616,39 @@ function inferToolkitsFromDirectionPrompt(value: string) {
       const normalizedAlias = alias.trim().toLowerCase();
       if (!normalizedAlias) return false;
       const compactAlias = normalizedAlias.replace(/[^a-z0-9]/g, "");
-      return prompt.includes(normalizedAlias) || (compactAlias && compactPrompt.includes(compactAlias));
+      const shortAlias = compactAlias.length > 0 && compactAlias.length <= 2;
+      if (shortAlias) {
+        const bounded = new RegExp(`(?:^|\\W)${escapeRegex(normalizedAlias)}(?:$|\\W)`, "i");
+        return bounded.test(prompt);
+      }
+      return (
+        prompt.includes(normalizedAlias) ||
+        (compactAlias.length >= 4 && compactPrompt.includes(compactAlias))
+      );
     });
     if (matched) {
       requested.add(toolkit);
     }
+  }
+
+  const hasMeetingCreateIntent =
+    /\b(set up|setup|schedule|book|arrange|create|plan)\b[\s\S]{0,80}\b(meeting|call|invite|invitation|session)\b/i.test(
+      prompt
+    ) ||
+    /\b(meeting|call|invite|invitation|session)\b[\s\S]{0,80}\b(set up|setup|schedule|book|arrange|create|plan)\b/i.test(
+      prompt
+    );
+  const hasMeetingShareIntent =
+    /\b(send|share|mail|email)\b/i.test(prompt) &&
+    /\b(details?|invite|invitation|link|meeting)\b/i.test(prompt);
+  const hasRecipientEmail = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(prompt);
+
+  if (hasMeetingCreateIntent) {
+    requested.add("googlemeet");
+    requested.add("googlecalendar");
+  }
+  if (hasMeetingShareIntent && hasRecipientEmail) {
+    requested.add("gmail");
   }
 
   return [...requested];
@@ -1309,6 +1342,47 @@ export function VorldXShell() {
     () => permissionRequests.filter((item) => item.status === "PENDING").length,
     [permissionRequests]
   );
+  const activePlanId = directionPlanningResult?.planRecord?.id?.trim() ?? "";
+  const activeDirectionId = directionPlanningResult?.directionRecord?.id?.trim() ?? "";
+  const launchScopedPermissionRequests = useMemo(() => {
+    const byId = new Map<string, PermissionRequestItem>();
+
+    for (const request of directionPlanningResult?.permissionRequests ?? []) {
+      byId.set(request.id, request);
+    }
+
+    for (const request of permissionRequests) {
+      const matchesPlan = activePlanId.length > 0 && request.planId === activePlanId;
+      const matchesDirection =
+        !matchesPlan &&
+        activeDirectionId.length > 0 &&
+        request.directionId === activeDirectionId;
+      if (matchesPlan || matchesDirection || byId.has(request.id)) {
+        byId.set(request.id, request);
+      }
+    }
+
+    return [...byId.values()];
+  }, [
+    activeDirectionId,
+    activePlanId,
+    directionPlanningResult?.permissionRequests,
+    permissionRequests
+  ]);
+  const pendingLaunchPermissionRequestCount = useMemo(
+    () =>
+      launchScopedPermissionRequests.filter((item) => item.status === "PENDING").length,
+    [launchScopedPermissionRequests]
+  );
+  const rejectedLaunchPermissionRequestCount = useMemo(
+    () =>
+      launchScopedPermissionRequests.filter((item) => item.status === "REJECTED").length,
+    [launchScopedPermissionRequests]
+  );
+  const launchPermissionRequestIds = useMemo(
+    () => launchScopedPermissionRequests.map((item) => item.id),
+    [launchScopedPermissionRequests]
+  );
 
   useEffect(() => {
     if (signatureApprovals > requiredSignatures) {
@@ -1961,6 +2035,7 @@ export function VorldXShell() {
           };
           directionRecord?: { id?: string };
           planRecord?: { id?: string };
+          permissionRequests?: PermissionRequestItem[];
           requestCount?: number;
           model?: { provider?: string | null; name?: string | null };
         }>(response);
@@ -1981,7 +2056,7 @@ export function VorldXShell() {
 
         const refinedDirection = payload.directionGiven?.trim() || direction;
         const analysis = payload.analysis?.trim() ?? "";
-        const planToolkits = [
+        const planToolkitsRaw = [
           ...new Set(
             [
               ...(payload.requiredToolkits ?? []),
@@ -1993,12 +2068,16 @@ export function VorldXShell() {
               .filter(Boolean)
           )
         ];
+        const planToolkits = isGmailDirectionPrompt(refinedDirection)
+          ? ["gmail"]
+          : planToolkitsRaw;
         setIntent(refinedDirection);
         setDirectionPlanningResult({
           analysis,
           directionGiven: refinedDirection,
           primaryPlan: payload.primaryPlan,
           fallbackPlan: payload.fallbackPlan,
+          permissionRequests: payload.permissionRequests ?? [],
           requiredToolkits: planToolkits,
           autoSquad: payload.autoSquad,
           directionRecord: payload.directionRecord,
@@ -2692,10 +2771,18 @@ export function VorldXShell() {
       return;
     }
 
-    if (signatureApprovals < requiredSignatures) {
+    if (pendingLaunchPermissionRequestCount > 0) {
       setControlMessage({
         tone: "warning",
-        text: `Collect ${requiredSignatures} signatures before launch. Current: ${signatureApprovals}.`
+        text: `Resolve ${pendingLaunchPermissionRequestCount} pending permission request(s) before launch.`
+      });
+      return;
+    }
+
+    if (rejectedLaunchPermissionRequestCount > 0) {
+      setControlMessage({
+        tone: "error",
+        text: `Launch blocked: ${rejectedLaunchPermissionRequestCount} permission request(s) were rejected. Regenerate plan or update direction.`
       });
       return;
     }
@@ -2709,7 +2796,10 @@ export function VorldXShell() {
         return;
       }
 
-      const requestedToolkits = inferToolkitsFromDirectionPrompt(prompt);
+      const inferredToolkits = inferToolkitsFromDirectionPrompt(prompt);
+      const requestedToolkits = isGmailDirectionPrompt(prompt)
+        ? ["gmail"]
+        : inferredToolkits;
       const toolkitsReady = await ensureRequestedToolkitsReady(requestedToolkits, prompt);
       if (!toolkitsReady) {
         return;
@@ -2815,7 +2905,6 @@ export function VorldXShell() {
             text: payload.assistant_message || "Main Agent completed the Gmail action."
           });
         } else if (payload.status === "needs_input") {
-          setPendingEmailApproval(null);
           const requiredInputLines = (payload.required_inputs ?? [])
             .map((item) => `- ${item.label}`)
             .join("\n");
@@ -2872,7 +2961,6 @@ export function VorldXShell() {
               : "Draft ready. No email has been sent yet. Reply \"approve\" in chat to send."
           });
         } else {
-          setPendingEmailApproval(null);
           const connectUrl =
             payload.error?.code === "INTEGRATION_NOT_CONNECTED" &&
             typeof payload.error?.details?.connectUrl === "string"
@@ -2914,10 +3002,14 @@ export function VorldXShell() {
           prompt,
           directionId: directionPlanningResult?.directionRecord?.id || undefined,
           planId: directionPlanningResult?.planRecord?.id || undefined,
+          planWorkflows: directionPlanningResult?.primaryPlan?.workflows ?? undefined,
           swarmDensity,
           predictedBurn,
           requiredSignatures,
-          approvalsProvided: signatureApprovals,
+          permissionRequestIds:
+            launchPermissionRequestIds.length > 0
+              ? launchPermissionRequestIds
+              : undefined,
           requestedToolkits
         })
       });
@@ -2926,7 +3018,13 @@ export function VorldXShell() {
         ok?: boolean;
         warning?: string;
         message?: string;
-        flow?: { id: string; status: string; executionMode?: string };
+        flow?: {
+          id: string;
+          status: string;
+          executionMode?: string;
+          approvalsCaptured?: number;
+          requiredSignatures?: number;
+        };
       }>(response);
 
       if (!payload) {
@@ -2945,12 +3043,24 @@ export function VorldXShell() {
         return;
       }
 
-      setControlMessage({
-        tone: payload.warning ? "warning" : "success",
-        text: payload.warning
-          ? `Flow ${payload.flow?.id ?? ""} queued with warning: ${payload.warning}`
-          : `Flow ${payload.flow?.id ?? ""} queued successfully (${payload.flow?.status ?? "QUEUED"} | ${payload.flow?.executionMode ?? "MULTI_AGENT"}).`
-      });
+      const flowStatus = (payload.flow?.status ?? "").toUpperCase();
+      if (flowStatus === "DRAFT") {
+        const approvalsCaptured = payload.flow?.approvalsCaptured ?? 1;
+        const required = payload.flow?.requiredSignatures ?? requiredSignatures;
+        setControlMessage({
+          tone: "warning",
+          text:
+            payload.warning ??
+            `Flow ${payload.flow?.id ?? ""} created in draft. Additional signatures required (${approvalsCaptured}/${required}).`
+        });
+      } else {
+        setControlMessage({
+          tone: payload.warning ? "warning" : "success",
+          text: payload.warning
+            ? `Flow ${payload.flow?.id ?? ""} queued with warning: ${payload.warning}`
+            : `Flow ${payload.flow?.id ?? ""} queued successfully (${payload.flow?.status ?? "QUEUED"} | ${payload.flow?.executionMode ?? "MULTI_AGENT"}).`
+        });
+      }
       handleTabChange("flow");
     } catch (error) {
       setControlMessage({
@@ -2968,13 +3078,16 @@ export function VorldXShell() {
     authHeaders,
     directionPlanningResult?.directionRecord?.id,
     directionPlanningResult?.planRecord?.id,
+    directionPlanningResult?.primaryPlan,
     handleTabChange,
     ensureOrgAccessReady,
     ensureRequestedToolkitsReady,
     predictedBurn,
+    pendingLaunchPermissionRequestCount,
+    rejectedLaunchPermissionRequestCount,
     requiredSignatures,
     resolvedOrg?.id,
-    signatureApprovals,
+    launchPermissionRequestIds,
     swarmDensity,
     user?.uid,
     user?.email
@@ -2986,7 +3099,10 @@ export function VorldXShell() {
     }
 
     const prompt = pendingPlanLaunchApproval.prompt.trim();
-    const requestedToolkits = [...new Set(pendingPlanLaunchApproval.toolkits)];
+    const requestedToolkitsRaw = [...new Set(pendingPlanLaunchApproval.toolkits)];
+    const requestedToolkits = isGmailDirectionPrompt(prompt)
+      ? ["gmail"]
+      : requestedToolkitsRaw;
     if (!prompt) {
       setControlMessage({
         tone: "warning",
@@ -4020,7 +4136,9 @@ export function VorldXShell() {
                       }
                     ]);
 
-                    if (isApprovalReply(trimmed)) {
+                    const draftReplyIntent = classifyEmailDraftReply(trimmed);
+
+                    if (draftReplyIntent === "approve") {
                       setIntent(pendingEmailApproval.prompt);
                       await handleLaunchMainAgent(
                         pendingEmailApproval.prompt,
@@ -4032,13 +4150,12 @@ export function VorldXShell() {
                       return;
                     }
 
-                    if (isRejectReply(trimmed)) {
+                    if (draftReplyIntent === "cancel") {
                       handleRejectEmailDraft();
                       return;
                     }
 
                     const revisedPrompt = `${pendingEmailApproval.prompt}\n\nAdditional edits from user: ${trimmed}`;
-                    setPendingEmailApproval(null);
                     setIntent(revisedPrompt);
                     await handleLaunchMainAgent(revisedPrompt);
                     return;
@@ -4650,7 +4767,7 @@ function ControlDeckSurface({
 
   const composerBar = (
     <div className="relative overflow-visible rounded-[24px] border border-white/15 bg-[#02060d]/90 p-1.5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl sm:rounded-[30px] sm:p-2">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_10%_15%,rgba(56,189,248,0.2),transparent_38%),radial-gradient(circle_at_88%_86%,rgba(16,185,129,0.16),transparent_34%)]" />
+      <div className="pointer-events-none absolute inset-0 rounded-[24px] bg-[radial-gradient(circle_at_10%_15%,rgba(56,189,248,0.2),transparent_38%),radial-gradient(circle_at_88%_86%,rgba(16,185,129,0.16),transparent_34%)] sm:rounded-[30px]" />
       <div className="relative flex items-end gap-1.5 sm:gap-2">
         <div ref={attachMenuRef} className="relative shrink-0 self-center">
           <button
