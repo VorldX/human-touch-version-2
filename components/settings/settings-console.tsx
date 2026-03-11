@@ -57,6 +57,43 @@ interface OrganizationLlmSettings {
   updatedAt: string | null;
 }
 
+type OrchestrationPipelineMode = "OFF" | "AUDIT" | "ENFORCE";
+type OrchestrationPipelineRuleType =
+  | "REQUIRE_PLAN_BEFORE_EXECUTION"
+  | "REQUIRE_PLAN_WORKFLOWS"
+  | "BLOCK_DIRECT_WORKFLOW_LAUNCH"
+  | "FREEZE_EXECUTION_TO_APPROVED_PLAN"
+  | "REQUIRE_DETAILED_PLAN"
+  | "REQUIRE_MULTI_WORKFLOW_DECOMPOSITION"
+  | "ENFORCE_SPECIALIST_TOOL_ASSIGNMENT";
+
+interface OrchestrationPipelineRule {
+  id: string;
+  name: string;
+  type: OrchestrationPipelineRuleType;
+  enabled: boolean;
+  priority: number;
+}
+
+interface OrchestrationPipelineSettings {
+  mode: OrchestrationPipelineMode;
+  rules: OrchestrationPipelineRule[];
+  updatedAt: string | null;
+}
+
+interface OrchestrationPipelineEffectivePolicy {
+  strictFeatureEnabled: boolean;
+  mode: OrchestrationPipelineMode;
+  enforcePlanBeforeExecution: boolean;
+  requirePlanWorkflows: boolean;
+  blockDirectWorkflowLaunch: boolean;
+  freezeExecutionToApprovedPlan: boolean;
+  requireDetailedPlan: boolean;
+  requireMultiWorkflowDecomposition: boolean;
+  enforceSpecialistToolAssignment: boolean;
+  enabledRuleTypes: OrchestrationPipelineRuleType[];
+}
+
 interface OrgCreditsWallet {
   balanceCredits: number;
   lowBalanceThreshold: number;
@@ -80,6 +117,72 @@ function defaultMarkup(plan: ServicePlan) {
   if (plan === "ENTERPRISE") return 12;
   if (plan === "GROWTH") return 18;
   return 25;
+}
+
+function defaultPipelineRules(): OrchestrationPipelineRule[] {
+  return [
+    {
+      id: "rule-plan-before-execution",
+      name: "Require plan before execution",
+      type: "REQUIRE_PLAN_BEFORE_EXECUTION",
+      enabled: true,
+      priority: 10
+    },
+    {
+      id: "rule-plan-workflows",
+      name: "Require workflow breakdown from approved plan",
+      type: "REQUIRE_PLAN_WORKFLOWS",
+      enabled: true,
+      priority: 20
+    },
+    {
+      id: "rule-block-direct-launch",
+      name: "Block direct workflow launch",
+      type: "BLOCK_DIRECT_WORKFLOW_LAUNCH",
+      enabled: true,
+      priority: 30
+    },
+    {
+      id: "rule-freeze-plan",
+      name: "Freeze execution to approved plan snapshot",
+      type: "FREEZE_EXECUTION_TO_APPROVED_PLAN",
+      enabled: false,
+      priority: 40
+    },
+    {
+      id: "rule-detailed-plan",
+      name: "Require detailed plan blueprint",
+      type: "REQUIRE_DETAILED_PLAN",
+      enabled: true,
+      priority: 50
+    },
+    {
+      id: "rule-multi-workflow",
+      name: "Require multi-workflow decomposition",
+      type: "REQUIRE_MULTI_WORKFLOW_DECOMPOSITION",
+      enabled: true,
+      priority: 60
+    },
+    {
+      id: "rule-specialist-routing",
+      name: "Enforce specialist tool assignment",
+      type: "ENFORCE_SPECIALIST_TOOL_ASSIGNMENT",
+      enabled: false,
+      priority: 70
+    }
+  ];
+}
+
+function ruleTypeLabel(type: OrchestrationPipelineRuleType) {
+  if (type === "REQUIRE_PLAN_BEFORE_EXECUTION") return "Require Plan Before Execution";
+  if (type === "REQUIRE_PLAN_WORKFLOWS") return "Require Plan Workflows";
+  if (type === "BLOCK_DIRECT_WORKFLOW_LAUNCH") return "Block Direct Launch";
+  if (type === "FREEZE_EXECUTION_TO_APPROVED_PLAN") return "Freeze Execution To Plan Snapshot";
+  if (type === "REQUIRE_DETAILED_PLAN") return "Require Detailed Plan";
+  if (type === "REQUIRE_MULTI_WORKFLOW_DECOMPOSITION") {
+    return "Require Multi Workflow Decomposition";
+  }
+  return "Enforce Specialist Tool Assignment";
 }
 
 export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsConsoleProps) {
@@ -107,6 +210,13 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
     configuredApiKeyProviders: [],
     updatedAt: null
   });
+  const [pipelineSettings, setPipelineSettings] = useState<OrchestrationPipelineSettings>({
+    mode: "OFF",
+    rules: defaultPipelineRules(),
+    updatedAt: null
+  });
+  const [pipelineEffectivePolicy, setPipelineEffectivePolicy] =
+    useState<OrchestrationPipelineEffectivePolicy | null>(null);
 
   const [newWebhookUrl, setNewWebhookUrl] = useState("");
   const [newWebhookEvent, setNewWebhookEvent] = useState("TASK_UPDATED");
@@ -117,6 +227,9 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
   const [primaryProviderApiKey, setPrimaryProviderApiKey] = useState("");
   const [fallbackProviderApiKey, setFallbackProviderApiKey] = useState("");
   const [savingLlm, setSavingLlm] = useState(false);
+  const [savingPipeline, setSavingPipeline] = useState(false);
+  const [newPipelineRuleType, setNewPipelineRuleType] =
+    useState<OrchestrationPipelineRuleType>("REQUIRE_PLAN_BEFORE_EXECUTION");
   const [creditsWallet, setCreditsWallet] = useState<OrgCreditsWallet>({
     balanceCredits: 0,
     lowBalanceThreshold: 1000,
@@ -140,12 +253,15 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
       else setLoading(true);
 
       try {
-        const [webhooksRes, railsRes, identityRes, llmRes, creditsRes] = await Promise.all([
+        const [webhooksRes, railsRes, identityRes, llmRes, creditsRes, pipelineRes] = await Promise.all([
           fetch(`/api/settings/webhooks?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
           fetch(`/api/settings/rails?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
           fetch(`/api/settings/identity?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
           fetch(`/api/settings/llm?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
-          fetch(`/api/settings/credits?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" })
+          fetch(`/api/settings/credits?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store" }),
+          fetch(`/api/settings/orchestration-rules?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store"
+          })
         ]);
 
         const { payload: webhooksPayload, rawText: webhooksRawText } = await parseJsonResponse<{
@@ -175,6 +291,12 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           message?: string;
           wallet?: OrgCreditsWallet;
         }>(creditsRes);
+        const { payload: pipelinePayload, rawText: pipelineRawText } = await parseJsonResponse<{
+          ok?: boolean;
+          message?: string;
+          settings?: OrchestrationPipelineSettings;
+          effectivePolicy?: OrchestrationPipelineEffectivePolicy;
+        }>(pipelineRes);
 
         if (!webhooksRes.ok || !webhooksPayload?.ok) {
           throw new Error(
@@ -216,6 +338,14 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
                 : "Failed loading credits.")
           );
         }
+        if (!pipelineRes.ok || !pipelinePayload?.ok || !pipelinePayload.settings) {
+          throw new Error(
+            pipelinePayload?.message ??
+              (pipelineRawText
+                ? `Failed loading pipeline policy (${pipelineRes.status}): ${pipelineRawText.slice(0, 180)}`
+                : "Failed loading pipeline policy.")
+          );
+        }
 
         setError(null);
         setWebhooks(webhooksPayload.webhooks ?? []);
@@ -227,6 +357,8 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
           executionMode: llmPayload.executionMode ?? llmPayload.settings.executionMode ?? "BALANCED"
         });
         setCreditsWallet(creditsPayload.wallet);
+        setPipelineSettings(pipelinePayload.settings);
+        setPipelineEffectivePolicy(pipelinePayload.effectivePolicy ?? null);
         setPrimaryProviderApiKey("");
         setFallbackProviderApiKey("");
       } catch (requestError) {
@@ -428,6 +560,106 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
     },
     [fallbackProviderApiKey, llmSettings, notify, orgId, primaryProviderApiKey]
   );
+
+  const addPipelineRule = useCallback(() => {
+    setPipelineSettings((prev) => {
+      const exists = prev.rules.some((rule) => rule.type === newPipelineRuleType);
+      if (exists) {
+        notify({
+          title: "Pipeline",
+          message: "This rule type already exists. Edit the existing entry instead.",
+          type: "warning"
+        });
+        return prev;
+      }
+
+      const nextPriority =
+        prev.rules.length === 0
+          ? 10
+          : Math.max(...prev.rules.map((rule) => rule.priority)) + 10;
+      return {
+        ...prev,
+        rules: [
+          ...prev.rules,
+          {
+            id: `rule-${newPipelineRuleType.toLowerCase()}-${Date.now()}`,
+            name: ruleTypeLabel(newPipelineRuleType),
+            type: newPipelineRuleType,
+            enabled: true,
+            priority: nextPriority
+          }
+        ]
+      };
+    });
+  }, [newPipelineRuleType, notify]);
+
+  const updatePipelineRule = useCallback(
+    (ruleId: string, patch: Partial<OrchestrationPipelineRule>) => {
+      setPipelineSettings((prev) => ({
+        ...prev,
+        rules: prev.rules.map((rule) => (rule.id === ruleId ? { ...rule, ...patch } : rule))
+      }));
+    },
+    []
+  );
+
+  const removePipelineRule = useCallback((ruleId: string) => {
+    setPipelineSettings((prev) => ({
+      ...prev,
+      rules: prev.rules.filter((rule) => rule.id !== ruleId)
+    }));
+  }, []);
+
+  const savePipelineSettings = useCallback(async () => {
+    setSavingPipeline(true);
+    try {
+      const payloadRules = [...pipelineSettings.rules]
+        .sort((left, right) => left.priority - right.priority)
+        .map((rule, index) => ({
+          ...rule,
+          priority: (index + 1) * 10
+        }));
+
+      const response = await fetch("/api/settings/orchestration-rules", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orgId,
+          mode: pipelineSettings.mode,
+          rules: payloadRules
+        })
+      });
+      const { payload, rawText } = await parseJsonResponse<{
+        ok?: boolean;
+        message?: string;
+        settings?: OrchestrationPipelineSettings;
+        effectivePolicy?: OrchestrationPipelineEffectivePolicy;
+      }>(response);
+      if (!response.ok || !payload?.ok || !payload.settings) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Pipeline save failed (${response.status}): ${rawText.slice(0, 180)}`
+              : "Pipeline save failed.")
+        );
+      }
+      setPipelineSettings(payload.settings);
+      setPipelineEffectivePolicy(payload.effectivePolicy ?? null);
+      notify({
+        title: "Pipeline",
+        message: "Strict orchestration pipeline settings updated.",
+        type: "success"
+      });
+    } catch (requestError) {
+      notify({
+        title: "Pipeline",
+        message: requestError instanceof Error ? requestError.message : "Pipeline save failed.",
+        type: "error"
+      });
+    } finally {
+      setSavingPipeline(false);
+    }
+  }, [notify, orgId, pipelineSettings.mode, pipelineSettings.rules]);
 
   const saveCreditsWallet = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -732,6 +964,178 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
               Save Orchestration Settings
             </button>
           </form>
+
+          <section className="space-y-3 rounded-2xl border border-white/10 bg-black/30 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs font-bold uppercase tracking-[0.18em] text-slate-200">
+                Strict Orchestration Pipeline
+              </p>
+              <p className="text-[11px] text-slate-400">
+                Global flag:{" "}
+                <span className={pipelineEffectivePolicy?.strictFeatureEnabled ? "text-emerald-300" : "text-amber-300"}>
+                  {pipelineEffectivePolicy?.strictFeatureEnabled ? "enabled" : "disabled"}
+                </span>
+              </p>
+            </div>
+
+            <div className="grid gap-2 md:grid-cols-[220px_1fr]">
+              <label className="text-xs text-slate-300">
+                Pipeline Mode
+                <select
+                  value={pipelineSettings.mode}
+                  onChange={(event) =>
+                    setPipelineSettings((prev) => ({
+                      ...prev,
+                      mode: event.target.value as OrchestrationPipelineMode
+                    }))
+                  }
+                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                >
+                  <option value="OFF">OFF</option>
+                  <option value="AUDIT">AUDIT</option>
+                  <option value="ENFORCE">ENFORCE</option>
+                </select>
+              </label>
+
+              <div className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-300">
+                {pipelineSettings.mode === "OFF"
+                  ? "Pipeline rules are stored but not applied."
+                  : pipelineSettings.mode === "AUDIT"
+                    ? "Pipeline rules are evaluated in audit mode for visibility."
+                    : "Pipeline rules are enforced at runtime for all new launches."}
+              </div>
+            </div>
+
+            {pipelineEffectivePolicy ? (
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                <p className="rounded-xl border border-cyan-500/25 bg-cyan-500/10 px-3 py-2 text-[11px] text-cyan-100">
+                  Detailed plan: {pipelineEffectivePolicy.requireDetailedPlan ? "required" : "optional"}
+                </p>
+                <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-100">
+                  Multi-workflow:{" "}
+                  {pipelineEffectivePolicy.requireMultiWorkflowDecomposition ? "required" : "optional"}
+                </p>
+                <p className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                  Specialist routing:{" "}
+                  {pipelineEffectivePolicy.enforceSpecialistToolAssignment ? "enforced" : "best effort"}
+                </p>
+              </div>
+            ) : null}
+
+            <div className="space-y-2">
+              {pipelineSettings.rules
+                .slice()
+                .sort((left, right) => left.priority - right.priority)
+                .map((rule, index) => (
+                  <div
+                    key={rule.id}
+                    className="grid gap-2 rounded-xl border border-white/10 bg-black/35 px-3 py-2 md:grid-cols-[minmax(0,1fr)_110px_96px_auto_auto]"
+                  >
+                    <div>
+                      <input
+                        value={rule.name}
+                        onChange={(event) =>
+                          updatePipelineRule(rule.id, { name: event.target.value })
+                        }
+                        className="w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-xs text-slate-100 outline-none"
+                      />
+                      <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                        {ruleTypeLabel(rule.type)}
+                      </p>
+                    </div>
+
+                    <label className="text-[11px] text-slate-300">
+                      Priority
+                      <input
+                        type="number"
+                        min={1}
+                        max={999}
+                        step={1}
+                        value={rule.priority}
+                        onChange={(event) =>
+                          updatePipelineRule(rule.id, {
+                            priority: Number(event.target.value) || (index + 1) * 10
+                          })
+                        }
+                        className="mt-1 w-full rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-xs text-slate-100 outline-none"
+                      />
+                    </label>
+
+                    <label className="inline-flex items-center gap-2 text-[11px] text-slate-300 md:pt-6">
+                      <input
+                        type="checkbox"
+                        checked={rule.enabled}
+                        onChange={(event) =>
+                          updatePipelineRule(rule.id, { enabled: event.target.checked })
+                        }
+                      />
+                      Enabled
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updatePipelineRule(rule.id, { priority: Math.max(1, rule.priority - 10) })
+                      }
+                      className="rounded-lg border border-white/20 bg-white/5 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-slate-300"
+                    >
+                      Up
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removePipelineRule(rule.id)}
+                      className="rounded-lg border border-red-500/40 bg-red-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                ))}
+            </div>
+
+            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+              <select
+                value={newPipelineRuleType}
+                onChange={(event) =>
+                  setNewPipelineRuleType(event.target.value as OrchestrationPipelineRuleType)
+                }
+                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-100 outline-none"
+              >
+                <option value="REQUIRE_PLAN_BEFORE_EXECUTION">Require plan before execution</option>
+                <option value="REQUIRE_PLAN_WORKFLOWS">Require plan workflows</option>
+                <option value="BLOCK_DIRECT_WORKFLOW_LAUNCH">Block direct workflow launch</option>
+                <option value="FREEZE_EXECUTION_TO_APPROVED_PLAN">Freeze to plan snapshot</option>
+                <option value="REQUIRE_DETAILED_PLAN">Require detailed plan blueprint</option>
+                <option value="REQUIRE_MULTI_WORKFLOW_DECOMPOSITION">
+                  Require multi-workflow decomposition
+                </option>
+                <option value="ENFORCE_SPECIALIST_TOOL_ASSIGNMENT">
+                  Enforce specialist tool assignment
+                </option>
+              </select>
+              <button
+                type="button"
+                onClick={addPipelineRule}
+                className="rounded-xl border border-white/20 bg-white/5 px-3 py-2 text-xs uppercase tracking-[0.14em] text-slate-200"
+              >
+                Add Rule
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+              <p>
+                Updated: {pipelineSettings.updatedAt ? new Date(pipelineSettings.updatedAt).toLocaleString() : "Never"}
+              </p>
+              <button
+                type="button"
+                onClick={() => void savePipelineSettings()}
+                disabled={savingPipeline}
+                className="inline-flex items-center gap-2 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-200 transition hover:bg-cyan-500/20 disabled:opacity-60"
+              >
+                {savingPipeline ? <Loader2 size={14} className="animate-spin" /> : null}
+                Save Pipeline Rules
+              </button>
+            </div>
+          </section>
 
           {llmSettings.mode === "PLATFORM_MANAGED" ? (
             <form

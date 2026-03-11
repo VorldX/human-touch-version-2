@@ -1,7 +1,17 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Loader2, RefreshCw, Save } from "lucide-react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  CheckCircle2,
+  Flag,
+  Layers3,
+  Loader2,
+  RefreshCw,
+  Save,
+  ShieldAlert,
+  Sparkles,
+  Workflow as WorkflowIcon
+} from "lucide-react";
 
 import { useVorldXStore } from "@/lib/store/vorldx-store";
 
@@ -91,14 +101,60 @@ interface PlanTaskView {
 interface PlanWorkflowView {
   title: string;
   goal: string;
+  ownerRole: string;
+  ownerType: string;
+  dependencies: string[];
+  deliverables: string[];
+  tools: string[];
+  entryCriteria: string[];
+  exitCriteria: string[];
+  successMetrics: string[];
+  estimatedHours: number;
   tasks: PlanTaskView[];
 }
 
+interface PlanMilestoneView {
+  title: string;
+  ownerRole: string;
+  dueWindow: string;
+  deliverable: string;
+  successSignal: string;
+}
+
+interface PlanResourceAllocationView {
+  workforceType: string;
+  role: string;
+  responsibility: string;
+  capacityPct: number;
+  tools: string[];
+}
+
+interface PlanApprovalCheckpointView {
+  name: string;
+  trigger: string;
+  requiredRole: string;
+  reason: string;
+}
+
+interface PlanDependencyView {
+  fromWorkflow: string;
+  toWorkflow: string;
+  reason: string;
+}
+
 interface ExecutionPlanView {
+  objective: string;
+  organizationFitSummary: string;
   summary: string;
+  deliverables: string[];
+  milestones: PlanMilestoneView[];
+  resourcePlan: PlanResourceAllocationView[];
+  approvalCheckpoints: PlanApprovalCheckpointView[];
+  dependencies: PlanDependencyView[];
   workflows: PlanWorkflowView[];
   risks: string[];
   successMetrics: string[];
+  detailScore: number;
 }
 
 interface PlanStepView extends PlanTaskView {
@@ -150,23 +206,113 @@ function normalizeTask(value: unknown): PlanTaskView {
   };
 }
 
+function asBoundedNumber(value: unknown, fallback: number, min: number, max: number) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function normalizeMilestone(value: unknown): PlanMilestoneView | null {
+  const record = asRecord(value);
+  const title = asTrimmedText(record.title);
+  if (!title) return null;
+  return {
+    title,
+    ownerRole: asTrimmedText(record.ownerRole) || "EMPLOYEE",
+    dueWindow: asTrimmedText(record.dueWindow) || "TBD",
+    deliverable: asTrimmedText(record.deliverable) || title,
+    successSignal: asTrimmedText(record.successSignal) || "Deliverable accepted"
+  };
+}
+
+function normalizeResourcePlanItem(value: unknown): PlanResourceAllocationView | null {
+  const record = asRecord(value);
+  const role = asTrimmedText(record.role);
+  if (!role) return null;
+  return {
+    workforceType: asTrimmedText(record.workforceType) || "HYBRID",
+    role,
+    responsibility: asTrimmedText(record.responsibility) || "Execution support",
+    capacityPct: asBoundedNumber(record.capacityPct, 20, 1, 100),
+    tools: asStringList(record.tools, 12)
+  };
+}
+
+function normalizeApprovalCheckpoint(value: unknown): PlanApprovalCheckpointView | null {
+  const record = asRecord(value);
+  const name = asTrimmedText(record.name);
+  if (!name) return null;
+  return {
+    name,
+    trigger: asTrimmedText(record.trigger) || "Before stage transition",
+    requiredRole: asTrimmedText(record.requiredRole) || "ADMIN",
+    reason: asTrimmedText(record.reason) || "Approval required"
+  };
+}
+
+function normalizeDependency(value: unknown): PlanDependencyView | null {
+  const record = asRecord(value);
+  const fromWorkflow = asTrimmedText(record.fromWorkflow);
+  const toWorkflow = asTrimmedText(record.toWorkflow);
+  if (!fromWorkflow || !toWorkflow) return null;
+  return {
+    fromWorkflow,
+    toWorkflow,
+    reason: asTrimmedText(record.reason) || "Dependency mapping"
+  };
+}
+
 function normalizeExecutionPlan(value: Record<string, unknown> | null): ExecutionPlanView {
   const record = asRecord(value);
   const workflowRows = Array.isArray(record.workflows) ? record.workflows : [];
+  const milestoneRows = Array.isArray(record.milestones) ? record.milestones : [];
+  const resourceRows = Array.isArray(record.resourcePlan) ? record.resourcePlan : [];
+  const approvalRows = Array.isArray(record.approvalCheckpoints) ? record.approvalCheckpoints : [];
+  const dependencyRows = Array.isArray(record.dependencies) ? record.dependencies : [];
 
   return {
+    objective: asTrimmedText(record.objective),
+    organizationFitSummary: asTrimmedText(record.organizationFitSummary),
     summary: asTrimmedText(record.summary),
+    deliverables: asStringList(record.deliverables, 16),
+    milestones: milestoneRows
+      .map((item) => normalizeMilestone(item))
+      .filter((item): item is PlanMilestoneView => Boolean(item))
+      .slice(0, 20),
+    resourcePlan: resourceRows
+      .map((item) => normalizeResourcePlanItem(item))
+      .filter((item): item is PlanResourceAllocationView => Boolean(item))
+      .slice(0, 20),
+    approvalCheckpoints: approvalRows
+      .map((item) => normalizeApprovalCheckpoint(item))
+      .filter((item): item is PlanApprovalCheckpointView => Boolean(item))
+      .slice(0, 20),
+    dependencies: dependencyRows
+      .map((item) => normalizeDependency(item))
+      .filter((item): item is PlanDependencyView => Boolean(item))
+      .slice(0, 20),
     workflows: workflowRows.slice(0, 12).map((workflow, index) => {
       const workflowRecord = asRecord(workflow);
       const tasks = Array.isArray(workflowRecord.tasks) ? workflowRecord.tasks : [];
       return {
         title: asTrimmedText(workflowRecord.title) || `Workflow ${index + 1}`,
         goal: asTrimmedText(workflowRecord.goal),
+        ownerRole: asTrimmedText(workflowRecord.ownerRole) || "EMPLOYEE",
+        ownerType: asTrimmedText(workflowRecord.ownerType) || "HYBRID",
+        dependencies: asStringList(workflowRecord.dependencies, 16),
+        deliverables: asStringList(workflowRecord.deliverables, 16),
+        tools: asStringList(workflowRecord.tools, 16),
+        entryCriteria: asStringList(workflowRecord.entryCriteria, 16),
+        exitCriteria: asStringList(workflowRecord.exitCriteria, 16),
+        successMetrics: asStringList(workflowRecord.successMetrics, 16),
+        estimatedHours: asBoundedNumber(workflowRecord.estimatedHours, 8, 1, 240),
         tasks: tasks.slice(0, 24).map((task) => normalizeTask(task))
       };
     }),
     risks: asStringList(record.risks, 12),
-    successMetrics: asStringList(record.successMetrics, 12)
+    successMetrics: asStringList(record.successMetrics, 12),
+    detailScore: asBoundedNumber(record.detailScore, 0, 0, 100)
   };
 }
 
@@ -193,6 +339,7 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
 
 export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
+  const detailsFormRef = useRef<HTMLFormElement | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -209,6 +356,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const [fallbackPlanDraft, setFallbackPlanDraft] = useState("{}");
   const [statusDraft, setStatusDraft] = useState<PlanStatus>("ACTIVE");
   const [planViewTab, setPlanViewTab] = useState<PlanViewTab>("primary");
+  const [selectedWorkflowIndex, setSelectedWorkflowIndex] = useState(0);
 
   const selectedPlan = useMemo(
     () => plans.find((item) => item.id === selectedPlanId) ?? null,
@@ -234,6 +382,19 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const fallbackSteps = useMemo(() => flattenPlanSteps(fallbackPlanView), [fallbackPlanView]);
   const activePlanView = planViewTab === "primary" ? primaryPlanView : fallbackPlanView;
   const activeSteps = planViewTab === "primary" ? primarySteps : fallbackSteps;
+  const activeWorkflow =
+    activePlanView.workflows[Math.max(0, Math.min(selectedWorkflowIndex, activePlanView.workflows.length - 1))] ??
+    null;
+  const focusedSteps = useMemo(
+    () =>
+      activeWorkflow
+        ? activeWorkflow.tasks.map((task) => ({
+            ...task,
+            workflowTitle: activeWorkflow.title
+          }))
+        : activeSteps,
+    [activeSteps, activeWorkflow]
+  );
 
   const loadPlans = useCallback(
     async (silent?: boolean) => {
@@ -290,7 +451,12 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
     setFallbackPlanDraft(toPrettyJson(selectedPlan.fallbackPlan));
     setStatusDraft(selectedPlan.status);
     setPlanViewTab("primary");
+    setSelectedWorkflowIndex(0);
   }, [selectedPlan]);
+
+  useEffect(() => {
+    setSelectedWorkflowIndex(0);
+  }, [planViewTab, selectedPlanId]);
 
   const savePlan = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -362,21 +528,112 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
     ]
   );
 
+  const primaryApprovalCount = useMemo(
+    () => primarySteps.filter((step) => step.requiresApproval).length,
+    [primarySteps]
+  );
+  const fallbackApprovalCount = useMemo(
+    () => fallbackSteps.filter((step) => step.requiresApproval).length,
+    [fallbackSteps]
+  );
+  const activeApprovalCount = planViewTab === "primary" ? primaryApprovalCount : fallbackApprovalCount;
+  const activeToolCount = useMemo(() => {
+    const tools = new Set<string>();
+    activeSteps.forEach((step) => {
+      step.tools.forEach((tool) => {
+        if (tool.trim()) tools.add(tool.trim().toLowerCase());
+      });
+    });
+    activePlanView.workflows.forEach((workflow) => {
+      workflow.tools.forEach((tool) => {
+        if (tool.trim()) tools.add(tool.trim().toLowerCase());
+      });
+    });
+    return tools.size;
+  }, [activePlanView.workflows, activeSteps]);
+  const activeWorkflowCount = activePlanView.workflows.length;
+  const activeRiskCount = activePlanView.risks.length;
+  const activeMetricCount = activePlanView.successMetrics.length;
+  const activeDeliverableCount = activePlanView.deliverables.length;
+  const activeMilestoneCount = activePlanView.milestones.length;
+  const activeResourceCount = activePlanView.resourcePlan.length;
+  const activeCheckpointCount = activePlanView.approvalCheckpoints.length;
+  const selectedUpdatedAt = selectedPlan ? new Date(selectedPlan.updatedAt).toLocaleString() : "No plan selected";
+  const planInsightsById = useMemo(() => {
+    return plans.reduce<
+      Record<
+        string,
+        {
+          primaryWorkflowCount: number;
+          primaryStepCount: number;
+          primaryApprovalCount: number;
+          primaryDetailScore: number;
+          fallbackWorkflowCount: number;
+          fallbackStepCount: number;
+          fallbackDetailScore: number;
+        }
+      >
+    >((accumulator, item) => {
+      const primary = normalizeExecutionPlan(item.primaryPlan as Record<string, unknown>);
+      const fallback = normalizeExecutionPlan(item.fallbackPlan as Record<string, unknown>);
+      const primaryPlanSteps = flattenPlanSteps(primary);
+      const fallbackPlanSteps = flattenPlanSteps(fallback);
+      accumulator[item.id] = {
+        primaryWorkflowCount: primary.workflows.length,
+        primaryStepCount: primaryPlanSteps.length,
+        primaryApprovalCount: primaryPlanSteps.filter((step) => step.requiresApproval).length,
+        primaryDetailScore: primary.detailScore,
+        fallbackWorkflowCount: fallback.workflows.length,
+        fallbackStepCount: fallbackPlanSteps.length,
+        fallbackDetailScore: fallback.detailScore
+      };
+      return accumulator;
+    }, {});
+  }, [plans]);
+
+  const handlePlanSelect = useCallback((planId: string) => {
+    setSelectedPlanId(planId);
+    if (typeof window !== "undefined" && window.innerWidth < 1536) {
+      requestAnimationFrame(() => {
+        detailsFormRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start"
+        });
+      });
+    }
+  }, []);
+
   return (
-    <div className="mx-auto max-w-[1400px] space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
-        <div>
-          <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Plan</h2>
-          <p className="text-xs text-slate-500">Human + AI editable plans</p>
+    <div className="mx-auto max-w-[1500px] space-y-5">
+      <section className={`vx-panel relative overflow-hidden rounded-3xl p-5 ${themeStyle.border}`}>
+        <div className="pointer-events-none absolute -top-24 right-0 h-52 w-52 rounded-full bg-cyan-500/15 blur-3xl" />
+        <div className="pointer-events-none absolute -bottom-24 left-24 h-48 w-48 rounded-full bg-emerald-500/10 blur-3xl" />
+        <div className="relative flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="inline-flex items-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-cyan-100">
+              <Sparkles size={12} />
+              Plan Studio
+            </p>
+            <h2 className="mt-3 font-display text-3xl font-black tracking-tight text-white md:text-4xl">
+              Orchestration Plans
+            </h2>
+            <p className="mt-1 text-xs text-slate-400">
+              Human + AI editable plan graph with execution visibility and approval checkpoints.
+            </p>
+          </div>
+          <div className="rounded-2xl border border-white/10 bg-black/25 px-4 py-3 text-right">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Latest update</p>
+            <p className="mt-1 text-xs font-semibold text-slate-200">{selectedUpdatedAt}</p>
+            <button
+              onClick={() => void loadPlans(true)}
+              className="mt-3 inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:border-cyan-300/40 hover:bg-cyan-500/10"
+            >
+              {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+              Refresh
+            </button>
+          </div>
         </div>
-        <button
-          onClick={() => void loadPlans(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200"
-        >
-          {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          Refresh
-        </button>
-      </div>
+      </section>
 
       {error && (
         <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
@@ -384,11 +641,20 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
         </div>
       )}
 
-      <div className="grid gap-4 2xl:grid-cols-[360px_1fr]">
-        <div className={`vx-panel space-y-2 rounded-3xl p-4 ${themeStyle.border}`}>
-          <p className="text-sm font-semibold text-slate-300">Plan history</p>
+      <div className="grid gap-4 2xl:grid-cols-[340px_minmax(0,1fr)]">
+        <aside className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+          <div className="flex items-center justify-between">
+            <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-200">
+              <WorkflowIcon size={15} className="text-cyan-300" />
+              Plan history
+            </p>
+            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-slate-400">
+              {plans.length}
+            </span>
+          </div>
+
           {loading ? (
-            <div className="inline-flex items-center gap-2 text-xs text-slate-400">
+            <div className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-400">
               <Loader2 size={12} className="animate-spin" />
               Loading plans...
             </div>
@@ -398,96 +664,214 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
             </p>
           ) : (
             <div className="space-y-2">
-              {plans.map((item) => (
-                <button
-                  key={item.id}
-                  onClick={() => setSelectedPlanId(item.id)}
-                  className={`w-full rounded-2xl border p-3 text-left ${
-                    selectedPlanId === item.id
-                      ? "border-emerald-500/40 bg-emerald-500/10"
-                      : "border-white/10 bg-black/25"
-                  }`}
-                >
-                  <p className="line-clamp-1 text-sm font-semibold text-white">{item.title}</p>
-                  <p className="line-clamp-2 text-xs text-slate-400">
-                    {item.summary || item.direction}
-                  </p>
-                  <p className="text-xs text-slate-500">
-                    {item.status} | {item.source} | {new Date(item.updatedAt).toLocaleString()}
-                  </p>
-                </button>
-              ))}
+              {plans.map((item) => {
+                const isSelected = selectedPlanId === item.id;
+                const insight = planInsightsById[item.id];
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => handlePlanSelect(item.id)}
+                    aria-pressed={isSelected}
+                    className={`w-full rounded-2xl border px-3 py-3 text-left transition ${
+                      isSelected
+                        ? "border-cyan-400/45 bg-gradient-to-br from-cyan-500/18 to-emerald-500/10 shadow-[0_0_0_1px_rgba(56,189,248,0.08)]"
+                        : "border-white/10 bg-black/20 hover:border-white/25 hover:bg-black/35"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="line-clamp-1 text-sm font-semibold text-white">{item.title}</p>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          item.status === "ACTIVE"
+                            ? "border border-emerald-500/35 bg-emerald-500/15 text-emerald-200"
+                            : item.status === "DRAFT"
+                              ? "border border-amber-500/35 bg-amber-500/12 text-amber-200"
+                              : "border border-slate-400/35 bg-slate-500/10 text-slate-300"
+                        }`}
+                      >
+                        {item.status}
+                      </span>
+                    </div>
+                    <p className="mt-1 line-clamp-2 text-xs text-slate-400">{item.summary || item.direction}</p>
+                    <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                      <span>{item.source}</span>
+                      <span className="line-clamp-1">{new Date(item.updatedAt).toLocaleString()}</span>
+                    </div>
+                    {isSelected && insight ? (
+                      <div className="mt-2 space-y-2 rounded-xl border border-white/10 bg-black/30 p-2">
+                        <p className="line-clamp-2 text-[11px] text-slate-300">
+                          {item.direction || "No direction text for this plan yet."}
+                        </p>
+                        <div className="grid grid-cols-2 gap-1 text-[10px]">
+                          <span className="rounded-lg border border-cyan-500/35 bg-cyan-500/12 px-1.5 py-1 text-cyan-100">
+                            Primary: {insight.primaryWorkflowCount} wf / {insight.primaryStepCount} steps
+                          </span>
+                          <span className="rounded-lg border border-amber-500/35 bg-amber-500/12 px-1.5 py-1 text-amber-100">
+                            Fallback: {insight.fallbackWorkflowCount} wf / {insight.fallbackStepCount} steps
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          Approvals required: <span className="font-semibold text-amber-100">{insight.primaryApprovalCount}</span>
+                        </p>
+                        <p className="text-[10px] text-slate-400">
+                          Detail score:{" "}
+                          <span className="font-semibold text-cyan-100">{insight.primaryDetailScore}</span>
+                          {" / "}
+                          <span className="font-semibold text-amber-100">{insight.fallbackDetailScore}</span>
+                        </p>
+                      </div>
+                    ) : null}
+                  </button>
+                );
+              })}
             </div>
           )}
-        </div>
+        </aside>
 
-        <form onSubmit={savePlan} className={`vx-panel space-y-4 rounded-3xl p-4 ${themeStyle.border}`}>
+        <form
+          ref={detailsFormRef}
+          onSubmit={savePlan}
+          className={`vx-panel space-y-4 rounded-3xl p-4 ${themeStyle.border}`}
+        >
           {!selectedPlan ? (
-            <p className="text-sm text-slate-400">Select a plan from history.</p>
+            <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-3 text-sm text-slate-400">
+              Select a plan from history.
+            </p>
           ) : (
             <>
-              <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_220px_auto] xl:items-end">
-                <label className="space-y-1">
-                  <span className="text-xs text-slate-500">Plan title</span>
-                  <input
-                    value={titleDraft}
-                    onChange={(event) => setTitleDraft(event.target.value)}
-                    placeholder="Plan title"
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="text-xs text-slate-500">Status</span>
-                  <select
-                    value={statusDraft}
-                    onChange={(event) => setStatusDraft(event.target.value as PlanStatus)}
-                    className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+              <section className="space-y-3 rounded-2xl border border-white/10 bg-black/20 p-4">
+                <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_220px_auto] xl:items-end">
+                  <label className="space-y-1">
+                    <span className="text-xs text-slate-500">Plan title</span>
+                    <input
+                      value={titleDraft}
+                      onChange={(event) => setTitleDraft(event.target.value)}
+                      placeholder="Plan title"
+                      className="w-full rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs text-slate-500">Status</span>
+                    <select
+                      value={statusDraft}
+                      onChange={(event) => setStatusDraft(event.target.value as PlanStatus)}
+                      className="w-full rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                    >
+                      <option value="ACTIVE">ACTIVE</option>
+                      <option value="DRAFT">DRAFT</option>
+                      <option value="ARCHIVED">ARCHIVED</option>
+                    </select>
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="inline-flex h-[42px] items-center justify-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-black transition hover:bg-emerald-500 hover:text-white disabled:opacity-60"
                   >
-                    <option value="ACTIVE">ACTIVE</option>
-                    <option value="DRAFT">DRAFT</option>
-                    <option value="ARCHIVED">ARCHIVED</option>
-                  </select>
-                </label>
-                <button
-                  type="submit"
-                  disabled={saving}
-                  className="inline-flex h-[42px] items-center justify-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-black transition hover:bg-emerald-500 hover:text-white disabled:opacity-60"
-                >
-                  {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
-                  Save Plan
-                </button>
-              </div>
+                    {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+                    Save Plan
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2 text-[11px]">
+                  <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-slate-300">
+                    Source: {selectedPlan.source}
+                  </span>
+                  <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-slate-300">
+                    Updated: {new Date(selectedPlan.updatedAt).toLocaleString()}
+                  </span>
+                  {selectedPlan.ownerEmail ? (
+                    <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-slate-300">
+                      Owner: {selectedPlan.ownerEmail}
+                    </span>
+                  ) : null}
+                  {selectedPlan.directionId ? (
+                    <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-slate-300">
+                      Direction ID: {selectedPlan.directionId}
+                    </span>
+                  ) : null}
+                </div>
+              </section>
 
               <div className="grid gap-3 xl:grid-cols-2">
-                <label className="space-y-1">
-                  <span className="text-xs text-slate-500">Summary</span>
+                <label className="space-y-1 rounded-2xl border border-white/10 bg-black/20 p-3">
+                  <span className="inline-flex items-center gap-2 text-xs text-slate-400">
+                    <Sparkles size={12} className="text-cyan-300" />
+                    Summary
+                  </span>
                   <textarea
                     value={summaryDraft}
                     onChange={(event) => setSummaryDraft(event.target.value)}
                     placeholder="Plan summary"
-                    className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                   />
                 </label>
-                <label className="space-y-1">
-                  <span className="text-xs text-slate-500">Direction</span>
+                <label className="space-y-1 rounded-2xl border border-white/10 bg-black/20 p-3">
+                  <span className="inline-flex items-center gap-2 text-xs text-slate-400">
+                    <Flag size={12} className="text-amber-300" />
+                    Direction
+                  </span>
                   <textarea
                     value={directionDraft}
                     onChange={(event) => setDirectionDraft(event.target.value)}
                     placeholder="Direction"
-                    className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    className="h-24 w-full resize-none rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                   />
                 </label>
               </div>
 
-              <label className="space-y-1">
-                <span className="text-xs text-slate-500">Human plan notes</span>
+              <label className="space-y-1 rounded-2xl border border-white/10 bg-black/20 p-3">
+                <span className="text-xs text-slate-400">Human plan notes</span>
                 <textarea
                   value={humanPlanDraft}
                   onChange={(event) => setHumanPlanDraft(event.target.value)}
                   placeholder="Human editable plan"
-                  className="h-28 w-full resize-none rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                  className="h-28 w-full resize-none rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                 />
               </label>
+
+              <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+                <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-cyan-200">
+                    <Layers3 size={12} />
+                    Workflows
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-cyan-100">{activeWorkflowCount}</p>
+                </div>
+                <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-emerald-200">
+                    <WorkflowIcon size={12} />
+                    Steps
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-emerald-100">{activeSteps.length}</p>
+                </div>
+                <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-amber-200">
+                    <ShieldAlert size={12} />
+                    Approvals
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-amber-100">{activeApprovalCount}</p>
+                </div>
+                <div className="rounded-2xl border border-violet-500/25 bg-violet-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-violet-200">
+                    <CheckCircle2 size={12} />
+                    Success metrics
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-violet-100">{activeMetricCount}</p>
+                </div>
+                <div className="rounded-2xl border border-sky-500/25 bg-sky-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-sky-200">
+                    <Flag size={12} />
+                    Milestones
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-sky-100">{activeMilestoneCount}</p>
+                </div>
+                <div className="rounded-2xl border border-rose-500/25 bg-rose-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-rose-200">
+                    <Sparkles size={12} />
+                    Detail score
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-rose-100">{activePlanView.detailScore}</p>
+                </div>
+              </section>
 
               <div className="space-y-3 rounded-2xl border border-white/10 bg-black/20 p-3">
                 <div className="inline-flex max-w-full flex-wrap rounded-full border border-white/15 bg-black/45 p-1">
@@ -500,7 +884,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                         : "text-slate-300 hover:bg-white/10"
                     }`}
                   >
-                    Primary
+                    Primary ({primarySteps.length})
                   </button>
                   <button
                     type="button"
@@ -511,25 +895,30 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                         : "text-slate-300 hover:bg-white/10"
                     }`}
                   >
-                    Fallback
+                    Fallback ({fallbackSteps.length})
                   </button>
                 </div>
 
                 <section
-                  className={`space-y-3 rounded-2xl p-3 ${
+                  className={`space-y-3 rounded-2xl border p-3 ${
                     planViewTab === "primary"
-                      ? "border border-cyan-500/25 bg-cyan-500/8"
-                      : "border border-amber-500/25 bg-amber-500/8"
+                      ? "border-cyan-500/25 bg-cyan-500/8"
+                      : "border-amber-500/25 bg-amber-500/8"
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <p
-                      className={`text-xs font-semibold ${
-                        planViewTab === "primary" ? "text-cyan-200" : "text-amber-200"
-                      }`}
-                    >
-                      {planViewTab === "primary" ? "Primary execution plan" : "Fallback execution plan"}
-                    </p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p
+                        className={`text-xs font-semibold ${
+                          planViewTab === "primary" ? "text-cyan-200" : "text-amber-200"
+                        }`}
+                      >
+                        {planViewTab === "primary" ? "Primary execution plan" : "Fallback execution plan"}
+                      </p>
+                      <p className="text-[11px] text-slate-400">
+                        {activeWorkflowCount} workflows, {activeSteps.length} total steps, {activeToolCount} tool tags
+                      </p>
+                    </div>
                     <span
                       className={`rounded-full px-2 py-0.5 text-xs ${
                         planViewTab === "primary"
@@ -537,9 +926,25 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                           : "border border-amber-500/35 bg-amber-500/12 text-amber-100"
                       }`}
                     >
-                      {activeSteps.length} steps
+                      {focusedSteps.length} shown
                     </span>
                   </div>
+
+                  {activePlanView.objective ? (
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Objective</p>
+                      <p className="mt-1 text-sm text-slate-100">{activePlanView.objective}</p>
+                    </div>
+                  ) : null}
+
+                  {activePlanView.organizationFitSummary ? (
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Organization Fit
+                      </p>
+                      <p className="mt-1 text-sm text-slate-100">{activePlanView.organizationFitSummary}</p>
+                    </div>
+                  ) : null}
 
                   {activePlanView.summary ? (
                     <p className={planViewTab === "primary" ? "text-sm text-cyan-100" : "text-sm text-amber-100"}>
@@ -547,30 +952,199 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                     </p>
                   ) : null}
 
-                  {activeSteps.length === 0 ? (
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Deliverables ({activeDeliverableCount})
+                      </p>
+                      {activePlanView.deliverables.length > 0 ? (
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-slate-200">
+                          {activePlanView.deliverables.map((item, index) => (
+                            <li key={`${planViewTab}-deliverable-${index}`}>{item}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-2 text-xs text-slate-500">No deliverables mapped.</p>
+                      )}
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Milestones ({activeMilestoneCount})
+                      </p>
+                      {activePlanView.milestones.length > 0 ? (
+                        <ul className="mt-2 space-y-2 text-xs text-slate-200">
+                          {activePlanView.milestones.map((item, index) => (
+                            <li key={`${planViewTab}-milestone-${index}`} className="rounded-lg border border-white/10 bg-black/20 p-2">
+                              <p className="font-semibold text-slate-100">{item.title}</p>
+                              <p className="mt-0.5 text-[11px] text-slate-400">
+                                {item.ownerRole} | {item.dueWindow}
+                              </p>
+                              <p className="mt-1 text-[11px] text-slate-300">
+                                {item.deliverable} | {item.successSignal}
+                              </p>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-2 text-xs text-slate-500">No milestones mapped.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Resource Plan ({activeResourceCount})
+                      </p>
+                      {activePlanView.resourcePlan.length > 0 ? (
+                        <ul className="mt-2 space-y-2 text-xs text-slate-200">
+                          {activePlanView.resourcePlan.map((item, index) => (
+                            <li key={`${planViewTab}-resource-${index}`} className="rounded-lg border border-white/10 bg-black/20 p-2">
+                              <p className="font-semibold text-slate-100">
+                                {item.role} | {item.workforceType}
+                              </p>
+                              <p className="mt-0.5 text-[11px] text-slate-300">
+                                {item.responsibility} | Capacity {item.capacityPct}%
+                              </p>
+                              {item.tools.length > 0 ? (
+                                <p className="mt-1 text-[11px] text-slate-400">
+                                  Tools: {item.tools.join(", ")}
+                                </p>
+                              ) : null}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-2 text-xs text-slate-500">No resource allocations mapped.</p>
+                      )}
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Approval Checkpoints ({activeCheckpointCount})
+                      </p>
+                      {activePlanView.approvalCheckpoints.length > 0 ? (
+                        <ul className="mt-2 space-y-2 text-xs text-slate-200">
+                          {activePlanView.approvalCheckpoints.map((item, index) => (
+                            <li key={`${planViewTab}-checkpoint-${index}`} className="rounded-lg border border-white/10 bg-black/20 p-2">
+                              <p className="font-semibold text-slate-100">{item.name}</p>
+                              <p className="mt-0.5 text-[11px] text-slate-400">
+                                {item.requiredRole} | {item.trigger}
+                              </p>
+                              <p className="mt-1 text-[11px] text-slate-300">{item.reason}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-2 text-xs text-slate-500">No approval checkpoints mapped.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {activePlanView.dependencies.length > 0 ? (
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Workflow Dependencies
+                      </p>
+                      <ul className="mt-2 space-y-1 text-xs text-slate-200">
+                        {activePlanView.dependencies.map((item, index) => (
+                          <li key={`${planViewTab}-dependency-${index}`}>
+                            {item.fromWorkflow}
+                            {" -> "}
+                            {item.toWorkflow}
+                            {item.reason ? ` (${item.reason})` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+
+                  {activePlanView.workflows.length > 0 ? (
+                    <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                        Workflow Details
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {activePlanView.workflows.map((workflow, index) => {
+                          const selected = activeWorkflow?.title === workflow.title;
+                          return (
+                            <button
+                              key={`${planViewTab}-workflow-chip-${index}`}
+                              type="button"
+                              onClick={() => setSelectedWorkflowIndex(index)}
+                              className={`rounded-full border px-3 py-1.5 text-[11px] transition ${
+                                selected
+                                  ? "border-cyan-400/50 bg-cyan-500/15 text-cyan-100"
+                                  : "border-white/15 bg-black/20 text-slate-300 hover:border-white/30"
+                              }`}
+                            >
+                              {workflow.title}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {activeWorkflow ? (
+                        <div className="mt-3 rounded-xl border border-white/10 bg-black/20 p-3 text-xs text-slate-200">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-sm font-semibold text-white">{activeWorkflow.title}</p>
+                            <p className="text-[11px] text-slate-400">
+                              {activeWorkflow.ownerRole} | {activeWorkflow.ownerType} | {activeWorkflow.estimatedHours}h
+                            </p>
+                          </div>
+                          {activeWorkflow.goal ? <p className="mt-2 text-slate-300">{activeWorkflow.goal}</p> : null}
+                          <div className="mt-2 grid gap-2 md:grid-cols-2">
+                            <p className="rounded-lg border border-white/10 bg-black/20 px-2 py-1">
+                              Entry: {activeWorkflow.entryCriteria.join(" | ") || "N/A"}
+                            </p>
+                            <p className="rounded-lg border border-white/10 bg-black/20 px-2 py-1">
+                              Exit: {activeWorkflow.exitCriteria.join(" | ") || "N/A"}
+                            </p>
+                          </div>
+                          {activeWorkflow.deliverables.length > 0 ? (
+                            <p className="mt-2 text-[11px] text-slate-300">
+                              Deliverables: {activeWorkflow.deliverables.join(", ")}
+                            </p>
+                          ) : null}
+                          {activeWorkflow.dependencies.length > 0 ? (
+                            <p className="mt-1 text-[11px] text-slate-400">
+                              Depends on: {activeWorkflow.dependencies.join(", ")}
+                            </p>
+                          ) : null}
+                          {activeWorkflow.tools.length > 0 ? (
+                            <p className="mt-1 text-[11px] text-slate-400">
+                              Tools: {activeWorkflow.tools.join(", ")}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {focusedSteps.length === 0 ? (
                     <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-400">
                       {planViewTab === "primary"
                         ? "No ordered steps available in primary plan JSON."
                         : "No ordered fallback steps available."}
                     </p>
                   ) : (
-                    <ol className="space-y-2.5">
-                      {activeSteps.map((step, index) => (
+                    <ol className="space-y-3">
+                      {focusedSteps.map((step, index) => (
                         <li
                           key={`${planViewTab}-step-${index}`}
-                          className="rounded-xl border border-white/10 bg-black/25 p-3"
+                          className="rounded-2xl border border-white/10 bg-black/25 p-3"
                         >
-                          <p className="text-xs text-slate-500">
-                            Step {index + 1} | {step.workflowTitle}
-                          </p>
-                          <p className="mt-1 text-sm font-semibold text-white">{step.title}</p>
-                          <p
-                            className={`mt-1 text-xs ${
-                              planViewTab === "primary" ? "text-cyan-100" : "text-amber-100"
-                            }`}
-                          >
-                            Agent: <span className="font-semibold">{step.ownerRole}</span>
-                          </p>
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <p className="inline-flex items-center gap-2 text-[11px] text-slate-500">
+                              <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-white/15 bg-black/30 text-[10px] font-semibold text-slate-300">
+                                {index + 1}
+                              </span>
+                              {step.workflowTitle}
+                            </p>
+                            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
+                              Agent: {step.ownerRole}
+                            </span>
+                          </div>
+
+                          <p className="mt-2 text-sm font-semibold text-white">{step.title}</p>
 
                           {step.subtasks.length > 0 ? (
                             <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-slate-300">
@@ -580,12 +1154,16 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                             </ul>
                           ) : null}
 
-                          {planViewTab === "primary" && step.tools.length > 0 ? (
+                          {step.tools.length > 0 ? (
                             <div className="mt-2 flex flex-wrap gap-1.5">
                               {step.tools.map((tool, toolIndex) => (
                                 <span
                                   key={`${planViewTab}-step-${index}-tool-${toolIndex}`}
-                                  className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-100"
+                                  className={`rounded-full border px-2 py-0.5 text-[11px] ${
+                                    planViewTab === "primary"
+                                      ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-100"
+                                      : "border-amber-500/30 bg-amber-500/10 text-amber-100"
+                                  }`}
                                 >
                                   {tool}
                                 </span>
@@ -593,7 +1171,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                             </div>
                           ) : null}
 
-                          {planViewTab === "primary" && step.requiresApproval ? (
+                          {step.requiresApproval ? (
                             <p className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-100">
                               Approval: {step.approvalRole}
                               {step.approvalReason ? ` | ${step.approvalReason}` : ""}
@@ -604,23 +1182,23 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                     </ol>
                   )}
 
-                  {planViewTab === "primary" && primaryPlanView.risks.length > 0 ? (
+                  {activeRiskCount > 0 ? (
                     <div className="rounded-xl border border-red-500/25 bg-red-500/8 p-3">
                       <p className="text-xs text-red-200">Risks</p>
                       <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-red-100">
-                        {primaryPlanView.risks.map((risk, index) => (
-                          <li key={`primary-risk-${index}`}>{risk}</li>
+                        {activePlanView.risks.map((risk, index) => (
+                          <li key={`${planViewTab}-risk-${index}`}>{risk}</li>
                         ))}
                       </ul>
                     </div>
                   ) : null}
 
-                  {planViewTab === "primary" && primaryPlanView.successMetrics.length > 0 ? (
+                  {activeMetricCount > 0 ? (
                     <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/8 p-3">
                       <p className="text-xs text-emerald-200">Success metrics</p>
                       <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-emerald-100">
-                        {primaryPlanView.successMetrics.map((metric, index) => (
-                          <li key={`primary-metric-${index}`}>{metric}</li>
+                        {activePlanView.successMetrics.map((metric, index) => (
+                          <li key={`${planViewTab}-metric-${index}`}>{metric}</li>
                         ))}
                       </ul>
                     </div>

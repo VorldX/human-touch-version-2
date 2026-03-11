@@ -389,34 +389,40 @@ function computeBilling(
   };
 }
 
-function resolvePlatformApiKey(provider: ProviderKind) {
-  const normalizeApiKey = (value: string | undefined) => {
-    const trimmed = value?.trim() ?? "";
-    if (!trimmed || /^replace_with_/i.test(trimmed)) {
-      return null;
-    }
-    return trimmed;
-  };
+function normalizeProviderApiKey(provider: ProviderKind, value: string | null | undefined) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || /^replace_with_/i.test(trimmed)) {
+    return null;
+  }
 
+  // Common Gemini typo: keys should start with "AIza", not "AAIza".
+  if (provider === "gemini" && /^AAIza/i.test(trimmed)) {
+    return `AIza${trimmed.slice(5)}`;
+  }
+
+  return trimmed;
+}
+
+function resolvePlatformApiKey(provider: ProviderKind) {
   if (provider === "anthropic") {
     return (
-      normalizeApiKey(process.env.PLATFORM_ANTHROPIC_API_KEY) ??
-      normalizeApiKey(process.env.ANTHROPIC_API_KEY) ??
+      normalizeProviderApiKey(provider, process.env.PLATFORM_ANTHROPIC_API_KEY) ??
+      normalizeProviderApiKey(provider, process.env.ANTHROPIC_API_KEY) ??
       null
     );
   }
 
   if (provider === "gemini") {
     return (
-      normalizeApiKey(process.env.PLATFORM_GEMINI_API_KEY) ??
-      normalizeApiKey(process.env.GEMINI_API_KEY) ??
+      normalizeProviderApiKey(provider, process.env.PLATFORM_GEMINI_API_KEY) ??
+      normalizeProviderApiKey(provider, process.env.GEMINI_API_KEY) ??
       null
     );
   }
 
   return (
-    normalizeApiKey(process.env.PLATFORM_OPENAI_API_KEY) ??
-    normalizeApiKey(process.env.OPENAI_API_KEY) ??
+    normalizeProviderApiKey(provider, process.env.PLATFORM_OPENAI_API_KEY) ??
+    normalizeProviderApiKey(provider, process.env.OPENAI_API_KEY) ??
     null
   );
 }
@@ -426,15 +432,7 @@ function resolveKeyForProvider(
   agentApiKey: string | null,
   organizationRuntime?: AgentExecutionInput["organizationRuntime"]
 ): { apiKey: string | null; apiSource: ApiSource } {
-  const normalizeApiKey = (value: string | null | undefined) => {
-    const trimmed = typeof value === "string" ? value.trim() : "";
-    if (!trimmed || /^replace_with_/i.test(trimmed)) {
-      return null;
-    }
-    return trimmed;
-  };
-
-  const normalizedAgentKey = normalizeApiKey(agentApiKey);
+  const normalizedAgentKey = normalizeProviderApiKey(provider, agentApiKey);
   if (normalizedAgentKey) {
     return { apiKey: normalizedAgentKey, apiSource: "agent" };
   }
@@ -448,12 +446,12 @@ function resolveKeyForProvider(
     orgApiKeys && typeof orgApiKeys[provider] === "string"
       ? orgApiKeys[provider]?.trim()
       : "";
-  const providerScopedKey = normalizeApiKey(providerScopedKeyRaw);
+  const providerScopedKey = normalizeProviderApiKey(provider, providerScopedKeyRaw);
   if (providerScopedKey) {
     return { apiKey: providerScopedKey, apiSource: "organization" };
   }
 
-  const orgApiKey = normalizeApiKey(organizationRuntime?.organizationApiKey ?? null);
+  const orgApiKey = normalizeProviderApiKey(provider, organizationRuntime?.organizationApiKey ?? null);
   if (orgApiKey) {
     return { apiKey: orgApiKey, apiSource: "organization" };
   }

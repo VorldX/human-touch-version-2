@@ -45,6 +45,7 @@ import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
 import { OnboardingWizard } from "@/components/onboarding/onboarding-wizard";
 import { CollaborationConsole } from "@/components/collab/collab-console";
 import { DirectionConsole } from "@/components/direction/direction-console";
+import { BlueprintConsole } from "@/components/blueprint/blueprint-console";
 import { HubConsole } from "@/components/hub/hub-console";
 import { MemoryConsole } from "@/components/memory/memory-console";
 import { PlanConsole } from "@/components/plan/plan-console";
@@ -66,6 +67,13 @@ const NAV_ITEMS = [
     helper: "Chat + approvals",
     group: "operate",
     icon: LayoutDashboard
+  },
+  {
+    id: "blueprint",
+    label: "Blueprint",
+    helper: "Workforce graph",
+    group: "operate",
+    icon: LayoutGrid
   },
   {
     id: "direction",
@@ -130,6 +138,10 @@ const DIRECTION_MODELS = [
   { id: "openai:gpt-4o-mini", label: "ChatGPT (gpt-4o-mini)" },
   { id: "anthropic:claude-3-5-sonnet", label: "Claude (3.5 Sonnet)" }
 ] as const;
+
+const REQUESTS_POLL_INTERVAL_MS = 30000;
+const PIPELINE_POLICY_POLL_INTERVAL_MS = 30000;
+const MISSION_SCHEDULES_POLL_INTERVAL_MS = 45000;
 
 function initials(name: string) {
   return name
@@ -406,9 +418,13 @@ type ControlConversationDetail = "REASONING_MIN" | "DIRECTION_GIVEN";
 
 interface DirectionPlanTask {
   title: string;
+  description?: string;
   ownerRole: string;
+  dependsOn?: string[];
   subtasks: string[];
   tools: string[];
+  expectedOutput?: string;
+  estimatedMinutes?: number;
   requiresApproval: boolean;
   approvalRole: string;
   approvalReason: string;
@@ -417,14 +433,52 @@ interface DirectionPlanTask {
 interface DirectionPlanWorkflow {
   title: string;
   goal: string;
+  ownerRole?: string;
+  ownerType?: "HUMAN" | "AGENT" | "HYBRID";
+  dependencies?: string[];
+  deliverables?: string[];
+  tools?: string[];
+  entryCriteria?: string[];
+  exitCriteria?: string[];
+  successMetrics?: string[];
+  estimatedHours?: number;
   tasks: DirectionPlanTask[];
 }
 
 interface DirectionExecutionPlan {
+  objective?: string;
+  organizationFitSummary?: string;
   summary: string;
+  deliverables?: string[];
+  milestones?: Array<{
+    title: string;
+    ownerRole: string;
+    dueWindow: string;
+    deliverable: string;
+    successSignal: string;
+  }>;
+  resourcePlan?: Array<{
+    workforceType: "HUMAN" | "AGENT" | "HYBRID";
+    role: string;
+    responsibility: string;
+    capacityPct: number;
+    tools: string[];
+  }>;
+  approvalCheckpoints?: Array<{
+    name: string;
+    trigger: string;
+    requiredRole: string;
+    reason: string;
+  }>;
+  dependencies?: Array<{
+    fromWorkflow: string;
+    toWorkflow: string;
+    reason: string;
+  }>;
   workflows: DirectionPlanWorkflow[];
   risks: string[];
   successMetrics: string[];
+  detailScore?: number;
 }
 
 interface PermissionRequestItem {
@@ -468,6 +522,21 @@ interface DirectionPlanningResult {
   };
   directionRecord?: { id?: string };
   planRecord?: { id?: string };
+}
+
+type OrchestrationPipelineMode = "OFF" | "AUDIT" | "ENFORCE";
+
+interface OrchestrationPipelineEffectivePolicy {
+  strictFeatureEnabled: boolean;
+  mode: OrchestrationPipelineMode;
+  enforcePlanBeforeExecution: boolean;
+  requirePlanWorkflows: boolean;
+  blockDirectWorkflowLaunch: boolean;
+  freezeExecutionToApprovedPlan: boolean;
+  requireDetailedPlan: boolean;
+  requireMultiWorkflowDecomposition: boolean;
+  enforceSpecialistToolAssignment: boolean;
+  enabledRuleTypes: string[];
 }
 
 function toDatetimeLocalValue(iso: string) {
@@ -573,12 +642,49 @@ function shouldDirectWorkflowLaunch(value: string) {
   return hasQuickActionVerb && hasToolSignal && likelyShortTask;
 }
 
+function shouldForceDirectionPlanRoute(value: string) {
+  const prompt = value.trim().toLowerCase();
+  if (!prompt) return false;
+
+  if (isRecurringTaskPrompt(prompt)) {
+    return true;
+  }
+
+  const informationalQuestion =
+    /^(what|why|how|when|where|who|which)\b/.test(prompt) &&
+    !/\b(can you|could you|please)\b/.test(prompt);
+  if (informationalQuestion) {
+    return false;
+  }
+
+  const hasExecutionVerb =
+    /\b(create|build|generate|prepare|design|draft|develop|produce|implement|execute|launch|run|orchestrate|automate|delegate|set up|setup)\b/.test(
+      prompt
+    );
+  const hasDeliverable =
+    /\b(ppt|presentation|pitch deck|investor deck|deck|proposal|workflow|plan|roadmap|campaign|report|playbook)\b/.test(
+      prompt
+    );
+
+  return hasExecutionVerb || hasDeliverable || shouldDirectWorkflowLaunch(prompt);
+}
+
 function inferToolkitsFromDirectionPrompt(value: string) {
   const prompt = value.toLowerCase();
   const compactPrompt = prompt.replace(/[^a-z0-9]/g, "");
   const requested = new Set<string>();
   const escapeRegex = (input: string) => input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const toolkitAliases: Record<string, string[]> = {
+    googleslides: [
+      "googleslides",
+      "google slides",
+      "slides",
+      "presentation",
+      "ppt",
+      "powerpoint",
+      "pitch deck",
+      "investor deck"
+    ],
     gmail: ["gmail", "email", "mailbox", "inbox"],
     slack: ["slack", "channel", "workspace", "direct message", "dm"],
     notion: ["notion", "wiki", "knowledge base", "docs", "documentation"],
@@ -664,6 +770,12 @@ function normalizeToolkitAlias(value: string) {
     "google meet": "googlemeet",
     "google calendar": "googlecalendar",
     calendar: "googlecalendar",
+    "google slides": "googleslides",
+    slides: "googleslides",
+    ppt: "googleslides",
+    powerpoint: "googleslides",
+    "pitch deck": "googleslides",
+    "investor deck": "googleslides",
     "google drive": "googledrive",
     drive: "googledrive",
     teams: "microsoftteams",
@@ -687,7 +799,21 @@ function formatToolkitList(toolkits: string[]) {
 function collectPlanToolkits(plan: DirectionExecutionPlan | null | undefined) {
   if (!plan) return [] as string[];
   const set = new Set<string>();
+  for (const allocation of plan.resourcePlan ?? []) {
+    for (const tool of allocation.tools ?? []) {
+      const normalized = tool.trim().toLowerCase();
+      if (normalized) {
+        set.add(normalized);
+      }
+    }
+  }
   for (const workflow of plan.workflows ?? []) {
+    for (const workflowTool of workflow.tools ?? []) {
+      const normalizedWorkflowTool = workflowTool.trim().toLowerCase();
+      if (normalizedWorkflowTool) {
+        set.add(normalizedWorkflowTool);
+      }
+    }
     for (const task of workflow.tasks ?? []) {
       for (const tool of task.tools ?? []) {
         const normalized = tool.trim().toLowerCase();
@@ -824,6 +950,9 @@ export function VorldXShell() {
   );
   const [approvedToolkitRequestId, setApprovedToolkitRequestId] = useState<string | null>(null);
   const [toolkitConnectInFlight, setToolkitConnectInFlight] = useState(false);
+  const [pipelinePolicy, setPipelinePolicy] = useState<OrchestrationPipelineEffectivePolicy | null>(
+    null
+  );
   const [controlMessage, setControlMessage] = useState<ControlMessage | null>(null);
   const [agentRunResult, setAgentRunResult] = useState<AgentRunResponse | null>(null);
   const [agentRunInputValues, setAgentRunInputValues] = useState<Record<string, string>>({});
@@ -838,6 +967,10 @@ export function VorldXShell() {
   const [humanInputOverridePrompt, setHumanInputOverridePrompt] = useState("");
   const [humanInputSubmitting, setHumanInputSubmitting] = useState(false);
   const permissionRequestsFetchSeqRef = useRef(0);
+  const permissionRequestsInFlightRef = useRef(false);
+  const pipelinePolicyInFlightRef = useRef(false);
+  const missionSchedulesInFlightRef = useRef(false);
+  const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
   const [realtimeSessionId] = useState(
     () => `shell-${Math.random().toString(36).slice(2, 10)}`
   );
@@ -859,6 +992,8 @@ export function VorldXShell() {
   const closeSearch = () => {
     setTimeout(() => setSearchOpen(false), 120);
   };
+
+  const activeOrgId = currentOrg?.id ?? orgs[0]?.id ?? "";
 
   const promptForHumanInput = useCallback((request: HumanInputRequest) => {
     const reason = normalizeHumanInputReason(request.reason) || "Human input required by agent.";
@@ -931,62 +1066,114 @@ export function VorldXShell() {
     }
   }, []);
 
-  const loadPermissionRequests = useCallback(async () => {
-    const fetchSeq = ++permissionRequestsFetchSeqRef.current;
-    const orgId = currentOrg?.id ?? orgs[0]?.id ?? "";
-    if (!orgId) {
-      if (fetchSeq === permissionRequestsFetchSeqRef.current) {
-        setPermissionRequests([]);
-        setCanReviewPermissionRequests(false);
-        setPermissionRequestsLoading(false);
+  const loadPermissionRequests = useCallback(
+    async (options?: { silent?: boolean; force?: boolean }) => {
+      if (!options?.force && permissionRequestsInFlightRef.current) {
+        return;
       }
-      return;
-    }
 
-    setPermissionRequestsLoading(true);
-    try {
-      const response = await fetch(
-        `/api/requests?orgId=${encodeURIComponent(orgId)}`,
-        {
-          cache: "no-store"
+      permissionRequestsInFlightRef.current = true;
+
+      const fetchSeq = ++permissionRequestsFetchSeqRef.current;
+      const orgId = activeOrgId;
+      if (!orgId) {
+        if (fetchSeq === permissionRequestsFetchSeqRef.current) {
+          setPermissionRequests([]);
+          setCanReviewPermissionRequests(false);
+          setPermissionRequestsLoading(false);
         }
-      );
-      const { payload, rawText } = await parseJsonBody<{
-        ok?: boolean;
-        message?: string;
-        canReview?: boolean;
-        requests?: PermissionRequestItem[];
-      }>(response);
+        permissionRequestsInFlightRef.current = false;
+        return;
+      }
 
-      if (!response.ok || !payload?.ok) {
-        throw new Error(
-          payload?.message ??
-            (rawText
-              ? `Failed loading permission requests (${response.status}): ${rawText.slice(0, 180)}`
-              : "Failed loading permission requests.")
+      if (!options?.silent) {
+        setPermissionRequestsLoading(true);
+      }
+      try {
+        const response = await fetch(
+          `/api/requests?orgId=${encodeURIComponent(orgId)}`,
+          {
+            cache: "no-store"
+          }
         );
+        const { payload, rawText } = await parseJsonBody<{
+          ok?: boolean;
+          message?: string;
+          canReview?: boolean;
+          requests?: PermissionRequestItem[];
+        }>(response);
+
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading permission requests (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading permission requests.")
+          );
+        }
+
+        if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
+          return;
+        }
+        setPermissionRequests(payload?.requests ?? []);
+        setCanReviewPermissionRequests(Boolean(payload?.canReview));
+      } catch (error) {
+        if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
+          return;
+        }
+        if (!options?.silent) {
+          setControlMessage({
+            tone: "error",
+            text:
+              error instanceof Error ? error.message : "Failed loading permission requests."
+          });
+        }
+      } finally {
+        if (fetchSeq === permissionRequestsFetchSeqRef.current && !options?.silent) {
+          setPermissionRequestsLoading(false);
+        }
+        permissionRequestsInFlightRef.current = false;
+      }
+    },
+    [activeOrgId]
+  );
+
+  const loadPipelinePolicy = useCallback(
+    async (options?: { force?: boolean }) => {
+      const orgId = activeOrgId;
+      if (!orgId) {
+        setPipelinePolicy(null);
+        return;
       }
 
-      if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
+      if (!options?.force && pipelinePolicyInFlightRef.current) {
         return;
       }
-      setPermissionRequests(payload?.requests ?? []);
-      setCanReviewPermissionRequests(Boolean(payload?.canReview));
-    } catch (error) {
-      if (fetchSeq !== permissionRequestsFetchSeqRef.current) {
-        return;
+      pipelinePolicyInFlightRef.current = true;
+
+      try {
+        const response = await fetch(
+          `/api/settings/orchestration-rules?orgId=${encodeURIComponent(orgId)}`,
+          {
+            cache: "no-store"
+          }
+        );
+        const { payload } = await parseJsonBody<{
+          ok?: boolean;
+          effectivePolicy?: OrchestrationPipelineEffectivePolicy;
+        }>(response);
+        if (!response.ok || !payload?.ok) {
+          return;
+        }
+        setPipelinePolicy(payload.effectivePolicy ?? null);
+      } catch {
+        // Best effort only; launch API still enforces policy server-side.
+      } finally {
+        pipelinePolicyInFlightRef.current = false;
       }
-      setControlMessage({
-        tone: "error",
-        text:
-          error instanceof Error ? error.message : "Failed loading permission requests."
-      });
-    } finally {
-      if (fetchSeq === permissionRequestsFetchSeqRef.current) {
-        setPermissionRequestsLoading(false);
-      }
-    }
-  }, [currentOrg?.id, orgs]);
+    },
+    [activeOrgId]
+  );
 
   const handleSubmitJoinRequest = useCallback(async () => {
     const identifier = joinOrgIdentifier.trim();
@@ -1185,10 +1372,28 @@ export function VorldXShell() {
     }
     void loadPermissionRequests();
     const interval = setInterval(() => {
-      void loadPermissionRequests();
-    }, 15000);
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      void loadPermissionRequests({ silent: true });
+    }, REQUESTS_POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [loadPermissionRequests, resolvedOrg?.id]);
+
+  useEffect(() => {
+    if (!resolvedOrg?.id) {
+      setPipelinePolicy(null);
+      return;
+    }
+    void loadPipelinePolicy();
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      void loadPipelinePolicy();
+    }, PIPELINE_POLICY_POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadPipelinePolicy, resolvedOrg?.id]);
 
   useEffect(() => {
     const requestedTab = searchParams.get("tab");
@@ -1226,6 +1431,9 @@ export function VorldXShell() {
 
   useEffect(() => {
     permissionRequestsFetchSeqRef.current += 1;
+    permissionRequestsInFlightRef.current = false;
+    pipelinePolicyInFlightRef.current = false;
+    missionSchedulesInFlightRef.current = false;
     setDirectionTurns([]);
     setDirectionPrompt("");
     setIntent("");
@@ -1257,10 +1465,12 @@ export function VorldXShell() {
     setPendingEmailApproval(null);
     setPendingToolkitApproval(null);
     setApprovedToolkitRequestId(null);
+    pendingPlanRouteHandledKeyRef.current = null;
     setToolkitConnectInFlight(false);
     setAgentRunInputSourceUrl("");
     setAgentRunInputFile(null);
     setAgentRunInputSubmitting(false);
+    setPipelinePolicy(null);
     setControlMessage(null);
   }, [resolvedOrg?.id]);
 
@@ -1534,10 +1744,14 @@ export function VorldXShell() {
   }, [handleTabChange, openAddOrganization, orgs, searchQuery, toggleGhostMode]);
 
   const loadMissionSchedules = useCallback(
-    async (silent?: boolean) => {
+    async (silent?: boolean, force?: boolean) => {
       if (!resolvedOrg?.id) {
         return;
       }
+      if (!force && missionSchedulesInFlightRef.current) {
+        return;
+      }
+      missionSchedulesInFlightRef.current = true;
       if (silent) {
         setSchedulesRefreshing(true);
       } else {
@@ -1573,6 +1787,7 @@ export function VorldXShell() {
       } finally {
         setSchedulesLoading(false);
         setSchedulesRefreshing(false);
+        missionSchedulesInFlightRef.current = false;
       }
     },
     [resolvedOrg?.id]
@@ -1584,8 +1799,11 @@ export function VorldXShell() {
     }
     void loadMissionSchedules();
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
       void loadMissionSchedules(true);
-    }, 20000);
+    }, MISSION_SCHEDULES_POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [loadMissionSchedules, resolvedOrg?.id]);
 
@@ -1913,7 +2131,7 @@ export function VorldXShell() {
 
       const shouldPromoteDirectionCandidate =
         Boolean(payload.directionCandidate) &&
-        (payload.intentRouting?.route === "PLAN_REQUIRED" || sourceMode === "DIRECTION");
+        sourceMode === "DIRECTION";
 
       if (shouldPromoteDirectionCandidate && payload.directionCandidate) {
         setIntent(payload.directionCandidate);
@@ -1925,7 +2143,7 @@ export function VorldXShell() {
       }
 
       if (payload.intentRouting?.route === "PLAN_REQUIRED") {
-        const routedPrompt = payload.directionCandidate?.trim() || message;
+        const routedPrompt = message;
         const cadenceHint = payload.intentRouting.cadenceHint;
         setPendingChatPlanRoute({
           prompt: routedPrompt,
@@ -1941,6 +2159,21 @@ export function VorldXShell() {
           text: cadenceHint
             ? `Intent routed to planning pipeline (${cadenceHint.toLowerCase()} cadence).`
             : "Intent routed to planning pipeline."
+        });
+      } else if (sourceMode === "DIRECTION" && shouldForceDirectionPlanRoute(message)) {
+        const toolkitHints = inferToolkitsFromDirectionPrompt(message);
+        setPendingChatPlanRoute({
+          prompt: message,
+          reason:
+            payload.intentRouting?.reason ||
+            "Direction mode detected execution intent. Routing to planning pipeline.",
+          toolkitHints
+        });
+        setControlMode("DIRECTION");
+        setControlConversationDetail("DIRECTION_GIVEN");
+        setControlMessage({
+          tone: "success",
+          text: "Direction intent routed to planning pipeline."
         });
       }
     } catch (error) {
@@ -2136,7 +2369,7 @@ export function VorldXShell() {
           ]);
         }
 
-        await loadPermissionRequests();
+        await loadPermissionRequests({ force: true });
         const autoSquadCreatedCount = autoSquadCreated.length;
         setControlMessage({
           tone: "success",
@@ -2197,7 +2430,7 @@ export function VorldXShell() {
           );
         }
 
-        await loadPermissionRequests();
+        await loadPermissionRequests({ force: true });
       } catch (error) {
         setControlMessage({
           tone: "error",
@@ -2246,7 +2479,7 @@ export function VorldXShell() {
         );
       }
 
-      await loadPermissionRequests();
+      await loadPermissionRequests({ force: true });
       setControlMessage({
         tone: "success",
         text: `Cleared ${payload.clearedCount ?? 0} permission requests.`
@@ -2424,7 +2657,7 @@ export function VorldXShell() {
         );
       }
 
-      await loadMissionSchedules(true);
+      await loadMissionSchedules(true, true);
       const launchedCount = payload.launchedCount ?? 0;
       const failedCount = payload.failedCount ?? 0;
       setControlMessage({
@@ -2767,6 +3000,29 @@ export function VorldXShell() {
       return;
     }
 
+    const strictPlanFirst =
+      (pipelinePolicy?.enforcePlanBeforeExecution === true ||
+        pipelinePolicy?.requireDetailedPlan === true ||
+        pipelinePolicy?.requireMultiWorkflowDecomposition === true) &&
+      pipelinePolicy?.strictFeatureEnabled === true;
+    if (strictPlanFirst && !directionPlanningResult?.planRecord?.id) {
+      const toolkitHints = inferToolkitsFromDirectionPrompt(prompt);
+      setIntent(prompt);
+      setControlMode("DIRECTION");
+      setControlConversationDetail("DIRECTION_GIVEN");
+      setPendingChatPlanRoute(null);
+      setControlMessage({
+        tone: "warning",
+        text:
+          "Plan-first policy is active. Creating plan now; approve the plan before execution launch."
+      });
+      await handleGenerateDirectionPlans(prompt, {
+        toolkitHints,
+        navigateToPlanTab: true
+      });
+      return;
+    }
+
     if (launchInFlight) {
       return;
     }
@@ -3076,6 +3332,7 @@ export function VorldXShell() {
     agentRunInputValues,
     pendingEmailApproval,
     authHeaders,
+    handleGenerateDirectionPlans,
     directionPlanningResult?.directionRecord?.id,
     directionPlanningResult?.planRecord?.id,
     directionPlanningResult?.primaryPlan,
@@ -3088,6 +3345,10 @@ export function VorldXShell() {
     requiredSignatures,
     resolvedOrg?.id,
     launchPermissionRequestIds,
+    pipelinePolicy?.enforcePlanBeforeExecution,
+    pipelinePolicy?.requireDetailedPlan,
+    pipelinePolicy?.requireMultiWorkflowDecomposition,
+    pipelinePolicy?.strictFeatureEnabled,
     swarmDensity,
     user?.uid,
     user?.email
@@ -3326,6 +3587,19 @@ export function VorldXShell() {
 
     let cancelled = false;
     const pending = pendingChatPlanRoute;
+    const routeKey = [
+      pending.prompt.trim().toLowerCase(),
+      [...new Set((pending.toolkitHints ?? []).map((item) => item.trim().toLowerCase()))]
+        .sort()
+        .join(",")
+    ].join("|");
+
+    if (pendingPlanRouteHandledKeyRef.current === routeKey) {
+      setPendingChatPlanRoute((current) => (current === pending ? null : current));
+      return;
+    }
+    pendingPlanRouteHandledKeyRef.current = routeKey;
+    setPendingChatPlanRoute((current) => (current === pending ? null : current));
 
     const run = async () => {
       try {
@@ -3334,6 +3608,7 @@ export function VorldXShell() {
           navigateToPlanTab: false
         });
       } finally {
+        pendingPlanRouteHandledKeyRef.current = null;
         if (!cancelled) {
           setPendingChatPlanRoute((current) => (current === pending ? null : current));
         }
@@ -3666,7 +3941,7 @@ export function VorldXShell() {
                     setShowRequestCenter((prev) => !prev);
                     setShowOrgSwitcher(false);
                     setShowUtilityMenu(false);
-                    void loadPermissionRequests();
+                    void loadPermissionRequests({ force: true });
                   }}
                   className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
                 >
@@ -4025,6 +4300,34 @@ export function VorldXShell() {
                       return;
                     }
 
+                    const directLaunchBlockedByPolicy =
+                      pipelinePolicy?.strictFeatureEnabled === true &&
+                      (pipelinePolicy.blockDirectWorkflowLaunch ||
+                        pipelinePolicy.enforcePlanBeforeExecution ||
+                        pipelinePolicy.requireDetailedPlan ||
+                        pipelinePolicy.requireMultiWorkflowDecomposition);
+
+                    if (directLaunchBlockedByPolicy && shouldDirectWorkflowLaunch(trimmed)) {
+                      setPendingToolkitApproval(null);
+                      setApprovedToolkitRequestId(null);
+                      setPendingEmailApproval(null);
+                      setPendingPlanLaunchApproval(null);
+                      setPendingChatPlanRoute(null);
+                      setControlMode("DIRECTION");
+                      setControlConversationDetail("DIRECTION_GIVEN");
+                      setIntent(trimmed);
+                      setDirectionPrompt(trimmed);
+                      setControlMessage({
+                        tone: "warning",
+                        text: "Direct launch blocked by strict pipeline policy. Routing to planning."
+                      });
+                      await handleGenerateDirectionPlans(trimmed, {
+                        toolkitHints: inferToolkitsFromDirectionPrompt(trimmed),
+                        navigateToPlanTab: true
+                      });
+                      return;
+                    }
+
                     if (shouldDirectWorkflowLaunch(trimmed)) {
                       setPendingToolkitApproval(null);
                       setApprovedToolkitRequestId(null);
@@ -4184,6 +4487,15 @@ export function VorldXShell() {
                   border: themeStyle.border
                 }}
                 onTaskNeedsInput={promptForHumanInput}
+              />
+            ) : activeTab === "blueprint" ? (
+              <BlueprintConsole
+                orgId={resolvedOrg.id}
+                themeStyle={{
+                  accent: themeStyle.accent,
+                  accentSoft: themeStyle.accentSoft,
+                  border: themeStyle.border
+                }}
               />
             ) : activeTab === "direction" ? (
               <DirectionConsole

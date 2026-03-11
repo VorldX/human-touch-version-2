@@ -830,6 +830,15 @@ test("inferRequestedToolkits maps Google Meet signals without duplicate meet too
   assert.deepEqual([...inferred].sort(), ["googlemeet"].sort());
 });
 
+test("inferRequestedToolkits maps presentation intents to Google Slides", () => {
+  const inferred = inferRequestedToolkits(
+    "Make a PPT investor pitch deck for seed funding and prepare slides for demo day.",
+    ["googleslides", "googledocs", "gmail"]
+  );
+
+  assert.deepEqual([...inferred].sort(), ["googleslides"].sort());
+});
+
 test("inferRequestedToolkits detects setup-meeting plus details-email workflows", () => {
   const inferred = inferRequestedToolkits(
     "Setup meeting and send meeting details to singhtrun7985@gmail.com",

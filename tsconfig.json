@@ -35,8 +35,7 @@
     "**/*.ts",
     "**/*.tsx",
     ".next/types/**/*.ts",
-    ".next-local-cache/dist/types/**/*.ts",
-    ".next-smoke/types/**/*.ts"
+    "..\\..\\..\\AppData\\Local\\vorldx-next-cache\\d9cb28135424\\dist/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

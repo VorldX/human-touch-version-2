@@ -17,6 +17,10 @@ import {
   recordPassiveSpend
 } from "@/lib/enterprise/passive";
 import {
+  getOrgOrchestrationPipelineSettings,
+  resolveOrchestrationPipelineEffectivePolicy
+} from "@/lib/agent/orchestration/pipeline-policy";
+import {
   ensureMainAgentProfile,
   resolveOrgExecutionMode
 } from "@/lib/agent/orchestration/runtime";
@@ -62,6 +66,24 @@ interface LaunchPlanWorkflowInput {
   goal: string;
   tasks: LaunchPlanTaskInput[];
 }
+
+interface PlanPolicySummary {
+  objective: string;
+  organizationFitSummary: string;
+  deliverableCount: number;
+  milestoneCount: number;
+  resourcePlanCount: number;
+  approvalCheckpointCount: number;
+  workflowCount: number;
+  taskCount: number;
+  workflowToolCoverageCount: number;
+  detailScore: number;
+}
+
+const MIN_DETAILED_PLAN_DELIVERABLES = 2;
+const MIN_DETAILED_PLAN_MILESTONES = 2;
+const MIN_DETAILED_PLAN_WORKFLOWS = 2;
+const MIN_DETAILED_PLAN_TASKS_PER_WORKFLOW = 2;
 
 function asPositiveInt(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -194,6 +216,54 @@ function parsePlanWorkflows(value: unknown): LaunchPlanWorkflowInput[] {
     })
     .filter((workflow) => workflow.tasks.length > 0)
     .slice(0, 10);
+}
+
+function summarizePlanForPolicy(value: unknown): PlanPolicySummary {
+  const record = asRecord(value);
+  const workflows = Array.isArray(record.workflows) ? record.workflows : [];
+  const objective = compactText(typeof record.objective === "string" ? record.objective : "");
+  const organizationFitSummary = compactText(
+    typeof record.organizationFitSummary === "string" ? record.organizationFitSummary : ""
+  );
+  const deliverableCount = Array.isArray(record.deliverables) ? record.deliverables.length : 0;
+  const milestoneCount = Array.isArray(record.milestones) ? record.milestones.length : 0;
+  const resourcePlanCount = Array.isArray(record.resourcePlan) ? record.resourcePlan.length : 0;
+  const approvalCheckpointCount = Array.isArray(record.approvalCheckpoints)
+    ? record.approvalCheckpoints.length
+    : 0;
+  const detailScore =
+    typeof record.detailScore === "number" && Number.isFinite(record.detailScore)
+      ? Math.max(0, Math.min(100, Math.floor(record.detailScore)))
+      : 0;
+
+  let taskCount = 0;
+  let workflowToolCoverageCount = 0;
+  for (const workflowRaw of workflows) {
+    const workflow = asRecord(workflowRaw);
+    const workflowTools = normalizeTextList(workflow.tools, 16);
+    const tasks = Array.isArray(workflow.tasks) ? workflow.tasks : [];
+    taskCount += tasks.length;
+    const taskToolCount = tasks.reduce((sum, taskRaw) => {
+      const task = asRecord(taskRaw);
+      return sum + normalizeTextList(task.tools, 16).length;
+    }, 0);
+    if (workflowTools.length > 0 || taskToolCount > 0) {
+      workflowToolCoverageCount += 1;
+    }
+  }
+
+  return {
+    objective,
+    organizationFitSummary,
+    deliverableCount,
+    milestoneCount,
+    resourcePlanCount,
+    approvalCheckpointCount,
+    workflowCount: workflows.length,
+    taskCount,
+    workflowToolCoverageCount,
+    detailScore
+  };
 }
 
 function splitDirectionIntoTasks(direction: string, swarmDensity: number) {
@@ -512,6 +582,149 @@ export async function POST(request: NextRequest) {
         { status: 404 }
       );
     }
+    const pipelineSettings = await getOrgOrchestrationPipelineSettings(orgId);
+    const pipelinePolicy = resolveOrchestrationPipelineEffectivePolicy(pipelineSettings);
+    const launchPlanRecord = planId ? await getPlan(orgId, planId) : null;
+    const launchPlanSummary = launchPlanRecord
+      ? summarizePlanForPolicy(launchPlanRecord.primaryPlan)
+      : null;
+
+    if (pipelinePolicy.enforcePlanBeforeExecution && !planId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Strict orchestration pipeline requires an approved plan before execution launch."
+        },
+        { status: 412 }
+      );
+    }
+
+    if (pipelinePolicy.requireDetailedPlan && !planId) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Strict orchestration pipeline requires a detailed approved plan before execution launch."
+        },
+        { status: 412 }
+      );
+    }
+
+    if (pipelinePolicy.enforcePlanBeforeExecution && planId && !launchPlanRecord) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Strict orchestration pipeline requires a valid approved plan record before launch."
+        },
+        { status: 412 }
+      );
+    }
+
+    if (pipelinePolicy.requireDetailedPlan && planId && !launchPlanRecord) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Strict orchestration pipeline requires a valid detailed plan snapshot before launch."
+        },
+        { status: 412 }
+      );
+    }
+
+    if (
+      pipelinePolicy.enforcePlanBeforeExecution &&
+      launchPlanRecord &&
+      launchPlanRecord.status !== "ACTIVE"
+    ) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: `Strict orchestration pipeline blocks launch because plan ${launchPlanRecord.id} is ${launchPlanRecord.status}.`
+        },
+        { status: 412 }
+      );
+    }
+
+    if (pipelinePolicy.requireDetailedPlan && launchPlanSummary) {
+      const minimumTaskCount =
+        Math.max(
+          MIN_DETAILED_PLAN_WORKFLOWS,
+          launchPlanSummary.workflowCount
+        ) * MIN_DETAILED_PLAN_TASKS_PER_WORKFLOW;
+      const detailedPlanMissingReasons: string[] = [];
+      if (!launchPlanSummary.objective) detailedPlanMissingReasons.push("objective");
+      if (!launchPlanSummary.organizationFitSummary) {
+        detailedPlanMissingReasons.push("organizationFitSummary");
+      }
+      if (launchPlanSummary.deliverableCount < MIN_DETAILED_PLAN_DELIVERABLES) {
+        detailedPlanMissingReasons.push("deliverables");
+      }
+      if (launchPlanSummary.milestoneCount < MIN_DETAILED_PLAN_MILESTONES) {
+        detailedPlanMissingReasons.push("milestones");
+      }
+      if (launchPlanSummary.resourcePlanCount < 1) detailedPlanMissingReasons.push("resourcePlan");
+      if (launchPlanSummary.approvalCheckpointCount < 1) {
+        detailedPlanMissingReasons.push("approvalCheckpoints");
+      }
+      if (launchPlanSummary.workflowCount < MIN_DETAILED_PLAN_WORKFLOWS) {
+        detailedPlanMissingReasons.push("workflows");
+      }
+      if (launchPlanSummary.taskCount < minimumTaskCount) {
+        detailedPlanMissingReasons.push("workflow task depth");
+      }
+      if (launchPlanSummary.workflowToolCoverageCount < 1) {
+        detailedPlanMissingReasons.push("tool mapping");
+      }
+      if (launchPlanSummary.detailScore < 60) {
+        detailedPlanMissingReasons.push("detailScore");
+      }
+      if (detailedPlanMissingReasons.length > 0) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message: `Strict orchestration pipeline blocked launch: detailed plan is incomplete (${detailedPlanMissingReasons.join(", ")}).`
+          },
+          { status: 412 }
+        );
+      }
+    }
+
+    if (pipelinePolicy.requireMultiWorkflowDecomposition) {
+      if (parsedPlanWorkflows.length < MIN_DETAILED_PLAN_WORKFLOWS) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message:
+              "Strict orchestration pipeline requires multi-workflow decomposition in launch payload."
+          },
+          { status: 412 }
+        );
+      }
+      if (launchPlanSummary && launchPlanSummary.workflowCount < MIN_DETAILED_PLAN_WORKFLOWS) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message:
+              "Strict orchestration pipeline blocked launch: approved plan does not include enough workflows."
+          },
+          { status: 412 }
+        );
+      }
+    }
+
+    if (pipelinePolicy.requirePlanWorkflows && parsedPlanWorkflows.length === 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            "Strict orchestration pipeline requires workflow breakdown from the approved plan before execution."
+        },
+        { status: 412 }
+      );
+    }
+
     const launchActorUserId = access.actor.userId;
     const nonInternalRequestedApprovers = requestedApprovalUserIds.filter(
       (userId) => userId !== launchActorUserId
@@ -598,7 +811,7 @@ export async function POST(request: NextRequest) {
         );
 
         if (scopedPermissionRequests.length === 0) {
-          const planRecord = await getPlan(orgId, planId);
+          const planRecord = launchPlanRecord ?? (await getPlan(orgId, planId));
           const normalizedPlanDirection = planRecord?.direction
             ? normalizeDirectionKey(planRecord.direction)
             : "";
@@ -726,6 +939,42 @@ export async function POST(request: NextRequest) {
       ])
     ];
 
+    if (pipelinePolicy.enforceSpecialistToolAssignment) {
+      const specialistGaps: Array<{ step: number; hints: string[] }> = [];
+      for (let index = 1; index < taskPrompts.length; index += 1) {
+        const stepPrompt = taskPrompts[index];
+        const specialtyHints = inferTaskSpecialtyHints(stepPrompt);
+        const toolkitHints = inferRequestedToolkits(stepPrompt);
+        const hints = [...new Set([...specialtyHints, ...toolkitHints])];
+        if (hints.length === 0) {
+          continue;
+        }
+
+        const specialistPool = mainAgent
+          ? activeAgents.filter((agent) => agent.id !== mainAgent.id)
+          : activeAgents;
+        const bestCandidate = specialistPool
+          .map((agent) => scoreAgentSpecialty(agent, hints))
+          .sort((left, right) => right - left)[0];
+        if (!bestCandidate || bestCandidate <= 0) {
+          specialistGaps.push({
+            step: index + 1,
+            hints: hints.slice(0, 4)
+          });
+        }
+      }
+      if (specialistGaps.length > 0) {
+        const firstGap = specialistGaps[0];
+        return NextResponse.json(
+          {
+            ok: false,
+            message: `Strict orchestration pipeline blocked launch: no specialist agent available for step ${firstGap.step} (${firstGap.hints.join(", ")}).`
+          },
+          { status: 412 }
+        );
+      }
+    }
+
     const runawaySignal = detectRunawaySignal(predictedBurn, org.monthlyBtuCap);
 
     const initiatedByUserId = access.actor.userId;
@@ -795,11 +1044,29 @@ export async function POST(request: NextRequest) {
             executionTrace: {
               requestedToolkits: taskRequestedToolkits,
               initiatedByUserId,
-              orchestrator: {
-                mode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-                stage: index === 0 ? "PLANNING" : "EXECUTION",
-                stepIndex: index + 1,
-                totalSteps: taskPrompts.length
+                orchestrator: {
+                  mode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
+                  stage: index === 0 ? "PLANNING" : "EXECUTION",
+                  stepIndex: index + 1,
+                  totalSteps: taskPrompts.length,
+                  strictPipelineMode: pipelineSettings.mode,
+                  strictRules: {
+                    requireDetailedPlan: pipelinePolicy.requireDetailedPlan,
+                    requireMultiWorkflowDecomposition:
+                      pipelinePolicy.requireMultiWorkflowDecomposition,
+                    enforceSpecialistToolAssignment:
+                      pipelinePolicy.enforceSpecialistToolAssignment
+                  },
+                  planId: planId ?? null,
+                  planLock: pipelinePolicy.freezeExecutionToApprovedPlan
+                    ? {
+                      enabled: true,
+                      planId: planId ?? null,
+                      planUpdatedAt: launchPlanRecord?.updatedAt ?? null
+                    }
+                  : {
+                      enabled: false
+                    }
               }
             }
           }
@@ -815,7 +1082,7 @@ export async function POST(request: NextRequest) {
             launchReady ? "queued" : "created in draft"
           }. Burn=${predictedBurn}, signatures=${requiredSignatures}, approvalsCaptured=${approvalsCaptured}, mode=${
             fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
-          }, planWorkflows=${parsedPlanWorkflows.length}, permissionRequests=${permissionRequestCounts.total}/${permissionRequestCounts.approved}.`
+          }, planWorkflows=${parsedPlanWorkflows.length}, permissionRequests=${permissionRequestCounts.total}/${permissionRequestCounts.approved}, strictPipeline=${pipelineSettings.mode}, detailedPlanRule=${pipelinePolicy.requireDetailedPlan}, multiWorkflowRule=${pipelinePolicy.requireMultiWorkflowDecomposition}, specialistRule=${pipelinePolicy.enforceSpecialistToolAssignment}.`
         }
       });
 
@@ -953,7 +1220,8 @@ export async function POST(request: NextRequest) {
         orgExecutionMode,
         planWorkflowCount: parsedPlanWorkflows.length,
         permissionRequestCount: permissionRequestCounts.total,
-        approvedPermissionRequestCount: permissionRequestCounts.approved
+        approvedPermissionRequestCount: permissionRequestCounts.approved,
+        strictPipelineMode: pipelineSettings.mode
       });
 
       try {
@@ -980,7 +1248,8 @@ export async function POST(request: NextRequest) {
                 orgExecutionMode,
                 planWorkflowCount: parsedPlanWorkflows.length,
                 permissionRequestCount: permissionRequestCounts.total,
-                approvedPermissionRequestCount: permissionRequestCounts.approved
+                approvedPermissionRequestCount: permissionRequestCounts.approved,
+                strictPipelineMode: pipelineSettings.mode
               }
             }
           ]),
@@ -1072,7 +1341,8 @@ export async function POST(request: NextRequest) {
           permissionRequestCount: permissionRequestCounts.total,
           approvedPermissionRequestCount: permissionRequestCounts.approved,
           executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-          orgExecutionMode
+          orgExecutionMode,
+          strictPipelineMode: pipelineSettings.mode
         },
         warning: [
           launchReady

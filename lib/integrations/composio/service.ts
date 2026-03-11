@@ -25,6 +25,7 @@ const DEFAULT_ALLOWLIST = [
   "googlemeet",
   "gmeet",
   "googlecalendar",
+  "googleslides",
   "googledrive",
   "googledocs",
   "googlesheets",

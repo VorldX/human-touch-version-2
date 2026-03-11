@@ -23,6 +23,10 @@ export const featureFlags = {
   policyEnginePassive: parseBoolean(process.env.FEATURE_POLICY_ENGINE_PASSIVE, false),
   costGuardianPassive: parseBoolean(process.env.FEATURE_COST_GUARDIAN_PASSIVE, false),
   evalGatesScaffold: parseBoolean(process.env.FEATURE_EVAL_GATES_SCAFFOLD, false),
+  strictOrchestrationPipeline: parseBoolean(
+    process.env.FEATURE_STRICT_ORCHESTRATION_PIPELINE,
+    false
+  ),
   memoryGovernance: parseBoolean(process.env.FEATURE_MEMORY_GOVERNANCE, true),
   agentLongTermMemory: parseBoolean(process.env.FEATURE_AGENT_LONG_TERM_MEMORY, true),
   capabilityVault: parseBoolean(process.env.FEATURE_CAPABILITY_VAULT, false),

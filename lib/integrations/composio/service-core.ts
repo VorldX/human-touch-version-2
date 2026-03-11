@@ -221,8 +221,12 @@ function normalizeToolkit(value: string) {
 
 function canonicalToolkitForCompare(toolkit: string) {
   const normalized = normalizeToolkit(toolkit);
-  if (normalized === "googlemeet" || normalized === "gmeet") {
+  const compact = normalized.replace(/[\s_-]+/g, "");
+  if (compact === "googlemeet" || compact === "gmeet") {
     return "gmeet";
+  }
+  if (compact === "googleslides" || compact === "gslides") {
+    return "googleslides";
   }
   return normalized;
 }
@@ -1177,6 +1181,10 @@ export class ComposioServiceCore {
       allowedPrefixes.add("GMEET");
       allowedPrefixes.add("GOOGLEMEET");
     }
+    if (canonicalToolkitForCompare(toolkit) === "googleslides") {
+      allowedPrefixes.add("GOOGLESLIDES");
+      allowedPrefixes.add("GSLIDES");
+    }
     const hasValidPrefix = [...allowedPrefixes].some((prefix) =>
       normalizedSlug.startsWith(`${prefix}_`)
     );
@@ -1338,6 +1346,15 @@ export function inferRequestedToolkits(prompt: string, allowlistedToolkits: stri
     /\b(zoom|video call|video meeting|webinar|meeting link)\b/i.test(normalizedPrompt)
   ) {
     requested.add("zoom");
+  }
+
+  if (
+    allowlist.includes("googleslides") &&
+    /\b(google slides|googleslides|slides|presentation|ppt|powerpoint|pitch deck|investor deck)\b/i.test(
+      normalizedPrompt
+    )
+  ) {
+    requested.add("googleslides");
   }
 
   if (

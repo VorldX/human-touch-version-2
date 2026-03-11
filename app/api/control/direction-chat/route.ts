@@ -327,6 +327,16 @@ function inferToolkitHints(text: string) {
   const escapeRegex = (input: string) => input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   const toolkitAliases: Record<string, string[]> = {
+    googleslides: [
+      "googleslides",
+      "google slides",
+      "slides",
+      "presentation",
+      "ppt",
+      "powerpoint",
+      "pitch deck",
+      "investor deck"
+    ],
     gmail: ["gmail", "email", "inbox", "mailbox"],
     slack: ["slack", "channel", "workspace", "direct message", "dm"],
     notion: ["notion", "wiki", "knowledge base", "docs", "documentation"],
@@ -467,13 +477,23 @@ function inferIntentRouting(input: {
   const ownerTrimmed = ownerLower.trim();
   const recurringCadence = inferRecurringCadence(input.ownerMessage);
 
-  const explicitActionIntent = /\b(create|build|launch|implement|execute|automate|orchestrate|run|set up|setup|deploy|delegate)\b/.test(
-    ownerLower
-  );
+  const explicitActionIntent =
+    /\b(create|build|launch|implement|execute|automate|orchestrate|run|set up|setup|deploy|delegate|generate|prepare|design|draft|develop|produce)\b/.test(
+      ownerLower
+    );
   const explicitPlanningIntent =
     /\b(workflow|plan|roadmap|steps|mission|task breakdown|decompose)\b/.test(ownerLower) ||
     /\b(team|squad)\b/.test(ownerLower);
-  const explicitExecutionIntent = explicitActionIntent || explicitPlanningIntent;
+  const artifactRequestIntent =
+    /\b(presentation|ppt|pitch deck|investor deck|deck|proposal|strategy doc|brief|report|campaign|automation)\b/.test(
+      ownerLower
+    ) &&
+    (/\b(for me|for us|i want|we want|i need|we need|looking for|aiming for)\b/.test(
+      ownerLower
+    ) ||
+      explicitActionIntent);
+  const explicitExecutionIntent =
+    explicitActionIntent || explicitPlanningIntent || artifactRequestIntent;
 
   const directQuestionIntent = /^(what|why|how|when|where|who|which|can|could|is|are|do|does|tell me|explain|summarize|list)\b/.test(
     ownerTrimmed

@@ -1,42 +1,89 @@
 export const dynamic = "force-dynamic";
 
-import { randomUUID } from "node:crypto";
-
 import { AgentRole, LogType, PersonnelStatus, PersonnelType } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
-import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
-import { selectCompanyContext } from "@/lib/ai/context-selector";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
-import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
 import { prisma } from "@/lib/db/prisma";
 import { createDirection } from "@/lib/direction/directions";
-import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
+import { runSwarmPlanningGraph } from "@/lib/langgraph/swarm-planning-entry";
 import { createPlan } from "@/lib/plans/plans";
 import { createPermissionRequests } from "@/lib/requests/permission-requests";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface PlanTask {
   title: string;
+  description: string;
   ownerRole: string;
+  dependsOn: string[];
   subtasks: string[];
   tools: string[];
+  expectedOutput: string;
+  estimatedMinutes: number;
   requiresApproval: boolean;
   approvalRole: string;
   approvalReason: string;
 }
 
+type WorkforceType = "HUMAN" | "AGENT" | "HYBRID";
+
 interface PlanWorkflow {
   title: string;
   goal: string;
+  ownerRole: string;
+  ownerType: WorkforceType;
+  dependencies: string[];
+  deliverables: string[];
+  tools: string[];
+  entryCriteria: string[];
+  exitCriteria: string[];
+  successMetrics: string[];
+  estimatedHours: number;
   tasks: PlanTask[];
 }
 
+interface PlanMilestone {
+  title: string;
+  ownerRole: string;
+  dueWindow: string;
+  deliverable: string;
+  successSignal: string;
+}
+
+interface PlanResourceAllocation {
+  workforceType: WorkforceType;
+  role: string;
+  responsibility: string;
+  capacityPct: number;
+  tools: string[];
+}
+
+interface PlanApprovalCheckpoint {
+  name: string;
+  trigger: string;
+  requiredRole: string;
+  reason: string;
+}
+
+interface PlanDependency {
+  fromWorkflow: string;
+  toWorkflow: string;
+  reason: string;
+}
+
 interface ExecutionPlan {
+  objective: string;
+  organizationFitSummary: string;
   summary: string;
+  deliverables: string[];
+  milestones: PlanMilestone[];
+  resourcePlan: PlanResourceAllocation[];
+  approvalCheckpoints: PlanApprovalCheckpoint[];
+  dependencies: PlanDependency[];
   workflows: PlanWorkflow[];
   risks: string[];
   successMetrics: string[];
+  detailScore: number;
 }
 
 interface PermissionHint {
@@ -124,7 +171,23 @@ const MAX_CONTEXT_SELECTOR_CHUNK_CHARS = positiveEnvInt(
 );
 const DIRECTION_PLAN_MAX_OUTPUT_TOKENS = positiveEnvInt(
   "DIRECTION_PLAN_MAX_OUTPUT_TOKENS",
-  480
+  900
+);
+const DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS = positiveEnvInt(
+  "DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS",
+  3
+);
+const DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW = positiveEnvInt(
+  "DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW",
+  2
+);
+const DIRECTION_PLAN_MIN_DETAIL_SCORE = positiveEnvInt(
+  "DIRECTION_PLAN_MIN_DETAIL_SCORE",
+  70
+);
+const DIRECTION_PLAN_MIN_FALLBACK_DETAIL_SCORE = positiveEnvInt(
+  "DIRECTION_PLAN_MIN_FALLBACK_DETAIL_SCORE",
+  45
 );
 
 function cleanText(value: unknown) {
@@ -186,16 +249,130 @@ function normalizeStringList(value: unknown, fallback: string[] = []) {
     .slice(0, 16);
 }
 
+function toBoundedNumber(value: unknown, fallback: number, min: number, max: number) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function normalizeWorkforceType(value: unknown): WorkforceType {
+  const normalized = cleanText(value).toUpperCase();
+  if (normalized === "HUMAN") return "HUMAN";
+  if (normalized === "AGENT") return "AGENT";
+  if (normalized === "HYBRID") return "HYBRID";
+  return "HYBRID";
+}
+
+function splitDirectionIntoItems(direction: string, limit = 6) {
+  const normalized = direction
+    .replace(/\r\n/g, "\n")
+    .split(/\n|[.?!;]+/g)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+  return [...new Set(normalized)].slice(0, limit);
+}
+
+function inferToolHints(value: string) {
+  const lower = value.toLowerCase();
+  const hints = new Set<string>();
+  if (/\b(gmail|email|mail|inbox)\b/.test(lower)) hints.add("gmail");
+  if (/\b(google calendar|calendar|meeting|schedule)\b/.test(lower)) hints.add("googlecalendar");
+  if (/\b(google meet|gmeet|meet)\b/.test(lower)) hints.add("googlemeet");
+  if (/\b(facebook|fb|meta ads|instagram)\b/.test(lower)) hints.add("facebook");
+  if (/\b(slides|presentation|pitch deck|investor deck)\b/.test(lower)) hints.add("googleslides");
+  if (/\b(docs|document|proposal)\b/.test(lower)) hints.add("googledocs");
+  if (/\b(sheet|spreadsheet|financial model)\b/.test(lower)) hints.add("googlesheets");
+  return [...hints];
+}
+
+function normalizeMilestone(raw: unknown): PlanMilestone | null {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const title = cleanText(record.title);
+  if (!title) {
+    return null;
+  }
+  return {
+    title,
+    ownerRole: cleanText(record.ownerRole) || "EMPLOYEE",
+    dueWindow: cleanText(record.dueWindow) || "TBD",
+    deliverable: cleanText(record.deliverable) || title,
+    successSignal: cleanText(record.successSignal) || "Deliverable accepted by reviewer"
+  };
+}
+
+function normalizeResourceAllocation(raw: unknown): PlanResourceAllocation | null {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const role = cleanText(record.role);
+  if (!role) {
+    return null;
+  }
+  return {
+    workforceType: normalizeWorkforceType(record.workforceType),
+    role,
+    responsibility: cleanText(record.responsibility) || "Execution support",
+    capacityPct: toBoundedNumber(record.capacityPct, 25, 5, 100),
+    tools: normalizeStringList(record.tools, [])
+  };
+}
+
+function normalizeApprovalCheckpoint(raw: unknown): PlanApprovalCheckpoint | null {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const name = cleanText(record.name);
+  if (!name) {
+    return null;
+  }
+  return {
+    name,
+    trigger: cleanText(record.trigger) || "Before execution stage transition",
+    requiredRole: cleanText(record.requiredRole) || "ADMIN",
+    reason: cleanText(record.reason) || "Ensure direction-plan alignment before launch"
+  };
+}
+
+function normalizePlanDependency(raw: unknown): PlanDependency | null {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const fromWorkflow = cleanText(record.fromWorkflow);
+  const toWorkflow = cleanText(record.toWorkflow);
+  if (!fromWorkflow || !toWorkflow) {
+    return null;
+  }
+  return {
+    fromWorkflow,
+    toWorkflow,
+    reason: cleanText(record.reason) || "Downstream execution depends on upstream output"
+  };
+}
+
 function normalizeTask(raw: unknown): PlanTask {
   const record =
     raw && typeof raw === "object" && !Array.isArray(raw)
       ? (raw as Record<string, unknown>)
       : {};
+  const subtasks = normalizeStringList(record.subtasks, []);
+  const title = cleanText(record.title) || "Task";
+  const tools = normalizeStringList(record.tools, []);
   return {
-    title: cleanText(record.title) || "Task",
+    title,
+    description: cleanText(record.description) || title,
     ownerRole: cleanText(record.ownerRole) || "EMPLOYEE",
-    subtasks: normalizeStringList(record.subtasks, []),
-    tools: normalizeStringList(record.tools, []),
+    dependsOn: normalizeStringList(record.dependsOn, []),
+    subtasks,
+    tools,
+    expectedOutput: cleanText(record.expectedOutput) || subtasks[0] || `Completed output for ${title}`,
+    estimatedMinutes: toBoundedNumber(record.estimatedMinutes, 60, 10, 720),
     requiresApproval: Boolean(record.requiresApproval),
     approvalRole: cleanText(record.approvalRole) || "ADMIN",
     approvalReason: cleanText(record.approvalReason)
@@ -208,10 +385,22 @@ function normalizeWorkflow(raw: unknown): PlanWorkflow {
       ? (raw as Record<string, unknown>)
       : {};
   const rawTasks = Array.isArray(record.tasks) ? record.tasks : [];
+  const tasks = rawTasks.map((item) => normalizeTask(item)).slice(0, 16);
+  const toolTags = normalizeStringList(record.tools, []);
+  const inferredTools = tasks.flatMap((task) => task.tools).filter(Boolean);
   return {
     title: cleanText(record.title) || "Workflow",
     goal: cleanText(record.goal) || "",
-    tasks: rawTasks.map((item) => normalizeTask(item)).slice(0, 12)
+    ownerRole: cleanText(record.ownerRole) || "EMPLOYEE",
+    ownerType: normalizeWorkforceType(record.ownerType),
+    dependencies: normalizeStringList(record.dependencies, []),
+    deliverables: normalizeStringList(record.deliverables, []),
+    tools: [...new Set([...toolTags, ...inferredTools])].slice(0, 16),
+    entryCriteria: normalizeStringList(record.entryCriteria, []),
+    exitCriteria: normalizeStringList(record.exitCriteria, []),
+    successMetrics: normalizeStringList(record.successMetrics, []),
+    estimatedHours: toBoundedNumber(record.estimatedHours, 8, 1, 240),
+    tasks
   };
 }
 
@@ -221,12 +410,330 @@ function normalizePlan(raw: unknown): ExecutionPlan {
       ? (raw as Record<string, unknown>)
       : {};
   const rawWorkflows = Array.isArray(record.workflows) ? record.workflows : [];
+  const milestones = Array.isArray(record.milestones)
+    ? record.milestones
+        .map((item) => normalizeMilestone(item))
+        .filter((item): item is PlanMilestone => Boolean(item))
+        .slice(0, 20)
+    : [];
+  const resourcePlan = Array.isArray(record.resourcePlan)
+    ? record.resourcePlan
+        .map((item) => normalizeResourceAllocation(item))
+        .filter((item): item is PlanResourceAllocation => Boolean(item))
+        .slice(0, 20)
+    : [];
+  const approvalCheckpoints = Array.isArray(record.approvalCheckpoints)
+    ? record.approvalCheckpoints
+        .map((item) => normalizeApprovalCheckpoint(item))
+        .filter((item): item is PlanApprovalCheckpoint => Boolean(item))
+        .slice(0, 20)
+    : [];
+  const dependencies = Array.isArray(record.dependencies)
+    ? record.dependencies
+        .map((item) => normalizePlanDependency(item))
+        .filter((item): item is PlanDependency => Boolean(item))
+        .slice(0, 20)
+    : [];
   return {
+    objective: cleanText(record.objective),
+    organizationFitSummary: cleanText(record.organizationFitSummary),
     summary: cleanText(record.summary),
-    workflows: rawWorkflows.map((item) => normalizeWorkflow(item)).slice(0, 8),
+    deliverables: normalizeStringList(record.deliverables, []),
+    milestones,
+    resourcePlan,
+    approvalCheckpoints,
+    dependencies,
+    workflows: rawWorkflows.map((item) => normalizeWorkflow(item)).slice(0, 12),
     risks: normalizeStringList(record.risks, []),
-    successMetrics: normalizeStringList(record.successMetrics, [])
+    successMetrics: normalizeStringList(record.successMetrics, []),
+    detailScore: toBoundedNumber(record.detailScore, 0, 0, 100)
   };
+}
+
+function ensureMinimumTasks(workflow: PlanWorkflow, toolkitHints: string[]) {
+  const normalized = workflow;
+  while (normalized.tasks.length < DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW) {
+    const stepIndex = normalized.tasks.length + 1;
+    normalized.tasks.push({
+      title: `${normalized.title}: Step ${stepIndex}`,
+      description: `Execute step ${stepIndex} for ${normalized.goal || normalized.title}.`,
+      ownerRole: normalized.ownerRole || "EMPLOYEE",
+      dependsOn: stepIndex > 1 ? [`${normalized.title}: Step ${stepIndex - 1}`] : [],
+      subtasks: [
+        "Prepare inputs and constraints",
+        "Execute output with tool evidence",
+        "Record handoff notes"
+      ],
+      tools: toolkitHints.slice(0, 4),
+      expectedOutput: `Step ${stepIndex} artifact ready for next handoff`,
+      estimatedMinutes: 75,
+      requiresApproval: false,
+      approvalRole: "ADMIN",
+      approvalReason: ""
+    });
+  }
+  return normalized;
+}
+
+function buildDeterministicWorkflowPack(input: { direction: string; fallback: boolean }) {
+  const seeds = splitDirectionIntoItems(input.direction, input.fallback ? 4 : 6);
+  const toolkitHints = inferToolHints(input.direction);
+  const baseTitles = input.fallback
+    ? ["Fallback Triage", "Fallback Execution", "Fallback Assurance"]
+    : ["Scope Blueprint", "Execution Pods", "Validation & Launch", "Post-Launch Optimization"];
+  const workflowTarget = input.fallback ? 2 : DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS;
+  const workflows: PlanWorkflow[] = [];
+
+  for (let index = 0; index < workflowTarget; index += 1) {
+    const seed = seeds[index] || input.direction;
+    const title = baseTitles[index] || `Workflow ${index + 1}`;
+    const tasks: PlanTask[] = [
+      {
+        title: `${title}: Define execution package`,
+        description: `Define scoped package for ${seed}.`,
+        ownerRole: index === 0 ? "MAIN_AGENT" : "EMPLOYEE",
+        dependsOn: [],
+        subtasks: [
+          "Capture objective, constraints, and measurable output",
+          "Lock tools and handoff ownership",
+          "Register dependency notes"
+        ],
+        tools: toolkitHints.slice(0, 4),
+        expectedOutput: "Scoped execution package with ownership mapping",
+        estimatedMinutes: 80,
+        requiresApproval: index === 0,
+        approvalRole: "ADMIN",
+        approvalReason: index === 0 ? "Launch readiness and scope lock check." : ""
+      },
+      {
+        title: `${title}: Execute and hand off`,
+        description: `Deliver execution artifact for ${seed}.`,
+        ownerRole: "EMPLOYEE",
+        dependsOn: [`${title}: Define execution package`],
+        subtasks: [
+          "Run execution tasks in order",
+          "Capture evidence and deliverable links",
+          "Prepare structured handoff to next workflow"
+        ],
+        tools: toolkitHints.slice(0, 4),
+        expectedOutput: "Deliverable artifact and handoff package",
+        estimatedMinutes: 110,
+        requiresApproval: input.fallback,
+        approvalRole: "ADMIN",
+        approvalReason: input.fallback
+          ? "Fallback path confirmation required before continuation."
+          : ""
+      }
+    ];
+
+    workflows.push({
+      title,
+      goal: seed,
+      ownerRole: index === 0 ? "MAIN_AGENT" : "EMPLOYEE",
+      ownerType: index === 0 ? "AGENT" : "HYBRID",
+      dependencies: index > 0 ? [baseTitles[Math.max(0, index - 1)] || `Workflow ${index}`] : [],
+      deliverables: [`${title} output package`],
+      tools: toolkitHints.slice(0, 6),
+      entryCriteria: index === 0 ? ["Direction approved and context loaded"] : ["Previous workflow handoff received"],
+      exitCriteria: ["Deliverable reviewed", "Dependencies updated"],
+      successMetrics: [
+        "Deliverables completed on scope",
+        "No unresolved blockers at handoff"
+      ],
+      estimatedHours: input.fallback ? 8 : 12,
+      tasks: ensureMinimumTasks(
+        {
+          title,
+          goal: seed,
+          ownerRole: index === 0 ? "MAIN_AGENT" : "EMPLOYEE",
+          ownerType: index === 0 ? "AGENT" : "HYBRID",
+          dependencies: index > 0 ? [baseTitles[Math.max(0, index - 1)] || `Workflow ${index}`] : [],
+          deliverables: [`${title} output package`],
+          tools: toolkitHints.slice(0, 6),
+          entryCriteria: [],
+          exitCriteria: [],
+          successMetrics: [],
+          estimatedHours: input.fallback ? 8 : 12,
+          tasks
+        },
+        toolkitHints
+      ).tasks
+    });
+  }
+
+  return workflows;
+}
+
+function applyPlanFallbackScaffold(plan: ExecutionPlan, direction: string, fallback: boolean) {
+  const generatedPack = buildDeterministicWorkflowPack({
+    direction,
+    fallback
+  });
+  const minimumWorkflows = fallback ? 2 : DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS;
+
+  if (plan.workflows.length === 0) {
+    plan.workflows = generatedPack;
+  } else if (plan.workflows.length < minimumWorkflows) {
+    const existingTitles = new Set(plan.workflows.map((workflow) => workflow.title.toLowerCase()));
+    for (const candidate of generatedPack) {
+      if (plan.workflows.length >= minimumWorkflows) {
+        break;
+      }
+      if (existingTitles.has(candidate.title.toLowerCase())) {
+        continue;
+      }
+      plan.workflows.push(candidate);
+      existingTitles.add(candidate.title.toLowerCase());
+    }
+  }
+
+  const toolkitHints = inferToolHints(direction);
+  plan.workflows = plan.workflows
+    .slice(0, 12)
+    .map((workflow) => ensureMinimumTasks(workflow, toolkitHints));
+}
+
+function computePlanDetailScore(plan: ExecutionPlan) {
+  let score = 0;
+  if (plan.objective.length >= 24) score += 10;
+  if (plan.organizationFitSummary.length >= 24) score += 10;
+  if (plan.summary.length >= 60) score += 10;
+  if (plan.deliverables.length >= 2) score += 8;
+  if (plan.milestones.length >= 2) score += 8;
+  if (plan.resourcePlan.length >= 2) score += 8;
+  if (plan.approvalCheckpoints.length >= 1) score += 6;
+  if (plan.dependencies.length >= 1) score += 5;
+  if (plan.risks.length >= 2) score += 6;
+  if (plan.successMetrics.length >= 3) score += 8;
+
+  const workflowCount = plan.workflows.length;
+  if (workflowCount >= DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS) score += 10;
+  const taskCount = plan.workflows.reduce((sum, workflow) => sum + workflow.tasks.length, 0);
+  if (taskCount >= workflowCount * DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW) score += 8;
+  const workflowToolCoverage = plan.workflows.filter((workflow) => workflow.tools.length > 0).length;
+  if (workflowCount > 0 && workflowToolCoverage >= Math.ceil(workflowCount * 0.5)) score += 3;
+  return Math.max(0, Math.min(100, score));
+}
+
+function hydratePlanDetailSections(plan: ExecutionPlan, direction: string, fallback: boolean) {
+  const fallbackObjective = fallback
+    ? `Fallback objective for direction: ${direction}`
+    : `Primary objective for direction: ${direction}`;
+  if (!plan.objective) {
+    plan.objective = clampText(fallbackObjective, 280);
+  }
+  if (!plan.organizationFitSummary) {
+    plan.organizationFitSummary =
+      "Plan structure aligned with organization DNA, operating model, and workforce specialization.";
+  }
+  if (!plan.summary) {
+    plan.summary = fallback
+      ? "Fallback execution path preserving critical outcomes with risk controls."
+      : "Detailed execution blueprint with workforce coordination and measurable delivery gates.";
+  }
+
+  if (plan.deliverables.length === 0) {
+    plan.deliverables = plan.workflows
+      .flatMap((workflow) => workflow.deliverables)
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+  if (plan.deliverables.length === 0) {
+    plan.deliverables = splitDirectionIntoItems(direction, 4).map(
+      (item, index) => `Deliverable ${index + 1}: ${item}`
+    );
+  }
+
+  if (plan.milestones.length === 0) {
+    plan.milestones = plan.workflows.slice(0, 6).map((workflow, index) => ({
+      title: `${workflow.title} milestone`,
+      ownerRole: workflow.ownerRole || "EMPLOYEE",
+      dueWindow: fallback ? `Fallback Window ${index + 1}` : `Execution Window ${index + 1}`,
+      deliverable: workflow.deliverables[0] || workflow.goal || workflow.title,
+      successSignal: workflow.successMetrics[0] || "Milestone accepted by reviewer"
+    }));
+  }
+
+  if (plan.resourcePlan.length === 0) {
+    plan.resourcePlan = plan.workflows.slice(0, 8).map((workflow) => ({
+      workforceType: workflow.ownerType,
+      role: workflow.ownerRole || "EMPLOYEE",
+      responsibility: workflow.goal || workflow.title,
+      capacityPct: 20,
+      tools: workflow.tools.slice(0, 6)
+    }));
+  }
+
+  if (plan.approvalCheckpoints.length === 0) {
+    const approvalTasks = plan.workflows.flatMap((workflow) =>
+      workflow.tasks
+        .filter((task) => task.requiresApproval)
+        .map((task) => ({
+          name: `${workflow.title}: ${task.title}`,
+          trigger: "Before workflow stage promotion",
+          requiredRole: task.approvalRole || "ADMIN",
+          reason: task.approvalReason || "Critical step approval required."
+        }))
+    );
+    plan.approvalCheckpoints = approvalTasks.slice(0, 8);
+  }
+  if (plan.approvalCheckpoints.length === 0) {
+    plan.approvalCheckpoints = [
+      {
+        name: fallback ? "Fallback launch approval" : "Execution launch approval",
+        trigger: "Before execution begins",
+        requiredRole: "ADMIN",
+        reason: "Validate final plan quality and risk controls."
+      }
+    ];
+  }
+
+  if (plan.dependencies.length === 0 && plan.workflows.length > 1) {
+    plan.dependencies = plan.workflows.slice(1).map((workflow, index) => ({
+      fromWorkflow: plan.workflows[index]?.title || `Workflow ${index + 1}`,
+      toWorkflow: workflow.title,
+      reason: "Sequential dependency from upstream deliverable."
+    }));
+  }
+
+  if (plan.risks.length === 0) {
+    plan.risks = [
+      "Execution drift from approved scope",
+      "Tool authorization delays",
+      "Dependency slippage across squads"
+    ];
+  }
+  if (plan.successMetrics.length === 0) {
+    plan.successMetrics = [
+      "All deliverables accepted by owner",
+      "Milestones closed within planned window",
+      "No unresolved critical blockers at launch"
+    ];
+  }
+
+  for (const workflow of plan.workflows) {
+    if (!workflow.ownerRole) {
+      workflow.ownerRole = "EMPLOYEE";
+    }
+    if (workflow.tools.length === 0) {
+      const taskTools = workflow.tasks.flatMap((task) => task.tools);
+      workflow.tools = taskTools.length > 0 ? [...new Set(taskTools)].slice(0, 6) : ["general-ops"];
+    }
+    if (workflow.deliverables.length === 0) {
+      workflow.deliverables = [workflow.goal || `${workflow.title} completed output`];
+    }
+    if (workflow.entryCriteria.length === 0) {
+      workflow.entryCriteria = ["Required context and dependencies are available"];
+    }
+    if (workflow.exitCriteria.length === 0) {
+      workflow.exitCriteria = ["Deliverable accepted by downstream owner"];
+    }
+    if (workflow.successMetrics.length === 0) {
+      workflow.successMetrics = ["Workflow deliverables completed with quality checks"];
+    }
+  }
+
+  plan.detailScore = computePlanDetailScore(plan);
 }
 
 function normalizePermission(raw: unknown): PermissionHint | null {
@@ -264,51 +771,10 @@ function parseModelPlan(rawOutput: string, fallbackDirection: string): ModelPlan
   const primaryPlan = normalizePlan(record.primaryPlan);
   const fallbackPlan = normalizePlan(record.fallbackPlan);
 
-  if (primaryPlan.workflows.length === 0) {
-    primaryPlan.workflows = [
-      {
-        title: "Primary Execution Workflow",
-        goal: fallbackDirection,
-        tasks: [
-          {
-            title: "Translate direction into deliverable milestones",
-            ownerRole: "EMPLOYEE",
-            subtasks: [
-              "Break direction into measurable milestones",
-              "Assign execution owners and due windows"
-            ],
-            tools: [],
-            requiresApproval: false,
-            approvalRole: "ADMIN",
-            approvalReason: ""
-          }
-        ]
-      }
-    ];
-  }
-
-  if (fallbackPlan.workflows.length === 0) {
-    fallbackPlan.workflows = [
-      {
-        title: "Fallback Stabilization Workflow",
-        goal: `Fallback for: ${fallbackDirection}`,
-        tasks: [
-          {
-            title: "Run conservative fallback execution path",
-            ownerRole: "EMPLOYEE",
-            subtasks: [
-              "Scale down scope to critical outcomes",
-              "Protect ongoing operations from disruption"
-            ],
-            tools: [],
-            requiresApproval: true,
-            approvalRole: "ADMIN",
-            approvalReason: "Fallback path changes delivery scope."
-          }
-        ]
-      }
-    ];
-  }
+  applyPlanFallbackScaffold(primaryPlan, fallbackDirection, false);
+  applyPlanFallbackScaffold(fallbackPlan, fallbackDirection, true);
+  hydratePlanDetailSections(primaryPlan, fallbackDirection, false);
+  hydratePlanDetailSections(fallbackPlan, fallbackDirection, true);
 
   const permissions = Array.isArray(record.permissions)
     ? record.permissions
@@ -338,7 +804,21 @@ function normalizeToolkitName(value: string) {
 
 function collectPlanToolkits(plan: ExecutionPlan) {
   const unique = new Set<string>();
+  for (const allocation of plan.resourcePlan) {
+    for (const tool of allocation.tools) {
+      const normalized = normalizeToolkitName(tool);
+      if (normalized) {
+        unique.add(normalized);
+      }
+    }
+  }
   for (const workflow of plan.workflows) {
+    for (const workflowTool of workflow.tools) {
+      const normalizedWorkflowTool = normalizeToolkitName(workflowTool);
+      if (normalizedWorkflowTool) {
+        unique.add(normalizedWorkflowTool);
+      }
+    }
     for (const task of workflow.tasks) {
       for (const tool of task.tools) {
         const normalized = normalizeToolkitName(tool);
@@ -349,6 +829,99 @@ function collectPlanToolkits(plan: ExecutionPlan) {
     }
   }
   return [...unique];
+}
+
+function isSyntheticFallbackTask(task: PlanTask | undefined) {
+  if (!task) return false;
+  const title = task.title.trim().toLowerCase();
+  return (
+    title === "translate direction into deliverable milestones" ||
+    title === "run conservative fallback execution path" ||
+    title.includes("define execution package")
+  );
+}
+
+function countPlanTasks(plan: ExecutionPlan) {
+  return plan.workflows.reduce((sum, workflow) => sum + workflow.tasks.length, 0);
+}
+
+function hasPlannerQualityIssues(input: { primaryPlan: ExecutionPlan; fallbackPlan: ExecutionPlan }) {
+  const issues: string[] = [];
+  const primaryTaskCount = countPlanTasks(input.primaryPlan);
+  const fallbackTaskCount = countPlanTasks(input.fallbackPlan);
+  const firstPrimaryTask = input.primaryPlan.workflows[0]?.tasks[0];
+  const firstFallbackTask = input.fallbackPlan.workflows[0]?.tasks[0];
+  const primaryUnderDetailedWorkflowCount = input.primaryPlan.workflows.filter(
+    (workflow) => workflow.tasks.length < DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW
+  ).length;
+  const fallbackUnderDetailedWorkflowCount = input.fallbackPlan.workflows.filter(
+    (workflow) => workflow.tasks.length < DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW
+  ).length;
+  const primaryToolCoverage = input.primaryPlan.workflows.filter(
+    (workflow) =>
+      workflow.tools.length > 0 || workflow.tasks.some((task) => task.tools.length > 0)
+  ).length;
+  const fallbackToolCoverage = input.fallbackPlan.workflows.filter(
+    (workflow) =>
+      workflow.tools.length > 0 || workflow.tasks.some((task) => task.tools.length > 0)
+  ).length;
+
+  if (
+    input.primaryPlan.workflows.length < DIRECTION_PLAN_MIN_PRIMARY_WORKFLOWS ||
+    primaryTaskCount <
+      input.primaryPlan.workflows.length * DIRECTION_PLAN_MIN_TASKS_PER_WORKFLOW
+  ) {
+    issues.push("Primary plan is missing structured workflows/tasks.");
+  }
+  if (primaryUnderDetailedWorkflowCount > 0) {
+    issues.push(
+      `Primary plan has ${primaryUnderDetailedWorkflowCount} workflow(s) below minimum task depth.`
+    );
+  }
+  if (input.primaryPlan.detailScore < DIRECTION_PLAN_MIN_DETAIL_SCORE) {
+    issues.push(
+      `Primary plan detail score ${input.primaryPlan.detailScore} is below required ${DIRECTION_PLAN_MIN_DETAIL_SCORE}.`
+    );
+  }
+  if (!input.primaryPlan.objective || !input.primaryPlan.organizationFitSummary) {
+    issues.push("Primary plan is missing objective or organization fit summary.");
+  }
+  if (input.primaryPlan.deliverables.length < 2 || input.primaryPlan.milestones.length < 2) {
+    issues.push("Primary plan must include deliverables and milestones.");
+  }
+  if (input.primaryPlan.resourcePlan.length < 1 || input.primaryPlan.approvalCheckpoints.length < 1) {
+    issues.push("Primary plan must include resource plan and approval checkpoints.");
+  }
+  if (primaryToolCoverage < Math.max(1, Math.floor(input.primaryPlan.workflows.length / 2))) {
+    issues.push("Primary plan tool mapping is insufficient across workflows.");
+  }
+
+  if (input.fallbackPlan.workflows.length < 1 || fallbackTaskCount < 1) {
+    issues.push("Fallback plan is missing structured workflows/tasks.");
+  }
+  if (fallbackUnderDetailedWorkflowCount > 0) {
+    issues.push(
+      `Fallback plan has ${fallbackUnderDetailedWorkflowCount} workflow(s) below minimum task depth.`
+    );
+  }
+  if (input.fallbackPlan.detailScore < DIRECTION_PLAN_MIN_FALLBACK_DETAIL_SCORE) {
+    issues.push(
+      `Fallback plan detail score ${input.fallbackPlan.detailScore} is below required ${DIRECTION_PLAN_MIN_FALLBACK_DETAIL_SCORE}.`
+    );
+  }
+  if (fallbackToolCoverage < 1) {
+    issues.push("Fallback plan must keep at least one workflow with explicit tool mapping.");
+  }
+  if (
+    primaryTaskCount <= 1 &&
+    fallbackTaskCount <= 1 &&
+    isSyntheticFallbackTask(firstPrimaryTask) &&
+    isSyntheticFallbackTask(firstFallbackTask)
+  ) {
+    issues.push("Planner returned synthetic generic fallback tasks.");
+  }
+
+  return issues;
 }
 
 function inferAutoSquadTemplates(input: {
@@ -540,59 +1113,16 @@ export async function POST(request: NextRequest) {
     )
   ].join(", ");
 
-  let companyContext = "";
-  let contextSelection: ReturnType<typeof selectCompanyContext>["trace"] | null = null;
-  try {
-    const companyData = await ensureCompanyDataFile(orgId);
-    const selected = selectCompanyContext({
-      mode: "direction-plan",
-      companyDataText: companyData.content,
-      primaryText: [direction, humanPlan, ...history.map((entry) => entry.content)].join("\n"),
-      history,
-      maxSelectedChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
-      maxChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS
-    });
-    companyContext = selected.contextText;
-    contextSelection = selected.trace;
-    if (!companyContext) {
-      companyContext = companyData.content.slice(0, MAX_PROMPT_COMPANY_CONTEXT_CHARS);
-    }
-  } catch {
-    companyContext = "";
-    contextSelection = null;
-  }
-
-  const modelPrompt = [
-    `Direction: ${direction}`,
-    humanPlan ? `Human plan input: ${humanPlan}` : "Human plan input: none",
-    history.length > 0
-      ? [
-          "Recent conversation:",
-          ...history.map(
-            (item) => `${item.role === "owner" ? "Owner" : "Organization"}: ${item.content}`
-          )
-        ].join("\n")
-      : "Recent conversation: none",
-    `Organization: ${org.name}`,
-    personnelSummary ? `Personnel roles: ${personnelSummary}` : "Personnel roles: unknown",
-    companyContext ? `Company context excerpt:\n${companyContext}` : "Company context: unavailable",
-    "",
-    "Return STRICT JSON only (no markdown) with keys:",
-    "analysis, directionGiven, primaryPlan, fallbackPlan, permissions.",
-    "",
-    "Shape requirements:",
-    "- primaryPlan/fallbackPlan => {summary, workflows, risks, successMetrics}",
-    "- workflows => [{title, goal, tasks}]",
-    "- tasks => [{title, ownerRole, subtasks, tools, requiresApproval, approvalRole, approvalReason}]",
-    "- permissions => [{area, requestedFromRole, reason, workflowTitle, taskTitle}]"
-  ].join("\n");
-
   const runtime = await getOrgLlmRuntime(orgId);
-  const execution = await executeSwarmAgent({
-    taskId: `direction-plan-${randomUUID().slice(0, 8)}`,
-    flowId: "direction-plan",
-    prompt: direction,
-    agent:
+  const planningGraphResult = await runSwarmPlanningGraph({
+    orgId,
+    userId: access.actor.userId,
+    orgName: org.name,
+    direction,
+    humanPlan,
+    history,
+    personnelSummary,
+    mainAgent:
       mainAgent ?? {
         id: "main-agent-proxy",
         name: "Main Agent",
@@ -608,45 +1138,48 @@ export async function POST(request: NextRequest) {
         fallbackBrainKeyAuthTag: null,
         fallbackBrainKeyKeyVer: null
       },
-    contextBlocks: companyContext
-      ? [
-          {
-            id: "company-data",
-            name: "Company Data",
-            content: companyContext,
-            amnesiaProtected: false
-          }
-        ]
-      : [],
     organizationRuntime: runtime,
-    ...(provider || model
-      ? {
-          modelPreference: {
-            ...(provider ? { provider } : {}),
-            ...(model ? { model } : {})
-          }
-        }
-      : {}),
-    systemPromptOverride: buildOrganizationMainAgentPrompt({
-      orgName: org.name,
-      mode: "planning",
-      contextAvailable: Boolean(companyContext)
-    }),
-    userPromptOverride: modelPrompt,
+    provider: provider || undefined,
+    model: model || undefined,
+    maxSelectedContextChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
+    maxContextChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS,
     maxOutputTokens: DIRECTION_PLAN_MAX_OUTPUT_TOKENS
   });
 
-  if (!execution.ok || !execution.outputText) {
+  if (!planningGraphResult.ok || !planningGraphResult.modelOutput) {
     return NextResponse.json(
       {
         ok: false,
-        message: execution.error ?? "Failed generating plans."
+        message: planningGraphResult.error ?? "Failed generating plans.",
+        planningGraph: {
+          graphRunId: planningGraphResult.graphRunId,
+          warnings: planningGraphResult.warnings
+        }
       },
       { status: 502 }
     );
   }
 
-  const parsed = parseModelPlan(execution.outputText, direction);
+  const parsed = parseModelPlan(planningGraphResult.modelOutput, direction);
+  const qualityIssues = hasPlannerQualityIssues({
+    primaryPlan: parsed.primaryPlan,
+    fallbackPlan: parsed.fallbackPlan
+  });
+  if (qualityIssues.length > 0) {
+    return NextResponse.json(
+      {
+        ok: false,
+        message: `Planner quality gate failed: ${qualityIssues.join(" | ")}`,
+        planningGraph: {
+          graphRunId: planningGraphResult.graphRunId,
+          warnings: planningGraphResult.warnings,
+          qualityIssues
+        },
+        contextSelection: planningGraphResult.contextSelection
+      },
+      { status: 502 }
+    );
+  }
   const requiredToolkits = [
     ...new Set([
       ...collectPlanToolkits(parsed.primaryPlan),
@@ -886,17 +1419,33 @@ export async function POST(request: NextRequest) {
       permissionRequests: persisted.permissionRequests,
       requestCount: persisted.permissionRequests.length,
       requiredToolkits,
+      planQuality: {
+        primary: {
+          detailScore: parsed.primaryPlan.detailScore,
+          workflowCount: parsed.primaryPlan.workflows.length,
+          taskCount: countPlanTasks(parsed.primaryPlan)
+        },
+        fallback: {
+          detailScore: parsed.fallbackPlan.detailScore,
+          workflowCount: parsed.fallbackPlan.workflows.length,
+          taskCount: countPlanTasks(parsed.fallbackPlan)
+        }
+      },
       autoSquad: persisted.autoSquadResult,
       directionRecord: persisted.directionRecord,
       planRecord: persisted.planRecord,
       model: {
-        provider: execution.usedProvider ?? null,
-        name: execution.usedModel ?? null,
-        source: execution.apiSource ?? null
+        provider: planningGraphResult.model?.provider ?? null,
+        name: planningGraphResult.model?.name ?? null,
+        source: planningGraphResult.model?.source ?? null
       },
-      tokenUsage: execution.tokenUsage ?? null,
-      billing: execution.billing ?? null,
-      contextSelection
+      tokenUsage: planningGraphResult.tokenUsage ?? null,
+      billing: planningGraphResult.billing ?? null,
+      contextSelection: planningGraphResult.contextSelection,
+      planningGraph: {
+        graphRunId: planningGraphResult.graphRunId,
+        warnings: planningGraphResult.warnings
+      }
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed generating plans.";

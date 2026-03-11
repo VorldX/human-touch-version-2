@@ -137,18 +137,35 @@ if (!devEnv.NEXT_DIST_DIR && process.platform === "win32" && isOneDriveWorkspace
   if (externalCacheRoot) {
     try {
       mkdirSync(externalCacheRoot, { recursive: true });
-
-      let recreateLink = true;
-      if (existsSync(localCacheRoot)) {
-        const stat = lstatSync(localCacheRoot);
-        if (stat.isSymbolicLink()) {
-          const linked = readlinkSync(localCacheRoot);
-          const resolvedLinked = resolve(process.cwd(), linked.replace(/^\\\\\?\\/, ""));
-          if (
-            normalizePathForCompare(resolvedLinked) ===
-            normalizePathForCompare(externalCacheRoot)
-          ) {
-            recreateLink = false;
+      const externalRelativeDist = resolveExternalRelativeDistDir(externalCacheRoot);
+      if (externalRelativeDist) {
+        devEnv.NEXT_DIST_DIR = externalRelativeDist;
+        console.log(
+          `[dev-singleton] Using direct external Next.js cache at ${resolve(
+            process.cwd(),
+            externalRelativeDist
+          )}`
+        );
+      } else {
+        let recreateLink = true;
+        if (existsSync(localCacheRoot)) {
+          const stat = lstatSync(localCacheRoot);
+          if (stat.isSymbolicLink()) {
+            const linked = readlinkSync(localCacheRoot);
+            const resolvedLinked = resolve(process.cwd(), linked.replace(/^\\\\\?\\/, ""));
+            if (
+              normalizePathForCompare(resolvedLinked) ===
+              normalizePathForCompare(externalCacheRoot)
+            ) {
+              recreateLink = false;
+            } else {
+              rmSync(localCacheRoot, {
+                recursive: true,
+                force: true,
+                maxRetries: 6,
+                retryDelay: 180
+              });
+            }
           } else {
             rmSync(localCacheRoot, {
               recursive: true,
@@ -157,44 +174,23 @@ if (!devEnv.NEXT_DIST_DIR && process.platform === "win32" && isOneDriveWorkspace
               retryDelay: 180
             });
           }
-        } else {
-          rmSync(localCacheRoot, {
-            recursive: true,
-            force: true,
-            maxRetries: 6,
-            retryDelay: 180
-          });
         }
-      }
 
-      if (recreateLink) {
-        symlinkSync(externalCacheRoot, localCacheRoot, "junction");
-      }
+        if (recreateLink) {
+          symlinkSync(externalCacheRoot, localCacheRoot, "junction");
+        }
 
-      mkdirSync(localDistAbsolute, { recursive: true });
-      devEnv.NEXT_DIST_DIR = localDistRelative;
-      console.log(
-        `[dev-singleton] Using Next.js cache outside OneDrive at ${externalCacheRoot}`
-      );
+        mkdirSync(localDistAbsolute, { recursive: true });
+        devEnv.NEXT_DIST_DIR = localDistRelative;
+        console.log(
+          `[dev-singleton] Using Next.js cache outside OneDrive at ${externalCacheRoot}`
+        );
+      }
     } catch (error) {
       console.warn(
         "Failed to initialize external Next.js cache junction. Falling back to workspace cache path.",
         error
       );
-      try {
-        const externalRelativeDist = resolveExternalRelativeDistDir(externalCacheRoot);
-        if (externalRelativeDist) {
-          devEnv.NEXT_DIST_DIR = externalRelativeDist;
-          console.log(
-            `[dev-singleton] Using direct external Next.js cache at ${resolve(
-              process.cwd(),
-              externalRelativeDist
-            )}`
-          );
-        }
-      } catch {
-        // Continue to workspace fallback below.
-      }
     }
   }
 
