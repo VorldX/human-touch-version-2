@@ -153,6 +153,29 @@ function looksLikeDraftDetailFillMessage(message: string) {
   );
 }
 
+function shouldAutofillSendDraftContent(input: {
+  message: string;
+  mergedArgs: Record<string, unknown>;
+  missing: string[];
+}) {
+  const needsSubject = input.missing.includes("subject");
+  const needsBody = input.missing.includes("body");
+  if (!needsSubject && !needsBody) {
+    return false;
+  }
+
+  const recipient = cleanText(input.mergedArgs.to || input.mergedArgs.recipient_email);
+  if (!recipient) {
+    return false;
+  }
+
+  const normalized = input.message.toLowerCase();
+  return (
+    /\b(meeting|google meet|gmeet|calendar|invite|invitation|agenda)\b/.test(normalized) ||
+    /\bsend\b[\s\S]{0,80}\b(details?|summary|update|minutes|note)\b/.test(normalized)
+  );
+}
+
 function summarizeGmailToolResponse(input: {
   action: string;
   data: Record<string, unknown>;
@@ -821,7 +844,30 @@ export async function POST(request: NextRequest) {
           args: gmailIntent.arguments,
           activeDraft
         });
-        const missing = listMissingDirectionSendFields(mergedSendArgs);
+        let missing = listMissingDirectionSendFields(mergedSendArgs);
+        if (
+          shouldAutofillSendDraftContent({
+            message,
+            mergedArgs: mergedSendArgs,
+            missing
+          })
+        ) {
+          const generatedTurn = draftTurn + 1;
+          const draftHandled = handleDirectionDraftIntent({
+            message,
+            args: mergedSendArgs,
+            activeDraft,
+            turn: generatedTurn
+          });
+          activeDraft = draftHandled.activeDraft;
+          draftTurn = generatedTurn;
+          mergedSendArgs = applyDirectionSendArgsFromActiveDraft({
+            args: mergedSendArgs,
+            activeDraft
+          });
+          missing = listMissingDirectionSendFields(mergedSendArgs);
+        }
+
         if (missing.length > 0) {
           return NextResponse.json({
             ok: true,

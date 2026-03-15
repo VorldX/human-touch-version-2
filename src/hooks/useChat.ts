@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ChatMessage, Feedback } from "@/src/types/chat";
+import type { AssistantMessageMeta, ChatMessage, Feedback } from "@/src/types/chat";
 
 function messageId(prefix: "u" | "a") {
   return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -141,11 +141,62 @@ export function useChat(input: {
     setActiveStreamId(null);
   }, [setActiveStreamId]);
 
+  const appendStructuredMessage = useCallback((payload: {
+    content?: string;
+    meta: AssistantMessageMeta;
+  }) => {
+    if (!payload?.meta) {
+      return;
+    }
+
+    const content = typeof payload.content === "string" ? payload.content : "";
+    const activeId = streamMessageIdRef.current;
+    let mappedIntoActiveStream = false;
+
+    setMessages((prev) => {
+      if (activeId) {
+        const target = prev.find((msg) => msg.id === activeId);
+        if (target && (target.content ?? "").trim().length === 0) {
+          mappedIntoActiveStream = true;
+          return prev.map((msg) =>
+            msg.id === activeId
+              ? {
+                  ...msg,
+                  content,
+                  isStreaming: false,
+                  meta: payload.meta
+                }
+              : msg
+          );
+        }
+      }
+
+      return [
+        ...prev,
+        {
+          id: messageId("a"),
+          role: "assistant",
+          content,
+          createdAt: Date.now(),
+          feedback: null,
+          meta: payload.meta
+        }
+      ];
+    });
+
+    if (mappedIntoActiveStream) {
+      setIsResponding(false);
+      setIsWaitingFirstToken(false);
+      setActiveStreamId(null);
+    }
+  }, [setActiveStreamId]);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     window.sendMessageToUI = appendToken;
     window.completeMessageToUI = completeStream;
     window.showErrorInUI = showError;
+    window.appendStructuredMessageToUI = appendStructuredMessage;
 
     return () => {
       if (window.sendMessageToUI === appendToken) {
@@ -157,8 +208,11 @@ export function useChat(input: {
       if (window.showErrorInUI === showError) {
         delete window.showErrorInUI;
       }
+      if (window.appendStructuredMessageToUI === appendStructuredMessage) {
+        delete window.appendStructuredMessageToUI;
+      }
     };
-  }, [appendToken, completeStream, showError]);
+  }, [appendStructuredMessage, appendToken, completeStream, showError]);
 
   const sendUserMessage = useCallback((rawText: string) => {
     const text = rawText.trim();

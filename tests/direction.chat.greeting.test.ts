@@ -66,6 +66,15 @@ test("preserves gmail send intent even when details are incomplete", () => {
   assert.equal(inferred?.arguments.body, undefined);
 });
 
+test("infers send intent from explicit recipient email even without mailbox keyword", () => {
+  const inferred = inferDirectionChatGmailIntent(
+    "send meeting details to jane@yahoo.com tomorrow"
+  );
+  assert.ok(inferred);
+  assert.equal(inferred?.action, "SEND_EMAIL");
+  assert.equal(inferred?.arguments.to, "jane@yahoo.com");
+});
+
 test("routes draft wording to deterministic draft intent (not send)", () => {
   const inferred = inferDirectionChatGmailIntent(
     "draft a mail for congratulating my brother for his new role"

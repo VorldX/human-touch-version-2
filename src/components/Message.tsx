@@ -36,6 +36,7 @@ export function Message(input: {
           content={message.content}
           isStreaming={Boolean(message.isStreaming)}
           isError={message.isError}
+          meta={message.meta}
         />
       )}
     </div>

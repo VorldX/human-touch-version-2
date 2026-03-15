@@ -58,6 +58,7 @@ import { classifyEmailDraftReply } from "@/lib/agent/run/email-request-parser";
 import { getRealtimeClient } from "@/lib/realtime/client";
 import type { AppTheme } from "@/lib/store/vorldx-store";
 import { useVorldXStore } from "@/lib/store/vorldx-store";
+import type { AssistantMessageMeta, WorkflowTaskStatus } from "@/src/types/chat";
 import { enrichMessageForIntent } from "@/src/utils/intentDetector";
 
 type NavGroupId = "operate" | "manage";
@@ -199,6 +200,7 @@ interface DirectionTurn {
   role: "owner" | "organization";
   content: string;
   modelLabel?: string;
+  meta?: AssistantMessageMeta;
 }
 
 type MissionCadence = "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
@@ -420,6 +422,98 @@ function formatDraftForChat(draft: { to: string; subject: string; body: string }
     "",
     "Reply \"approve\" to send this email, or reply with edits."
   ].join("\n");
+}
+
+function makeDirectionTurnId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeWorkflowTaskStatus(status: unknown): WorkflowTaskStatus {
+  const normalized = typeof status === "string" ? status.trim().toUpperCase() : "";
+  if (
+    normalized === "QUEUED" ||
+    normalized === "RUNNING" ||
+    normalized === "PAUSED" ||
+    normalized === "COMPLETED" ||
+    normalized === "FAILED" ||
+    normalized === "ABORTED" ||
+    normalized === "DRAFT" ||
+    normalized === "ACTIVE"
+  ) {
+    return normalized;
+  }
+  return "UNKNOWN";
+}
+
+function compactTaskTitle(value: string, fallback: string) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return fallback;
+  return compact.length > 96 ? `${compact.slice(0, 93)}...` : compact;
+}
+
+function workflowAgentLabelFromTaskTrace(input: {
+  agent?: { name: string; role: string } | null;
+  executionTrace?: unknown;
+}) {
+  if (input.agent?.name && input.agent?.role) {
+    return `${input.agent.name} (${input.agent.role})`;
+  }
+  const trace =
+    input.executionTrace && typeof input.executionTrace === "object"
+      ? (input.executionTrace as Record<string, unknown>)
+      : null;
+  const runtime =
+    trace?.agentRuntime && typeof trace.agentRuntime === "object"
+      ? (trace.agentRuntime as Record<string, unknown>)
+      : null;
+  const logicalRole =
+    typeof runtime?.logicalRole === "string" && runtime.logicalRole.trim().length > 0
+      ? runtime.logicalRole.trim()
+      : "";
+  const logicalAgentId =
+    typeof runtime?.logicalAgentId === "string" && runtime.logicalAgentId.trim().length > 0
+      ? runtime.logicalAgentId.trim().slice(0, 8)
+      : "";
+  if (logicalRole && logicalAgentId) {
+    return `${logicalRole} (${logicalAgentId})`;
+  }
+  if (logicalRole) {
+    return logicalRole;
+  }
+  return undefined;
+}
+
+function buildPlanCardMeta(input: {
+  direction: string;
+  plan: DirectionExecutionPlan;
+  requiredToolkits: string[];
+}): AssistantMessageMeta {
+  const title = input.direction.trim()
+    ? `Plan For: ${compactTaskTitle(input.direction, "Direction")}`
+    : "Execution Plan";
+
+  return {
+    kind: "plan_card",
+    title,
+    summary: input.plan.summary?.trim() || input.plan.organizationFitSummary?.trim() || "",
+    detailScore:
+      typeof input.plan.detailScore === "number" && Number.isFinite(input.plan.detailScore)
+        ? Math.max(0, Math.min(100, Math.floor(input.plan.detailScore)))
+        : undefined,
+    requiredToolkits: input.requiredToolkits.slice(0, 16),
+    workflows: (input.plan.workflows ?? []).slice(0, 6).map((workflow, workflowIndex) => ({
+      title: workflow.title || `Workflow ${workflowIndex + 1}`,
+      goal: workflow.goal || "",
+      ownerRole: workflow.ownerRole || "",
+      tasks: (workflow.tasks ?? []).slice(0, 10).map((task, taskIndex) => ({
+        id: `wf${workflowIndex + 1}-task${taskIndex + 1}`,
+        title: compactTaskTitle(task.title || "", `Task ${taskIndex + 1}`),
+        status: "QUEUED",
+        agentLabel: task.ownerRole || workflow.ownerRole || "Agent",
+        dependsOn: (task.dependsOn ?? []).slice(0, 4)
+      }))
+    }))
+  };
 }
 
 type ControlMode = "MINDSTORM" | "DIRECTION";
@@ -874,6 +968,46 @@ async function parseJsonBody<T>(response: Response): Promise<{
   }
 }
 
+function normalizePlanAnalysisText(rawValue: string | null | undefined) {
+  const raw = typeof rawValue === "string" ? rawValue.trim() : "";
+  if (!raw) {
+    return "";
+  }
+
+  const fenceMatch = raw.match(/^```(?:json|markdown|md)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = (fenceMatch?.[1] ?? raw).trim();
+  if (!candidate) {
+    return "";
+  }
+
+  if (!candidate.startsWith("{") && !candidate.startsWith("[")) {
+    return candidate;
+  }
+
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (typeof parsed === "string") {
+      return parsed.trim();
+    }
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      let summary = "";
+      if (typeof record.analysis === "string") {
+        summary = record.analysis;
+      } else if (typeof record.summary === "string") {
+        summary = record.summary;
+      } else if (typeof record.message === "string") {
+        summary = record.message;
+      }
+      return summary.trim();
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
 export function VorldXShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -982,6 +1116,8 @@ export function VorldXShell() {
   const pipelinePolicyInFlightRef = useRef(false);
   const missionSchedulesInFlightRef = useRef(false);
   const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
+  const workflowSnapshotTimersRef = useRef<Map<string, number>>(new Map());
+  const workflowEventThrottleRef = useRef<Map<string, number>>(new Map());
   const [realtimeSessionId] = useState(
     () => `shell-${Math.random().toString(36).slice(2, 10)}`
   );
@@ -999,6 +1135,141 @@ export function VorldXShell() {
     () => summarizeHumanInputReason(pendingHumanInput?.reason),
     [pendingHumanInput?.reason]
   );
+
+  const appendStructuredOrganizationTurn = useCallback((input: {
+    content: string;
+    meta: AssistantMessageMeta;
+    modelLabel?: string;
+  }) => {
+    setDirectionTurns((prev) => [
+      ...prev,
+      {
+        id: makeDirectionTurnId("org"),
+        role: "organization",
+        content: input.content,
+        ...(input.modelLabel ? { modelLabel: input.modelLabel } : {}),
+        meta: input.meta
+      }
+    ]);
+  }, []);
+
+  const shouldEmitWorkflowEvent = useCallback((key: string, minIntervalMs = 1200) => {
+    const now = Date.now();
+    const last = workflowEventThrottleRef.current.get(key) ?? 0;
+    if (now - last < minIntervalMs) {
+      return false;
+    }
+    workflowEventThrottleRef.current.set(key, now);
+    return true;
+  }, []);
+
+  const appendWorkflowSnapshotTurn = useCallback(
+    async (flowId: string, titleOverride?: string) => {
+      if (!flowId) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/flows/${encodeURIComponent(flowId)}`, {
+          cache: "no-store",
+          credentials: "include"
+        });
+        const { payload } = await parseJsonBody<{
+          ok?: boolean;
+          flow?: {
+            id: string;
+            prompt?: string;
+            status?: string;
+            progress?: number;
+            updatedAt?: string;
+            tasks?: Array<{
+              id: string;
+              prompt: string;
+              status: string;
+              agent?: { name: string; role: string } | null;
+              executionTrace?: unknown;
+            }>;
+          };
+        }>(response);
+
+        if (!response.ok || !payload?.ok || !payload.flow?.id) {
+          return;
+        }
+
+        const flow = payload.flow;
+        const tasks = Array.isArray(flow.tasks) ? flow.tasks : [];
+        const completedCount = tasks.filter(
+          (task) => normalizeWorkflowTaskStatus(task.status) === "COMPLETED"
+        ).length;
+
+        appendStructuredOrganizationTurn({
+          content: `Workflow ${flow.id.slice(0, 8)} update: ${String(flow.status || "unknown").toLowerCase()} (${completedCount}/${tasks.length} tasks completed).`,
+          meta: {
+            kind: "workflow_graph",
+            title: titleOverride || compactTaskTitle(flow.prompt || "Workflow Runtime", "Workflow Runtime"),
+            flowId: flow.id,
+            status: flow.status || "UNKNOWN",
+            progress:
+              typeof flow.progress === "number" && Number.isFinite(flow.progress)
+                ? Math.max(0, Math.min(100, Math.floor(flow.progress)))
+                : undefined,
+            updatedAt:
+              typeof flow.updatedAt === "string" && flow.updatedAt.trim().length > 0
+                ? flow.updatedAt
+                : undefined,
+            taskCount: tasks.length,
+            completedCount,
+            tasks: tasks.slice(0, 16).map((task, index) => ({
+              id: task.id || `${flow.id}-task-${index + 1}`,
+              title: compactTaskTitle(task.prompt || "", `Task ${index + 1}`),
+              status: normalizeWorkflowTaskStatus(task.status),
+              agentLabel: workflowAgentLabelFromTaskTrace({
+                agent: task.agent ?? null,
+                executionTrace: task.executionTrace
+              })
+            }))
+          }
+        });
+      } catch {
+        // Snapshot rendering is best-effort and should never block core workflow operations.
+      }
+    },
+    [appendStructuredOrganizationTurn]
+  );
+
+  const queueWorkflowSnapshotTurn = useCallback(
+    (flowId: string, titleOverride?: string) => {
+      if (typeof window === "undefined" || !flowId) {
+        return;
+      }
+
+      const existingTimer = workflowSnapshotTimersRef.current.get(flowId);
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+
+      const timer = window.setTimeout(() => {
+        workflowSnapshotTimersRef.current.delete(flowId);
+        void appendWorkflowSnapshotTurn(flowId, titleOverride);
+      }, 420);
+
+      workflowSnapshotTimersRef.current.set(flowId, timer);
+    },
+    [appendWorkflowSnapshotTurn]
+  );
+
+  useEffect(() => {
+    const snapshotTimers = workflowSnapshotTimersRef;
+    return () => {
+      if (typeof window === "undefined") {
+        return;
+      }
+      for (const timer of snapshotTimers.current.values()) {
+        window.clearTimeout(timer);
+      }
+      snapshotTimers.current.clear();
+    };
+  }, []);
 
   const closeSearch = () => {
     setTimeout(() => setSearchOpen(false), 120);
@@ -1618,10 +1889,31 @@ export function VorldXShell() {
       return;
     }
 
+    const readPayload = (envelope: any) =>
+      envelope?.payload && typeof envelope.payload === "object"
+        ? (envelope.payload as Record<string, unknown>)
+        : {};
+
+    const readFlowId = (payload: Record<string, unknown>) => {
+      const flowId =
+        typeof payload.flowId === "string" && payload.flowId.trim().length > 0
+          ? payload.flowId.trim()
+          : typeof payload.branchFlowId === "string" && payload.branchFlowId.trim().length > 0
+            ? payload.branchFlowId.trim()
+            : "";
+      return flowId;
+    };
+
+    const readTaskId = (payload: Record<string, unknown>) =>
+      typeof payload.taskId === "string" && payload.taskId.trim().length > 0
+        ? payload.taskId.trim()
+        : "";
+
     const handleSignatureCaptured = (envelope: any) => {
       if (envelope?.orgId !== resolvedOrg.id) {
         return;
       }
+      const payload = readPayload(envelope);
       const senderId = envelope?.payload?.senderId;
       if (senderId && senderId === realtimeSessionId) {
         return;
@@ -1642,6 +1934,31 @@ export function VorldXShell() {
         }
         return Math.min(remoteRequiredSignatures, prev + 1);
       });
+
+      const flowId = readFlowId(payload);
+      if (shouldEmitWorkflowEvent(`signature:${flowId || "global"}`, 2200)) {
+        appendStructuredOrganizationTurn({
+          content:
+            approvalsProvided !== null
+              ? `Signature captured (${approvalsProvided}/${remoteRequiredSignatures}).`
+              : "A new launch signature was captured.",
+          meta: {
+            kind: "workflow_event",
+            title: "Signature Captured",
+            message:
+              approvalsProvided !== null
+                ? `Launch signatures now at ${approvalsProvided}/${remoteRequiredSignatures}.`
+                : "A launch signature was captured by another authorized user.",
+            eventName: "signature.captured",
+            flowId: flowId || undefined,
+            timestamp: Date.now()
+          }
+        });
+      }
+
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Launch Signature Progress");
+      }
     };
 
     const handleKillSwitch = (envelope: any) => {
@@ -1653,17 +1970,25 @@ export function VorldXShell() {
         text: "Kill switch broadcast received. Active missions aborted."
       });
       setSignatureApprovals(0);
+      appendStructuredOrganizationTurn({
+        content: "Kill switch triggered. Active workflows were aborted.",
+        meta: {
+          kind: "workflow_event",
+          title: "Kill Switch Triggered",
+          message: "All active missions were aborted for this organization.",
+          eventName: "kill-switch.triggered",
+          status: "ABORTED",
+          timestamp: Date.now()
+        }
+      });
     };
 
     const handleTaskPaused = (envelope: any) => {
       if (envelope?.orgId !== resolvedOrg.id) {
         return;
       }
-      const payload =
-        envelope?.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as Record<string, unknown>)
-          : {};
-      const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
+      const payload = readPayload(envelope);
+      const taskId = readTaskId(payload);
       if (!taskId) {
         return;
       }
@@ -1684,41 +2009,291 @@ export function VorldXShell() {
           ? `Connect ${integrationError.toolkit.trim().toLowerCase()} integration before resume.`
           : "";
       const reason = reasonFromPayload || reasonFromIntegration || "Human input required by agent.";
-      const flowId = typeof payload.flowId === "string" ? payload.flowId.trim() : "";
+      const flowId = readFlowId(payload);
       promptForHumanInput({
         taskId,
         flowId: flowId || null,
         reason
       });
+
+      if (shouldEmitWorkflowEvent(`task.paused:${taskId}`, 900)) {
+        appendStructuredOrganizationTurn({
+          content: `Task ${taskId.slice(0, 8)} paused: ${reason}`,
+          meta: {
+            kind: "workflow_event",
+            title: "Task Paused",
+            message: reason,
+            eventName: "task.paused",
+            flowId: flowId || undefined,
+            taskId,
+            status: "PAUSED",
+            timestamp: Date.now()
+          }
+        });
+      }
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Task Paused");
+      }
     };
 
     const handleTaskResumed = (envelope: any) => {
       if (envelope?.orgId !== resolvedOrg.id) {
         return;
       }
-      const payload =
-        envelope?.payload && typeof envelope.payload === "object"
-          ? (envelope.payload as Record<string, unknown>)
-          : {};
-      const taskId = typeof payload.taskId === "string" ? payload.taskId.trim() : "";
+      const payload = readPayload(envelope);
+      const taskId = readTaskId(payload);
       if (!taskId) {
         return;
       }
       setPendingHumanInput((current) => (current?.taskId === taskId ? null : current));
+      const flowId = readFlowId(payload);
+      if (shouldEmitWorkflowEvent(`task.resumed:${taskId}`, 900)) {
+        appendStructuredOrganizationTurn({
+          content: `Task ${taskId.slice(0, 8)} resumed.`,
+          meta: {
+            kind: "workflow_event",
+            title: "Task Resumed",
+            message: "Execution resumed after pause/human input.",
+            eventName: "task.resumed",
+            flowId: flowId || undefined,
+            taskId,
+            status: "RUNNING",
+            timestamp: Date.now()
+          }
+        });
+      }
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Task Resumed");
+      }
+    };
+
+    const handleFlowUpdated = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      if (!flowId || !shouldEmitWorkflowEvent(`flow.updated:${flowId}`, 1300)) {
+        return;
+      }
+      const status =
+        typeof payload.status === "string" && payload.status.trim().length > 0
+          ? payload.status.trim().toUpperCase()
+          : "UPDATED";
+      appendStructuredOrganizationTurn({
+        content: `Workflow ${flowId.slice(0, 8)} updated: ${status}.`,
+        meta: {
+          kind: "workflow_event",
+          title: "Workflow Updated",
+          message: `Workflow state changed to ${status}.`,
+          eventName: "flow.updated",
+          flowId,
+          status,
+          timestamp: Date.now()
+        }
+      });
+      queueWorkflowSnapshotTurn(flowId, "Workflow Update");
+    };
+
+    const handleFlowProgress = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      if (!flowId || !shouldEmitWorkflowEvent(`flow.progress:${flowId}`, 1800)) {
+        return;
+      }
+      const progress =
+        typeof payload.progress === "number" && Number.isFinite(payload.progress)
+          ? Math.max(0, Math.min(100, Math.floor(payload.progress)))
+          : null;
+      appendStructuredOrganizationTurn({
+        content:
+          progress !== null
+            ? `Workflow ${flowId.slice(0, 8)} progress: ${progress}%.`
+            : `Workflow ${flowId.slice(0, 8)} progress updated.`,
+        meta: {
+          kind: "workflow_event",
+          title: "Workflow Progress",
+          message:
+            progress !== null
+              ? `Execution progress reached ${progress}%.`
+              : "Execution progress changed.",
+          eventName: "flow.progress",
+          flowId,
+          status: "RUNNING",
+          timestamp: Date.now()
+        }
+      });
+      queueWorkflowSnapshotTurn(flowId, "Live Progress");
+    };
+
+    const handleTaskCompleted = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      const taskId = readTaskId(payload);
+      if (!taskId || !shouldEmitWorkflowEvent(`task.completed:${taskId}`, 900)) {
+        return;
+      }
+      const runtime =
+        payload.executionTrace && typeof payload.executionTrace === "object"
+          ? ((payload.executionTrace as Record<string, unknown>).agentRuntime as
+              | Record<string, unknown>
+              | undefined)
+          : undefined;
+      const logicalRole =
+        runtime && typeof runtime.logicalRole === "string" ? runtime.logicalRole.trim() : "";
+      appendStructuredOrganizationTurn({
+        content: `Task ${taskId.slice(0, 8)} completed${logicalRole ? ` by ${logicalRole}` : ""}.`,
+        meta: {
+          kind: "workflow_event",
+          title: "Task Completed",
+          message: "A workflow task finished successfully.",
+          eventName: "task.completed",
+          flowId: flowId || undefined,
+          taskId,
+          status: "COMPLETED",
+          ...(logicalRole ? { agentLabel: logicalRole } : {}),
+          timestamp: Date.now()
+        }
+      });
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Task Completed");
+      }
+    };
+
+    const handleTaskFailed = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      const taskId = readTaskId(payload);
+      if (!taskId || !shouldEmitWorkflowEvent(`task.failed:${taskId}`, 900)) {
+        return;
+      }
+      appendStructuredOrganizationTurn({
+        content: `Task ${taskId.slice(0, 8)} failed and needs intervention.`,
+        meta: {
+          kind: "workflow_event",
+          title: "Task Failed",
+          message: "A task failed during execution. Review context and resume or rewind.",
+          eventName: "task.failed",
+          flowId: flowId || undefined,
+          taskId,
+          status: "FAILED",
+          timestamp: Date.now()
+        }
+      });
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Failure Snapshot");
+      }
+    };
+
+    const handleAgentDelegated = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      const taskId = readTaskId(payload);
+      const toRole =
+        typeof payload.toRole === "string" && payload.toRole.trim().length > 0
+          ? payload.toRole.trim()
+          : "Specialist";
+      if (!shouldEmitWorkflowEvent(`agent.delegated:${taskId || flowId || toRole}`, 900)) {
+        return;
+      }
+      appendStructuredOrganizationTurn({
+        content: `Task delegated to ${toRole}.`,
+        meta: {
+          kind: "workflow_event",
+          title: "Agent Delegation",
+          message: `Main agent delegated execution to ${toRole}.`,
+          eventName: "agent.delegated",
+          flowId: flowId || undefined,
+          taskId: taskId || undefined,
+          ...(toRole ? { agentLabel: toRole } : {}),
+          timestamp: Date.now()
+        }
+      });
+      if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Delegation Update");
+      }
+    };
+
+    const handleFlowRewound = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      const payload = readPayload(envelope);
+      const flowId = readFlowId(payload);
+      const branchFlowId =
+        typeof payload.branchFlowId === "string" && payload.branchFlowId.trim().length > 0
+          ? payload.branchFlowId.trim()
+          : "";
+      if (!shouldEmitWorkflowEvent(`flow.rewound:${flowId || branchFlowId}`, 900)) {
+        return;
+      }
+      appendStructuredOrganizationTurn({
+        content: branchFlowId
+          ? `Workflow rewound. New branch ${branchFlowId.slice(0, 8)} created.`
+          : "Workflow rewound and branched from selected task.",
+        meta: {
+          kind: "workflow_event",
+          title: "Workflow Rewound",
+          message: branchFlowId
+            ? `A branch workflow was created: ${branchFlowId.slice(0, 8)}.`
+            : "A workflow branch was created from rewind.",
+          eventName: "flow.rewound",
+          flowId: branchFlowId || flowId || undefined,
+          status: "QUEUED",
+          timestamp: Date.now()
+        }
+      });
+      if (branchFlowId) {
+        queueWorkflowSnapshotTurn(branchFlowId, "Branched Workflow");
+      } else if (flowId) {
+        queueWorkflowSnapshotTurn(flowId, "Rewind Snapshot");
+      }
     };
 
     socket.on("signature.captured", handleSignatureCaptured);
     socket.on("kill-switch.triggered", handleKillSwitch);
+    socket.on("flow.updated", handleFlowUpdated);
+    socket.on("flow.progress", handleFlowProgress);
+    socket.on("task.completed", handleTaskCompleted);
+    socket.on("task.failed", handleTaskFailed);
+    socket.on("agent.delegated", handleAgentDelegated);
+    socket.on("flow.rewound", handleFlowRewound);
     socket.on("task.paused", handleTaskPaused);
     socket.on("task.resumed", handleTaskResumed);
 
     return () => {
       socket.off("signature.captured", handleSignatureCaptured);
       socket.off("kill-switch.triggered", handleKillSwitch);
+      socket.off("flow.updated", handleFlowUpdated);
+      socket.off("flow.progress", handleFlowProgress);
+      socket.off("task.completed", handleTaskCompleted);
+      socket.off("task.failed", handleTaskFailed);
+      socket.off("agent.delegated", handleAgentDelegated);
+      socket.off("flow.rewound", handleFlowRewound);
       socket.off("task.paused", handleTaskPaused);
       socket.off("task.resumed", handleTaskResumed);
     };
-  }, [promptForHumanInput, realtimeSessionId, requiredSignatures, resolvedOrg?.id]);
+  }, [
+    appendStructuredOrganizationTurn,
+    promptForHumanInput,
+    queueWorkflowSnapshotTurn,
+    realtimeSessionId,
+    requiredSignatures,
+    resolvedOrg?.id,
+    shouldEmitWorkflowEvent
+  ]);
 
   const searchResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -2302,7 +2877,7 @@ export function VorldXShell() {
         }
 
         const refinedDirection = payload.directionGiven?.trim() || direction;
-        const analysis = payload.analysis?.trim() ?? "";
+        const analysis = normalizePlanAnalysisText(payload.analysis);
         const planToolkitsRaw = [
           ...new Set(
             [
@@ -2329,6 +2904,14 @@ export function VorldXShell() {
           autoSquad: payload.autoSquad,
           directionRecord: payload.directionRecord,
           planRecord: payload.planRecord
+        });
+        appendStructuredOrganizationTurn({
+          content: `Plan prepared with ${payload.primaryPlan.workflows.length} workflows and ${payload.primaryPlan.workflows.reduce((sum, workflow) => sum + workflow.tasks.length, 0)} tasks.`,
+          meta: buildPlanCardMeta({
+            direction: refinedDirection,
+            plan: payload.primaryPlan,
+            requiredToolkits: planToolkits
+          })
         });
         setPendingPlanLaunchApproval({
           prompt: refinedDirection,
@@ -2402,6 +2985,7 @@ export function VorldXShell() {
       }
     },
     [
+      appendStructuredOrganizationTurn,
       directionModelId,
       directionTurns,
       ensureOrgAccessReady,
@@ -3342,6 +3926,33 @@ export function VorldXShell() {
             : `Flow ${payload.flow?.id ?? ""} queued successfully (${payload.flow?.status ?? "QUEUED"} | ${payload.flow?.executionMode ?? "MULTI_AGENT"}).`
         });
       }
+
+      const launchedFlowId =
+        typeof payload.flow?.id === "string" && payload.flow.id.trim().length > 0
+          ? payload.flow.id.trim()
+          : "";
+      if (launchedFlowId) {
+        appendStructuredOrganizationTurn({
+          content:
+            flowStatus === "DRAFT"
+              ? `Workflow ${launchedFlowId.slice(0, 8)} is waiting for signatures before execution.`
+              : `Workflow ${launchedFlowId.slice(0, 8)} is now running through agent tasks.`,
+          meta: {
+            kind: "workflow_event",
+            title: flowStatus === "DRAFT" ? "Workflow Awaiting Signatures" : "Workflow Launched",
+            message:
+              flowStatus === "DRAFT"
+                ? `Flow ${launchedFlowId.slice(0, 8)} created in draft mode. Capture remaining signatures to begin execution.`
+                : `Flow ${launchedFlowId.slice(0, 8)} queued. Live task graph is now tracking agent assignments and task progress.`,
+            eventName: flowStatus === "DRAFT" ? "flow.created" : "flow.queued",
+            flowId: launchedFlowId,
+            status: payload.flow?.status ?? "QUEUED",
+            timestamp: Date.now()
+          }
+        });
+        queueWorkflowSnapshotTurn(launchedFlowId, "Live Workflow Runtime");
+      }
+
       handleTabChange("flow");
     } catch (error) {
       setControlMessage({
@@ -3352,6 +3963,7 @@ export function VorldXShell() {
       setLaunchInFlight(false);
     }
   }, [
+    appendStructuredOrganizationTurn,
     intent,
     launchInFlight,
     agentRunId,
@@ -3370,6 +3982,7 @@ export function VorldXShell() {
     rejectedLaunchPermissionRequestCount,
     requiredSignatures,
     resolvedOrg?.id,
+    queueWorkflowSnapshotTurn,
     launchPermissionRequestIds,
     pipelinePolicy?.enforcePlanBeforeExecution,
     pipelinePolicy?.requireDetailedPlan,

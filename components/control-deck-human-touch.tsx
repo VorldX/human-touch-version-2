@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import { HumanTouchApp } from "@/src/App";
+import type { AssistantMessageMeta } from "@/src/types/chat";
 
 type ControlMode = "MINDSTORM" | "DIRECTION";
 type AppShellTheme = "APEX" | "VEDA" | "NEXUS";
@@ -11,6 +12,7 @@ interface DirectionTurn {
   id: string;
   role: "owner" | "organization";
   content: string;
+  meta?: AssistantMessageMeta;
 }
 
 interface ControlDeckHumanTouchProps {
@@ -104,6 +106,13 @@ export function ControlDeckHumanTouch(input: ControlDeckHumanTouchProps) {
 
     for (const turn of unseenTurns) {
       seenAssistantTurnsRef.current.add(turn.id);
+      if (turn.meta && window.appendStructuredMessageToUI) {
+        window.appendStructuredMessageToUI({
+          content: turn.content,
+          meta: turn.meta
+        });
+        continue;
+      }
       enqueueAssistantText(turn.content);
     }
   }, [enqueueAssistantText, turns]);

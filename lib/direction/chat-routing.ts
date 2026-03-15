@@ -354,9 +354,11 @@ export function inferDirectionChatGmailIntent(message: string): DirectionChatGma
     };
   }
 
+  const hasRecipientEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(message);
   const hasMailboxContext =
     /\b(gmail|email|emails|mail|inbox)\b/i.test(message) ||
-    /\b(last|latest|recent)\s+\d{0,2}\s*emails?\b/i.test(message);
+    /\b(last|latest|recent)\s+\d{0,2}\s*emails?\b/i.test(message) ||
+    hasRecipientEmail;
   if (!hasMailboxContext) {
     return null;
   }
@@ -389,7 +391,7 @@ export function inferDirectionChatGmailIntent(message: string): DirectionChatGma
 
   const sendIntent =
     /\b(send|submit|deliver)\b/.test(normalized) &&
-    /\b(email|mail|gmail)\b/.test(normalized);
+    (/\b(email|mail|gmail)\b/.test(normalized) || hasRecipientEmail);
   if (sendIntent) {
     const to = extractEmailByLabel(message, "to") || extractFirstEmail(message);
     const subject = extractSubjectFromMessage(message);
