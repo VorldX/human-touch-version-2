@@ -1,0 +1,95 @@
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    command: npm run dev
+    ports:
+      - "3002:3000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/vorldx?schema=public
+      REDIS_URL: redis://redis:6379
+      INNGEST_BASE_URL: http://inngest:8288
+      REALTIME_SERVER_URL: http://realtime:4001/emit
+      REALTIME_EMIT_TOKEN: dev_realtime_token
+      NEXT_PUBLIC_REALTIME_URL: http://localhost:4002
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      inngest:
+        condition: service_started
+      realtime:
+        condition: service_started
+
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vorldx
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vorldx"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  inngest:
+    image: inngest/inngest:latest
+    restart: unless-stopped
+    command: ["inngest", "dev", "--host", "0.0.0.0", "-u", "http://app:3000/api/inngest/serve", "--no-discovery"]
+    ports:
+      - "8289:8288"
+    environment:
+      INNGEST_DEV: "1"
+
+  realtime:
+    build:
+      context: .
+      target: dev
+    command: npm run realtime
+    ports:
+      - "4002:4001"
+    env_file:
+      - .env
+    environment:
+      REALTIME_PORT: 4001
+      REALTIME_EMIT_TOKEN: dev_realtime_token
+      REALTIME_CORS_ORIGIN: "*"
+    volumes:
+      - ./:/app
+      - /app/node_modules
+
+volumes:
+  pgdata:
+  redisdata:
+

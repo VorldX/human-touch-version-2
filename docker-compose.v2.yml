@@ -1,0 +1,22 @@
+services:
+  app:
+    ports:
+      - "3002:3000"
+    environment:
+      NEXT_PUBLIC_REALTIME_URL: http://localhost:4002
+
+  db:
+    ports:
+      - "5433:5432"
+
+  redis:
+    ports:
+      - "6380:6379"
+
+  inngest:
+    ports:
+      - "8289:8288"
+
+  realtime:
+    ports:
+      - "4002:4001"
