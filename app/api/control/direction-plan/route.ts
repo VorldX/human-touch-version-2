@@ -71,6 +71,20 @@ interface PlanDependency {
   reason: string;
 }
 
+type PathwayExecutionMode = "HUMAN" | "AGENT" | "HYBRID";
+
+interface PlanPathwayStep {
+  stepId: string;
+  line: number;
+  workflowTitle: string;
+  taskTitle: string;
+  ownerRole: string;
+  executionMode: PathwayExecutionMode;
+  trigger: string;
+  dueWindow: string;
+  dependsOn: string[];
+}
+
 interface ExecutionPlan {
   objective: string;
   organizationFitSummary: string;
@@ -80,6 +94,7 @@ interface ExecutionPlan {
   resourcePlan: PlanResourceAllocation[];
   approvalCheckpoints: PlanApprovalCheckpoint[];
   dependencies: PlanDependency[];
+  pathway: PlanPathwayStep[];
   workflows: PlanWorkflow[];
   risks: string[];
   successMetrics: string[];
@@ -356,6 +371,135 @@ function normalizePlanDependency(raw: unknown): PlanDependency | null {
   };
 }
 
+function normalizePathwayExecutionMode(value: unknown): PathwayExecutionMode {
+  const normalized = cleanText(value).toUpperCase();
+  if (normalized === "HUMAN") return "HUMAN";
+  if (normalized === "AGENT") return "AGENT";
+  return "HYBRID";
+}
+
+function inferPathwayExecutionMode(input: {
+  ownerRole: string;
+  workflowOwnerType?: WorkforceType;
+}): PathwayExecutionMode {
+  const role = input.ownerRole.toLowerCase();
+  if (
+    /\b(main[_\s-]?agent|worker|agent|bot|ai|automation|orchestrator)\b/.test(role)
+  ) {
+    return "AGENT";
+  }
+  if (
+    /\b(founder|admin|employee|manager|lead|director|human)\b/.test(role)
+  ) {
+    return "HUMAN";
+  }
+  if (input.workflowOwnerType === "AGENT") return "AGENT";
+  if (input.workflowOwnerType === "HUMAN") return "HUMAN";
+  return "HYBRID";
+}
+
+function normalizePathwayStep(raw: unknown, index: number): PlanPathwayStep | null {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const workflowTitle = cleanText(record.workflowTitle);
+  const taskTitle = cleanText(record.taskTitle);
+  const ownerRole = cleanText(record.ownerRole);
+  if (!workflowTitle || !taskTitle) {
+    return null;
+  }
+  return {
+    stepId: cleanText(record.stepId) || `pathway-step-${index + 1}`,
+    line: toBoundedNumber(record.line, index + 1, 1, 999),
+    workflowTitle,
+    taskTitle,
+    ownerRole: ownerRole || "EMPLOYEE",
+    executionMode: normalizePathwayExecutionMode(record.executionMode),
+    trigger: cleanText(record.trigger) || (index === 0 ? "Immediate after plan approval" : "After previous step completion"),
+    dueWindow: cleanText(record.dueWindow) || "Same execution window",
+    dependsOn: normalizeStringList(record.dependsOn, [])
+  };
+}
+
+function buildDeterministicPathway(plan: ExecutionPlan): PlanPathwayStep[] {
+  const steps: PlanPathwayStep[] = [];
+  let line = 1;
+
+  for (const workflow of plan.workflows) {
+    for (const task of workflow.tasks) {
+      const ownerRole = task.ownerRole || workflow.ownerRole || "EMPLOYEE";
+      steps.push({
+        stepId: `pathway-step-${line}`,
+        line,
+        workflowTitle: workflow.title,
+        taskTitle: task.title,
+        ownerRole,
+        executionMode: inferPathwayExecutionMode({
+          ownerRole,
+          workflowOwnerType: workflow.ownerType
+        }),
+        trigger: line === 1 ? "Immediate after plan approval" : "After previous step completion",
+        dueWindow: line === 1 ? "Start window" : "Same execution window",
+        dependsOn: task.dependsOn.slice(0, 6)
+      });
+      line += 1;
+    }
+  }
+
+  return steps;
+}
+
+function ensurePlanPathway(plan: ExecutionPlan) {
+  if (plan.pathway.length === 0) {
+    plan.pathway = buildDeterministicPathway(plan);
+    return;
+  }
+
+  const knownStepKeys = new Set(
+    plan.pathway.map((step) => `${step.workflowTitle.toLowerCase()}::${step.taskTitle.toLowerCase()}`)
+  );
+  const missing: PlanPathwayStep[] = [];
+  let nextLine = plan.pathway.length + 1;
+  for (const workflow of plan.workflows) {
+    for (const task of workflow.tasks) {
+      const key = `${workflow.title.toLowerCase()}::${task.title.toLowerCase()}`;
+      if (knownStepKeys.has(key)) {
+        continue;
+      }
+      const ownerRole = task.ownerRole || workflow.ownerRole || "EMPLOYEE";
+      missing.push({
+        stepId: `pathway-step-${nextLine}`,
+        line: nextLine,
+        workflowTitle: workflow.title,
+        taskTitle: task.title,
+        ownerRole,
+        executionMode: inferPathwayExecutionMode({
+          ownerRole,
+          workflowOwnerType: workflow.ownerType
+        }),
+        trigger: "After dependency readiness",
+        dueWindow: "Execution window",
+        dependsOn: task.dependsOn.slice(0, 6)
+      });
+      nextLine += 1;
+    }
+  }
+
+  if (missing.length > 0) {
+    plan.pathway = [...plan.pathway, ...missing];
+  }
+
+  plan.pathway = plan.pathway
+    .sort((a, b) => a.line - b.line)
+    .map((step, index) => ({
+      ...step,
+      line: index + 1,
+      stepId: step.stepId || `pathway-step-${index + 1}`
+    }))
+    .slice(0, 120);
+}
+
 function normalizeTask(raw: unknown): PlanTask {
   const record =
     raw && typeof raw === "object" && !Array.isArray(raw)
@@ -434,6 +578,12 @@ function normalizePlan(raw: unknown): ExecutionPlan {
         .filter((item): item is PlanDependency => Boolean(item))
         .slice(0, 20)
     : [];
+  const pathway = Array.isArray(record.pathway)
+    ? record.pathway
+        .map((item, index) => normalizePathwayStep(item, index))
+        .filter((item): item is PlanPathwayStep => Boolean(item))
+        .slice(0, 120)
+    : [];
   return {
     objective: cleanText(record.objective),
     organizationFitSummary: cleanText(record.organizationFitSummary),
@@ -443,6 +593,7 @@ function normalizePlan(raw: unknown): ExecutionPlan {
     resourcePlan,
     approvalCheckpoints,
     dependencies,
+    pathway,
     workflows: rawWorkflows.map((item) => normalizeWorkflow(item)).slice(0, 12),
     risks: normalizeStringList(record.risks, []),
     successMetrics: normalizeStringList(record.successMetrics, []),
@@ -733,6 +884,7 @@ function hydratePlanDetailSections(plan: ExecutionPlan, direction: string, fallb
     }
   }
 
+  ensurePlanPathway(plan);
   plan.detailScore = computePlanDetailScore(plan);
 }
 
@@ -892,6 +1044,9 @@ function hasPlannerQualityIssues(input: { primaryPlan: ExecutionPlan; fallbackPl
   if (input.primaryPlan.resourcePlan.length < 1 || input.primaryPlan.approvalCheckpoints.length < 1) {
     issues.push("Primary plan must include resource plan and approval checkpoints.");
   }
+  if (input.primaryPlan.pathway.length < 1) {
+    issues.push("Primary plan must include pathway sequencing.");
+  }
   if (primaryToolCoverage < Math.max(1, Math.floor(input.primaryPlan.workflows.length / 2))) {
     issues.push("Primary plan tool mapping is insufficient across workflows.");
   }
@@ -911,6 +1066,9 @@ function hasPlannerQualityIssues(input: { primaryPlan: ExecutionPlan; fallbackPl
   }
   if (fallbackToolCoverage < 1) {
     issues.push("Fallback plan must keep at least one workflow with explicit tool mapping.");
+  }
+  if (input.fallbackPlan.pathway.length < 1) {
+    issues.push("Fallback plan must include pathway sequencing.");
   }
   if (
     primaryTaskCount <= 1 &&

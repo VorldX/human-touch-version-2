@@ -50,6 +50,7 @@ interface LaunchFlowRequest {
   planId?: string;
   fallbackPlanId?: string;
   planWorkflows?: unknown;
+  planPathway?: unknown;
   executionMode?: "ECO" | "BALANCED" | "TURBO";
   swarmDensity?: number;
   predictedBurn?: number;
@@ -61,6 +62,8 @@ interface LaunchFlowRequest {
 
 interface LaunchPlanTaskInput {
   title: string;
+  ownerRole?: string;
+  dependsOn?: string[];
   subtasks: string[];
   tools: string[];
 }
@@ -68,7 +71,35 @@ interface LaunchPlanTaskInput {
 interface LaunchPlanWorkflowInput {
   title: string;
   goal: string;
+  ownerRole?: string;
   tasks: LaunchPlanTaskInput[];
+}
+
+type LaunchPathwayExecutionMode = "HUMAN" | "AGENT" | "HYBRID";
+
+interface LaunchPlanPathwayStepInput {
+  stepId: string;
+  line: number;
+  workflowTitle: string;
+  taskTitle: string;
+  ownerRole: string;
+  executionMode: LaunchPathwayExecutionMode;
+  trigger: string;
+  dueWindow: string;
+  dependsOn: string[];
+}
+
+interface LaunchTaskPlanStep {
+  prompt: string;
+  isPlanningStep: boolean;
+  workflowTitle?: string;
+  taskTitle?: string;
+  ownerRole?: string;
+  executionMode?: LaunchPathwayExecutionMode;
+  trigger?: string;
+  dueWindow?: string;
+  dependsOn: string[];
+  toolkits: string[];
 }
 
 interface PlanPolicySummary {
@@ -200,15 +231,24 @@ function parsePlanWorkflows(value: unknown): LaunchPlanWorkflowInput[] {
       const workflow = asRecord(item);
       const title = compactText(typeof workflow.title === "string" ? workflow.title : "Workflow");
       const goal = compactText(typeof workflow.goal === "string" ? workflow.goal : "");
+      const ownerRole = compactText(
+        typeof workflow.ownerRole === "string" ? workflow.ownerRole : ""
+      );
       const rawTasks = Array.isArray(workflow.tasks) ? workflow.tasks : [];
       const tasks = rawTasks
         .map((rawTask) => {
           const task = asRecord(rawTask);
           const taskTitle = compactText(typeof task.title === "string" ? task.title : "Task");
+          const taskOwnerRole = compactText(
+            typeof task.ownerRole === "string" ? task.ownerRole : ""
+          );
+          const dependsOn = normalizeTextList(task.dependsOn, 10);
           const subtasks = normalizeTextList(task.subtasks, 6);
           const tools = parseRequestedToolkits(task.tools);
           return {
             title: taskTitle,
+            ownerRole: taskOwnerRole || undefined,
+            dependsOn,
             subtasks,
             tools
           };
@@ -219,11 +259,68 @@ function parsePlanWorkflows(value: unknown): LaunchPlanWorkflowInput[] {
       return {
         title,
         goal,
+        ownerRole: ownerRole || undefined,
         tasks
       };
     })
     .filter((workflow) => workflow.tasks.length > 0)
     .slice(0, 10);
+}
+
+function normalizePathwayExecutionMode(value: unknown): LaunchPathwayExecutionMode {
+  const normalized =
+    typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (normalized === "HUMAN") return "HUMAN";
+  if (normalized === "AGENT") return "AGENT";
+  return "HYBRID";
+}
+
+function parsePlanPathway(value: unknown): LaunchPlanPathwayStepInput[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item, index) => {
+      const step = asRecord(item);
+      const workflowTitle = compactText(
+        typeof step.workflowTitle === "string" ? step.workflowTitle : ""
+      );
+      const taskTitle = compactText(
+        typeof step.taskTitle === "string" ? step.taskTitle : ""
+      );
+      if (!workflowTitle || !taskTitle) {
+        return null;
+      }
+      const ownerRole = compactText(
+        typeof step.ownerRole === "string" ? step.ownerRole : "EMPLOYEE"
+      );
+      const parsedLine = Number(step.line);
+      const line =
+        Number.isFinite(parsedLine) && parsedLine > 0
+          ? Math.floor(parsedLine)
+          : index + 1;
+      return {
+        stepId:
+          compactText(typeof step.stepId === "string" ? step.stepId : "") ||
+          `pathway-step-${line}`,
+        line,
+        workflowTitle,
+        taskTitle,
+        ownerRole: ownerRole || "EMPLOYEE",
+        executionMode: normalizePathwayExecutionMode(step.executionMode),
+        trigger:
+          compactText(typeof step.trigger === "string" ? step.trigger : "") ||
+          (line === 1 ? "Immediate after plan approval" : "After previous step completion"),
+        dueWindow:
+          compactText(typeof step.dueWindow === "string" ? step.dueWindow : "") ||
+          "Execution window",
+        dependsOn: normalizeTextList(step.dependsOn, 10)
+      } satisfies LaunchPlanPathwayStepInput;
+    })
+    .filter((item): item is LaunchPlanPathwayStepInput => Boolean(item))
+    .sort((a, b) => a.line - b.line)
+    .slice(0, 120);
 }
 
 function summarizePlanForPolicy(value: unknown): PlanPolicySummary {
@@ -348,49 +445,104 @@ function collectPlanWorkflowToolkits(workflows: LaunchPlanWorkflowInput[]) {
 function buildTaskPlan(
   prompt: string,
   swarmDensity: number,
-  planWorkflows: LaunchPlanWorkflowInput[]
-) {
+  planWorkflows: LaunchPlanWorkflowInput[],
+  pathway: LaunchPlanPathwayStepInput[]
+): LaunchTaskPlanStep[] {
   if (planWorkflows.length > 0) {
     const mission = compactText(prompt);
     const workflowToolkits = collectPlanWorkflowToolkits(planWorkflows);
     const missionToolkits = [
       ...new Set([...inferRequestedToolkits(mission), ...workflowToolkits])
     ];
-    const planStep = `Main Agent planning phase: execute approved direction workflows, dependencies, and tool constraints. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`;
-    const executionSteps: string[] = [];
+    const planStep: LaunchTaskPlanStep = {
+      prompt: `Main Agent planning phase: execute approved direction workflows, dependencies, and tool constraints. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`,
+      isPlanningStep: true,
+      dependsOn: [],
+      toolkits: missionToolkits
+    };
 
-    for (const workflow of planWorkflows) {
-      for (const task of workflow.tasks) {
-        const details = [
-          workflow.title ? `Workflow: ${workflow.title}` : "",
-          workflow.goal ? `Goal: ${workflow.goal}` : "",
-          `Task: ${task.title}`,
-          task.subtasks.length > 0
-            ? `Subtasks: ${task.subtasks.join(" | ")}`
-            : ""
-        ]
-          .filter(Boolean)
-          .join(" | ");
-        const toolkits =
-          task.tools.length > 0
-            ? task.tools
-            : inferRequestedToolkits(`${workflow.title} ${workflow.goal} ${task.title}`);
+    const workflowByTitle = new Map(
+      planWorkflows.map((workflow) => [workflow.title.trim().toLowerCase(), workflow] as const)
+    );
+    const fallbackPathway: LaunchPlanPathwayStepInput[] = planWorkflows.flatMap(
+      (workflow, workflowIndex) =>
+        workflow.tasks.map((task, taskIndex) => ({
+          stepId: `wf-${workflowIndex + 1}-task-${taskIndex + 1}`,
+          line: workflowIndex * 100 + taskIndex + 1,
+          workflowTitle: workflow.title,
+          taskTitle: task.title,
+          ownerRole: task.ownerRole || workflow.ownerRole || "EMPLOYEE",
+          executionMode: "HYBRID",
+          trigger:
+            workflowIndex === 0 && taskIndex === 0
+              ? "Immediate after plan approval"
+              : "After previous step completion",
+          dueWindow: "Execution window",
+          dependsOn: task.dependsOn ?? []
+        }))
+    );
+    const pathwaySteps = pathway.length > 0 ? pathway : fallbackPathway;
+    const executionSteps: LaunchTaskPlanStep[] = [];
 
-        executionSteps.push(`${details} | ${formatToolkitMarker(toolkits)}`);
-      }
+    for (const pathwayStep of pathwaySteps) {
+      const workflow = workflowByTitle.get(pathwayStep.workflowTitle.trim().toLowerCase());
+      const matchingTask = workflow?.tasks.find(
+        (task) => task.title.trim().toLowerCase() === pathwayStep.taskTitle.trim().toLowerCase()
+      );
+      const details = [
+        pathwayStep.workflowTitle ? `Workflow: ${pathwayStep.workflowTitle}` : "",
+        workflow?.goal ? `Goal: ${workflow.goal}` : "",
+        `Task: ${pathwayStep.taskTitle}`,
+        matchingTask?.subtasks && matchingTask.subtasks.length > 0
+          ? `Subtasks: ${matchingTask.subtasks.join(" | ")}`
+          : "",
+        pathwayStep.trigger ? `Trigger: ${pathwayStep.trigger}` : "",
+        pathwayStep.dueWindow ? `Window: ${pathwayStep.dueWindow}` : "",
+        pathwayStep.ownerRole ? `Owner: ${pathwayStep.ownerRole}` : ""
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      const toolkits =
+        matchingTask?.tools && matchingTask.tools.length > 0
+          ? matchingTask.tools
+          : inferRequestedToolkits(
+              `${pathwayStep.workflowTitle} ${pathwayStep.taskTitle} ${details}`
+            );
+
+      executionSteps.push({
+        prompt: `${details} | ${formatToolkitMarker(toolkits)}`,
+        isPlanningStep: false,
+        workflowTitle: pathwayStep.workflowTitle,
+        taskTitle: pathwayStep.taskTitle,
+        ownerRole:
+          pathwayStep.ownerRole ||
+          matchingTask?.ownerRole ||
+          workflow?.ownerRole ||
+          undefined,
+        executionMode: pathwayStep.executionMode,
+        trigger: pathwayStep.trigger,
+        dueWindow: pathwayStep.dueWindow,
+        dependsOn:
+          pathwayStep.dependsOn.length > 0
+            ? pathwayStep.dependsOn
+            : matchingTask?.dependsOn ?? [],
+        toolkits
+      });
     }
 
-    const cappedSteps = executionSteps.slice(
-      0,
-      Math.min(24, Math.max(3, swarmDensity + 2))
-    );
+    const cappedSteps = executionSteps.slice(0, Math.min(24, Math.max(3, swarmDensity + 2)));
     return [planStep, ...cappedSteps];
   }
 
-  const executionSteps = splitDirectionIntoTasks(prompt, swarmDensity);
   const mission = compactText(prompt);
   const missionToolkits = inferRequestedToolkits(mission);
-  const planStep = `Main Agent planning phase: break this mission into ordered subtasks, dependencies, and required toolkit access before execution. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`;
+  const planStep: LaunchTaskPlanStep = {
+    prompt: `Main Agent planning phase: break this mission into ordered subtasks, dependencies, and required toolkit access before execution. Mission: ${mission} | ${formatToolkitMarker(missionToolkits)}`,
+    isPlanningStep: true,
+    dependsOn: [],
+    toolkits: missionToolkits
+  };
+  const executionSteps = splitDirectionIntoTasks(prompt, swarmDensity);
 
   return [
     planStep,
@@ -398,9 +550,82 @@ function buildTaskPlan(
       const inferredStepToolkits = inferRequestedToolkits(step);
       const stepToolkits =
         inferredStepToolkits.length > 0 ? inferredStepToolkits : missionToolkits;
-      return `Execution step ${index + 1}: ${step} | ${formatToolkitMarker(stepToolkits)}`;
+      return {
+        prompt: `Execution step ${index + 1}: ${step} | ${formatToolkitMarker(stepToolkits)}`,
+        isPlanningStep: false,
+        dependsOn: [],
+        toolkits: stepToolkits
+      } satisfies LaunchTaskPlanStep;
     })
   ];
+}
+
+function scoreAgentRoleAffinity(
+  agent: { role: string; name?: string | null; expertise?: string | null },
+  ownerRole: string | undefined
+) {
+  if (!ownerRole || !ownerRole.trim()) return 0;
+  const normalizedOwnerRole = ownerRole.toLowerCase();
+  const agentText = `${agent.role} ${agent.name ?? ""} ${agent.expertise ?? ""}`.toLowerCase();
+  if (agentText.includes(normalizedOwnerRole)) {
+    return 3;
+  }
+  const ownerTokens = normalizedOwnerRole
+    .split(/[^a-z0-9]+/g)
+    .filter((token) => token.length >= 3);
+  return ownerTokens.reduce((score, token) => (agentText.includes(token) ? score + 1 : score), 0);
+}
+
+function pickAgentForStep(input: {
+  step: LaunchTaskPlanStep;
+  index: number;
+  mainAgent: { id: string; role: string; name: string | null; expertise: string | null } | null;
+  activeAgents: Array<{ id: string; role: string; name: string | null; expertise: string | null }>;
+  assignmentPool: Array<{ id: string; role: string; name: string | null; expertise: string | null }>;
+}) {
+  const { step, index, mainAgent, activeAgents, assignmentPool } = input;
+
+  if (step.isPlanningStep) {
+    return mainAgent;
+  }
+
+  const roleHint = step.ownerRole?.trim().toLowerCase() ?? "";
+  if (mainAgent && /\b(main|boss|orchestrator)\b/.test(roleHint)) {
+    return mainAgent;
+  }
+
+  const roleCandidates = activeAgents
+    .map((agent) => ({
+      agent,
+      score: scoreAgentRoleAffinity(agent, step.ownerRole)
+    }))
+    .sort((left, right) => right.score - left.score);
+  if (roleCandidates[0] && roleCandidates[0].score > 0) {
+    return roleCandidates[0].agent;
+  }
+
+  const specialtyHints = inferTaskSpecialtyHints(step.prompt);
+  const specialistPool =
+    mainAgent && index > 0
+      ? activeAgents.filter((agent) => agent.id !== mainAgent.id)
+      : activeAgents;
+  const specialistCandidate =
+    specialtyHints.length > 0
+      ? specialistPool
+          .map((agent) => ({
+            agent,
+            score: scoreAgentSpecialty(agent, specialtyHints)
+          }))
+          .sort((a, b) => b.score - a.score)[0]
+      : null;
+  if (specialistCandidate && specialistCandidate.score > 0) {
+    return specialistCandidate.agent;
+  }
+
+  if (assignmentPool.length > 0) {
+    return assignmentPool[index % assignmentPool.length];
+  }
+  return null;
 }
 
 function inferTaskSpecialtyHints(prompt: string) {
@@ -559,6 +784,7 @@ export async function POST(request: NextRequest) {
   const providedRequestedToolkits = parseRequestedToolkits(body.requestedToolkits);
   const providedPermissionRequestIds = parseStringList(body.permissionRequestIds, 64);
   const parsedPlanWorkflows = parsePlanWorkflows(body.planWorkflows);
+  const parsedPlanPathway = parsePlanPathway(body.planPathway);
 
   if (!orgId || !prompt || !swarmDensity || !predictedBurn || !requiredSignatures) {
     return NextResponse.json(
@@ -934,10 +1160,17 @@ export async function POST(request: NextRequest) {
       ? [mainAgent, ...activeAgents.filter((agent) => agent.id !== mainAgent.id)]
       : [];
     const fallbackToMainOnly = assignmentPool.length === 0;
-    const taskPrompts = buildTaskPlan(prompt, swarmDensity, parsedPlanWorkflows);
+    const taskPlanSteps = buildTaskPlan(
+      prompt,
+      swarmDensity,
+      parsedPlanWorkflows,
+      parsedPlanPathway
+    );
     const promptInferredToolkits = inferRequestedToolkits(prompt);
     const planInferredToolkits = collectPlanWorkflowToolkits(parsedPlanWorkflows);
-    const subTaskInferredToolkits = taskPrompts.flatMap((step) => inferRequestedToolkits(step));
+    const subTaskInferredToolkits = taskPlanSteps.flatMap((step) =>
+      step.toolkits.length > 0 ? step.toolkits : inferRequestedToolkits(step.prompt)
+    );
     const requestedToolkits = [
       ...new Set([
         ...providedRequestedToolkits,
@@ -949,10 +1182,11 @@ export async function POST(request: NextRequest) {
 
     if (pipelinePolicy.enforceSpecialistToolAssignment) {
       const specialistGaps: Array<{ step: number; hints: string[] }> = [];
-      for (let index = 1; index < taskPrompts.length; index += 1) {
-        const stepPrompt = taskPrompts[index];
-        const specialtyHints = inferTaskSpecialtyHints(stepPrompt);
-        const toolkitHints = inferRequestedToolkits(stepPrompt);
+      for (let index = 1; index < taskPlanSteps.length; index += 1) {
+        const step = taskPlanSteps[index];
+        const specialtyHints = inferTaskSpecialtyHints(step.prompt);
+        const toolkitHints =
+          step.toolkits.length > 0 ? step.toolkits : inferRequestedToolkits(step.prompt);
         const hints = [...new Set([...specialtyHints, ...toolkitHints])];
         if (hints.length === 0) {
           continue;
@@ -1010,35 +1244,22 @@ export async function POST(request: NextRequest) {
       }
 
       const normalizedRunId = `r_${created.id}`;
-      for (let index = 0; index < taskPrompts.length; index += 1) {
-        const stepPrompt = taskPrompts[index];
-        const specialtyHints = inferTaskSpecialtyHints(stepPrompt);
-        const specialistPool =
-          mainAgent && index > 0
-            ? activeAgents.filter((agent) => agent.id !== mainAgent.id)
-            : activeAgents;
-        const specialistCandidate =
-          specialtyHints.length > 0
-            ? specialistPool
-                .map((agent) => ({
-                  agent,
-                  score: scoreAgentSpecialty(agent, specialtyHints)
-                }))
-                .sort((a, b) => b.score - a.score)[0]
-            : null;
-        const assignedAgent =
-          index === 0
-            ? mainAgent
-            : (specialistCandidate && specialistCandidate.score > 0
-                ? specialistCandidate.agent
-                : assignmentPool.length > 0
-                  ? assignmentPool[index % assignmentPool.length]
-                  : null);
-        const stepRequestedToolkits = inferRequestedToolkits(stepPrompt);
+      for (let index = 0; index < taskPlanSteps.length; index += 1) {
+        const step = taskPlanSteps[index];
+        const stepPrompt = step.prompt;
+        const assignedAgent = pickAgentForStep({
+          step,
+          index,
+          mainAgent,
+          activeAgents,
+          assignmentPool
+        });
+        const stepRequestedToolkits =
+          step.toolkits.length > 0 ? step.toolkits : inferRequestedToolkits(stepPrompt);
         const taskRequestedToolkits =
           stepRequestedToolkits.length > 0
             ? stepRequestedToolkits
-            : index === 0
+            : step.isPlanningStep
               ? requestedToolkits
               : promptInferredToolkits;
         const normalizedTaskId = `t_${randomUUID().slice(0, 10)}`;
@@ -1070,7 +1291,7 @@ export async function POST(request: NextRequest) {
             backoff_sec: 15
           },
           timeout_sec: 600,
-          priority: index === 0 ? "high" : "normal",
+          priority: step.isPlanningStep ? "high" : "normal",
           state: "PENDING",
           attempts: 0,
           created_at: nowIso,
@@ -1089,11 +1310,20 @@ export async function POST(request: NextRequest) {
               requestedToolkits: taskRequestedToolkits,
               initiatedByUserId,
               normalizedTask,
+              pathway: {
+                workflowTitle: step.workflowTitle ?? null,
+                taskTitle: step.taskTitle ?? null,
+                ownerRole: step.ownerRole ?? null,
+                executionMode: step.executionMode ?? null,
+                trigger: step.trigger ?? null,
+                dueWindow: step.dueWindow ?? null,
+                dependsOn: step.dependsOn
+              },
               orchestrator: {
                 mode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
-                stage: index === 0 ? "PLANNING" : "EXECUTION",
+                stage: step.isPlanningStep ? "PLANNING" : "EXECUTION",
                 stepIndex: index + 1,
-                totalSteps: taskPrompts.length,
+                totalSteps: taskPlanSteps.length,
                 strictPipelineMode: pipelineSettings.mode,
                 strictRules: {
                   requireDetailedPlan: pipelinePolicy.requireDetailedPlan,
@@ -1142,7 +1372,7 @@ export async function POST(request: NextRequest) {
             launchReady ? "queued" : "created in draft"
           }. Burn=${predictedBurn}, signatures=${requiredSignatures}, approvalsCaptured=${approvalsCaptured}, mode=${
             fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT"
-          }, planWorkflows=${parsedPlanWorkflows.length}, permissionRequests=${permissionRequestCounts.total}/${permissionRequestCounts.approved}, strictPipeline=${pipelineSettings.mode}, detailedPlanRule=${pipelinePolicy.requireDetailedPlan}, multiWorkflowRule=${pipelinePolicy.requireMultiWorkflowDecomposition}, specialistRule=${pipelinePolicy.enforceSpecialistToolAssignment}.`
+          }, planWorkflows=${parsedPlanWorkflows.length}, planPathway=${parsedPlanPathway.length}, permissionRequests=${permissionRequestCounts.total}/${permissionRequestCounts.approved}, strictPipeline=${pipelineSettings.mode}, detailedPlanRule=${pipelinePolicy.requireDetailedPlan}, multiWorkflowRule=${pipelinePolicy.requireMultiWorkflowDecomposition}, specialistRule=${pipelinePolicy.enforceSpecialistToolAssignment}.`
         }
       });
 
@@ -1179,12 +1409,13 @@ export async function POST(request: NextRequest) {
             requiredSignatures,
             approvalsCaptured,
             swarmDensity,
-            taskCount: taskPrompts.length,
+            taskCount: taskPlanSteps.length,
             requestedToolkits,
             initiatedByUserId,
             launchReady,
             executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
             planWorkflowCount: parsedPlanWorkflows.length,
+            planPathwayCount: parsedPlanPathway.length,
             permissionRequestCount: permissionRequestCounts.total,
             approvedPermissionRequestCount: permissionRequestCounts.approved
           }
@@ -1206,12 +1437,13 @@ export async function POST(request: NextRequest) {
             monthlyBtuCap: org.monthlyBtuCap,
             requiredSignatures,
             approvalsCaptured,
-            taskCount: taskPrompts.length,
+            taskCount: taskPlanSteps.length,
             requestedToolkits,
             initiatedByUserId,
             launchReady,
             executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
             planWorkflowCount: parsedPlanWorkflows.length,
+            planPathwayCount: parsedPlanPathway.length,
             permissionRequestCount: permissionRequestCounts.total,
             approvedPermissionRequestCount: permissionRequestCounts.approved
           }
@@ -1273,12 +1505,13 @@ export async function POST(request: NextRequest) {
         swarmDensity,
         predictedBurn,
         requiredSignatures,
-        taskCount: taskPrompts.length,
+        taskCount: taskPlanSteps.length,
         requestedToolkits,
         initiatedByUserId,
         executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
         orgExecutionMode,
         planWorkflowCount: parsedPlanWorkflows.length,
+        planPathwayCount: parsedPlanPathway.length,
         permissionRequestCount: permissionRequestCounts.total,
         approvedPermissionRequestCount: permissionRequestCounts.approved,
         strictPipelineMode: pipelineSettings.mode
@@ -1301,12 +1534,13 @@ export async function POST(request: NextRequest) {
                 swarmDensity,
                 predictedBurn,
                 requiredSignatures,
-                taskCount: taskPrompts.length,
+                taskCount: taskPlanSteps.length,
                 requestedToolkits,
                 initiatedByUserId,
                 executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",
                 orgExecutionMode,
                 planWorkflowCount: parsedPlanWorkflows.length,
+                planPathwayCount: parsedPlanPathway.length,
                 permissionRequestCount: permissionRequestCounts.total,
                 approvedPermissionRequestCount: permissionRequestCounts.approved,
                 strictPipelineMode: pipelineSettings.mode
@@ -1396,8 +1630,9 @@ export async function POST(request: NextRequest) {
           ...(directionId ? { directionId } : {}),
           ...(planId ? { planId } : {}),
           ...(fallbackPlanId ? { fallbackPlanId } : {}),
-          taskCount: taskPrompts.length,
+          taskCount: taskPlanSteps.length,
           planWorkflowCount: parsedPlanWorkflows.length,
+          planPathwayCount: parsedPlanPathway.length,
           permissionRequestCount: permissionRequestCounts.total,
           approvedPermissionRequestCount: permissionRequestCounts.approved,
           executionMode: fallbackToMainOnly ? "MAIN_AGENT_ONLY" : "MULTI_AGENT",

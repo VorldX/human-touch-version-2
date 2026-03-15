@@ -1,12 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
   Bell,
   Bot,
   Building2,
+  CalendarDays,
   Camera,
   Check,
   ChevronDown,
@@ -17,12 +18,9 @@ import {
   FileText,
   FolderOpen,
   Ghost,
-  Handshake,
   LayoutDashboard,
   LayoutGrid,
   Loader2,
-  LogOut,
-  Menu,
   Mic,
   MicOff,
   Paperclip,
@@ -33,18 +31,15 @@ import {
   Shield,
   Target,
   UserCheck,
-  UserCog,
   Users,
   Workflow,
-  X,
-  Zap
+  X
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
 import { OnboardingWizard } from "@/components/onboarding/onboarding-wizard";
-import { CollaborationConsole } from "@/components/collab/collab-console";
-import { ControlDeckHumanTouch } from "@/components/control-deck-human-touch";
+import { CalendarConsole } from "@/components/calendar/calendar-console";
 import { DirectionConsole } from "@/components/direction/direction-console";
 import { BlueprintConsole } from "@/components/blueprint/blueprint-console";
 import { HubConsole } from "@/components/hub/hub-console";
@@ -61,43 +56,139 @@ import { useVorldXStore } from "@/lib/store/vorldx-store";
 import type { AssistantMessageMeta, WorkflowTaskStatus } from "@/src/types/chat";
 import { enrichMessageForIntent } from "@/src/utils/intentDetector";
 
-type NavGroupId = "operate" | "manage";
-
 const NAV_ITEMS = [
   {
     id: "control",
     label: "Control Deck",
+    navLabel: "All Commands",
     helper: "Chat + approvals",
-    group: "operate",
+    primary: "FOCUS",
     icon: LayoutDashboard
+  },
+  {
+    id: "plan",
+    label: "Plan",
+    navLabel: "Plan",
+    helper: "Execution plan",
+    primary: "FOCUS",
+    icon: ClipboardList
+  },
+  {
+    id: "flow",
+    label: "Workflow",
+    navLabel: "Workflow",
+    helper: "Runtime",
+    primary: "FOCUS",
+    icon: Workflow
+  },
+  {
+    id: "direction",
+    label: "Command",
+    navLabel: "Pathway",
+    helper: "Command strategy",
+    primary: "FOCUS",
+    icon: Target
   },
   {
     id: "blueprint",
     label: "Blueprint",
+    navLabel: "Blueprint",
     helper: "Workforce graph",
-    group: "operate",
+    primary: "EXECUTION",
     icon: LayoutGrid
   },
   {
-    id: "direction",
-    label: "Direction",
-    helper: "Strategy",
-    group: "operate",
-    icon: Target
+    id: "hub",
+    label: "Hub",
+    navLabel: "Hub",
+    helper: "Data + tools",
+    primary: "EXECUTION",
+    icon: FolderOpen
   },
-  { id: "plan", label: "Plan", helper: "Execution plan", group: "operate", icon: ClipboardList },
-  { id: "flow", label: "Workflow", helper: "Runtime", group: "operate", icon: Workflow },
-  { id: "hub", label: "Hub", helper: "Data + tools", group: "manage", icon: FolderOpen },
-  { id: "squad", label: "Squad", helper: "People + agents", group: "manage", icon: Users },
-  { id: "memory", label: "Memory", helper: "Audit", group: "manage", icon: Database },
-  { id: "collab", label: "Collaboration", helper: "Marketplace", group: "manage", icon: Handshake },
-  { id: "settings", label: "Settings", helper: "Policies", group: "manage", icon: SettingsIcon }
+  {
+    id: "squad",
+    label: "Squad",
+    navLabel: "Squad",
+    helper: "People + agents",
+    primary: "EXECUTION",
+    icon: Users
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    navLabel: "Memory",
+    helper: "Audit",
+    primary: "GOVERNANCE",
+    icon: Database
+  },
+  {
+    id: "settings",
+    label: "Settings",
+    navLabel: "Settings",
+    helper: "Policies",
+    primary: "GOVERNANCE",
+    icon: SettingsIcon
+  },
+  {
+    id: "calendar",
+    label: "Calendar",
+    navLabel: "Calendar",
+    helper: "Mission schedules",
+    primary: "EXECUTION",
+    icon: CalendarDays
+  }
 ] as const;
 
-const NAV_GROUPS: Array<{ id: NavGroupId; label: string }> = [
-  { id: "operate", label: "Operate" },
-  { id: "manage", label: "Manage" }
-];
+const PRIMARY_WORKSPACE_TABS = [
+  {
+    id: "FOCUS",
+    label: "Focus",
+    helper: "Commands, planning, and pathway",
+    icon: Target
+  },
+  {
+    id: "EXECUTION",
+    label: "Execution",
+    helper: "Runtime, delivery, and orchestration",
+    icon: Workflow
+  },
+  {
+    id: "GOVERNANCE",
+    label: "Governance",
+    helper: "Policy, memory, and controls",
+    icon: Shield
+  }
+] as const;
+
+type NavItemId = (typeof NAV_ITEMS)[number]["id"];
+type PrimaryWorkspaceTabId = (typeof PRIMARY_WORKSPACE_TABS)[number]["id"];
+type WorkspaceMode = "BRAINSTORM" | "COMMAND" | "OPERATIONS" | "HUB" | "CALENDAR";
+
+const OPERATION_TAB_IDS = [
+  "plan",
+  "flow",
+  "direction",
+  "blueprint",
+  "squad",
+  "memory",
+  "settings"
+] as const;
+type OperationTabId = (typeof OPERATION_TAB_IDS)[number];
+const OPERATION_TAB_SET = new Set<string>(OPERATION_TAB_IDS);
+
+const DEFAULT_PRIMARY_TAB_SUBTAB: Record<PrimaryWorkspaceTabId, NavItemId> = {
+  FOCUS: "plan",
+  EXECUTION: "blueprint",
+  GOVERNANCE: "memory"
+};
+
+const NAV_ITEM_MAP = Object.fromEntries(
+  NAV_ITEMS.map((item) => [item.id, item])
+) as Record<NavItemId, (typeof NAV_ITEMS)[number]>;
+
+function getPrimaryWorkspaceTabForNavItem(tab: NavItemId): PrimaryWorkspaceTabId {
+  return NAV_ITEM_MAP[tab].primary;
+}
 
 const THEME_STYLES: Record<
   AppTheme,
@@ -285,6 +376,34 @@ interface PendingChatPlanRoute {
   prompt: string;
   reason: string;
   toolkitHints: string[];
+}
+
+interface ComposerAttachmentPayload {
+  files: File[];
+}
+
+interface ControlThreadHistoryItem {
+  id: string;
+  title: string;
+  mode: ControlMode;
+  updatedAt: number;
+  turns: DirectionTurn[];
+  directionGiven: string;
+  planningResult?: DirectionPlanningResult | null;
+  pendingPlanLaunchApproval?: PendingPlanLaunchApproval | null;
+  pendingToolkitApproval?: PendingToolkitApproval | null;
+  pendingEmailApproval?: PendingEmailApproval | null;
+  agentRunResult?: AgentRunResponse | null;
+  agentRunId?: string;
+  agentRunInputValues?: Record<string, string>;
+  agentRunPromptSnapshot?: string;
+  agentRunInputSourceUrl?: string;
+  launchScope?: {
+    directionId: string;
+    planId: string;
+    permissionRequestIds: string[];
+    flowIds: string[];
+  };
 }
 
 interface DirectionIntentRouting {
@@ -548,6 +667,18 @@ interface DirectionPlanWorkflow {
   tasks: DirectionPlanTask[];
 }
 
+interface DirectionPlanPathwayStep {
+  stepId: string;
+  line: number;
+  workflowTitle: string;
+  taskTitle: string;
+  ownerRole: string;
+  executionMode: "HUMAN" | "AGENT" | "HYBRID";
+  trigger: string;
+  dueWindow: string;
+  dependsOn: string[];
+}
+
 interface DirectionExecutionPlan {
   objective?: string;
   organizationFitSummary?: string;
@@ -578,6 +709,7 @@ interface DirectionExecutionPlan {
     toWorkflow: string;
     reason: string;
   }>;
+  pathway?: DirectionPlanPathwayStep[];
   workflows: DirectionPlanWorkflow[];
   risks: string[];
   successMetrics: string[];
@@ -604,6 +736,21 @@ interface PermissionRequestItem {
   decidedByUserId: string | null;
   decidedByEmail: string | null;
   decisionNote: string | null;
+}
+
+interface ApprovalCheckpointItem {
+  id: string;
+  orgId: string;
+  flowId: string | null;
+  taskId: string | null;
+  agentId: string | null;
+  agentRunId: string | null;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+  reason: string;
+  requestedAt: string;
+  resolvedAt: string | null;
+  resolvedByUserId: string | null;
+  resolutionNote: string | null;
 }
 
 interface DirectionPlanningResult {
@@ -1024,10 +1171,14 @@ export function VorldXShell() {
   const setStoreActiveUsers = useVorldXStore((state) => state.setActiveUsers);
   const pushNotification = useVorldXStore((state) => state.pushNotification);
 
-  const [activeTab, setActiveTab] =
-    useState<(typeof NAV_ITEMS)[number]["id"]>("control");
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<NavItemId>("control");
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("BRAINSTORM");
+  const [operationsTab, setOperationsTab] = useState<OperationTabId>("plan");
+  const [primaryWorkspaceTab, setPrimaryWorkspaceTab] =
+    useState<PrimaryWorkspaceTabId>("FOCUS");
+  const [primaryTabLastSubtab, setPrimaryTabLastSubtab] = useState<
+    Record<PrimaryWorkspaceTabId, NavItemId>
+  >(DEFAULT_PRIMARY_TAB_SUBTAB);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [showUtilityMenu, setShowUtilityMenu] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -1066,6 +1217,9 @@ export function VorldXShell() {
   const [controlConversationDetail, setControlConversationDetail] =
     useState<ControlConversationDetail>("REASONING_MIN");
   const [controlEngaged, setControlEngaged] = useState(false);
+  const [controlThreadHistory, setControlThreadHistory] = useState<ControlThreadHistoryItem[]>([]);
+  const [activeControlThreadId, setActiveControlThreadId] = useState<string | null>(null);
+  const [controlHistoryHydrated, setControlHistoryHydrated] = useState(false);
   const [humanPlanDraft, setHumanPlanDraft] = useState("");
   const [directionPlanningInFlight, setDirectionPlanningInFlight] = useState(false);
   const [directionPlanningResult, setDirectionPlanningResult] =
@@ -1074,8 +1228,12 @@ export function VorldXShell() {
   const [permissionRequests, setPermissionRequests] = useState<PermissionRequestItem[]>([]);
   const [permissionRequestsLoading, setPermissionRequestsLoading] = useState(false);
   const [permissionRequestActionId, setPermissionRequestActionId] = useState<string | null>(null);
+  const [approvalCheckpoints, setApprovalCheckpoints] = useState<ApprovalCheckpointItem[]>([]);
+  const [approvalCheckpointsLoading, setApprovalCheckpointsLoading] = useState(false);
+  const [approvalCheckpointActionId, setApprovalCheckpointActionId] = useState<string | null>(null);
   const [clearPermissionRequestsInFlight, setClearPermissionRequestsInFlight] = useState(false);
   const [canReviewPermissionRequests, setCanReviewPermissionRequests] = useState(false);
+  const [controlScopedFlowIds, setControlScopedFlowIds] = useState<string[]>([]);
   const [signatureApprovals, setSignatureApprovals] = useState(1);
   const [isRecordingIntent, setIsRecordingIntent] = useState(false);
   const [launchInFlight, setLaunchInFlight] = useState(false);
@@ -1111,8 +1269,11 @@ export function VorldXShell() {
   const [humanInputFile, setHumanInputFile] = useState<File | null>(null);
   const [humanInputOverridePrompt, setHumanInputOverridePrompt] = useState("");
   const [humanInputSubmitting, setHumanInputSubmitting] = useState(false);
+  const [pendingAutoLaunchPrompt, setPendingAutoLaunchPrompt] = useState<string | null>(null);
   const permissionRequestsFetchSeqRef = useRef(0);
   const permissionRequestsInFlightRef = useRef(false);
+  const approvalCheckpointsFetchSeqRef = useRef(0);
+  const approvalCheckpointsInFlightRef = useRef(false);
   const pipelinePolicyInFlightRef = useRef(false);
   const missionSchedulesInFlightRef = useRef(false);
   const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
@@ -1135,6 +1296,24 @@ export function VorldXShell() {
     () => summarizeHumanInputReason(pendingHumanInput?.reason),
     [pendingHumanInput?.reason]
   );
+
+  useEffect(() => {
+    if (!controlMessage || controlMessage.tone === "error") {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setControlMessage((current) => {
+        if (!current) {
+          return null;
+        }
+        if (current.text !== controlMessage.text || current.tone !== controlMessage.tone) {
+          return current;
+        }
+        return null;
+      });
+    }, 9000);
+    return () => window.clearTimeout(timeout);
+  }, [controlMessage]);
 
   const appendStructuredOrganizationTurn = useCallback((input: {
     content: string;
@@ -1295,10 +1474,51 @@ export function VorldXShell() {
     });
   }, []);
 
-  const handleTabChange = useCallback((tab: (typeof NAV_ITEMS)[number]["id"]) => {
-    setActiveTab(tab);
-    setIsMobileNavOpen(false);
+  const syncOperationSubtab = useCallback((tab: OperationTabId) => {
+    setOperationsTab(tab);
   }, []);
+
+  const handleTabChange = useCallback(
+    (tab: NavItemId) => {
+      const primaryTab = getPrimaryWorkspaceTabForNavItem(tab);
+      setActiveTab(tab);
+      setPrimaryWorkspaceTab(primaryTab);
+      if (tab === "control" || OPERATION_TAB_SET.has(tab)) {
+        setPrimaryTabLastSubtab((previous) =>
+          previous[primaryTab] === tab ? previous : { ...previous, [primaryTab]: tab }
+        );
+      }
+
+      if (tab === "control") {
+        setWorkspaceMode(controlMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
+        return;
+      }
+
+      if (tab === "hub") {
+        setWorkspaceMode("HUB");
+        return;
+      }
+
+      if (tab === "calendar") {
+        setWorkspaceMode("CALENDAR");
+        return;
+      }
+
+      if (OPERATION_TAB_SET.has(tab)) {
+        syncOperationSubtab(tab as OperationTabId);
+        setWorkspaceMode("OPERATIONS");
+        return;
+      }
+    },
+    [controlMode, syncOperationSubtab]
+  );
+
+  const handleOperationTabChange = useCallback(
+    (tab: OperationTabId) => {
+      handleTabChange(tab);
+    },
+    [handleTabChange]
+  );
 
   const handleSignOut = useCallback(async () => {
     setSignOutInFlight(true);
@@ -1312,7 +1532,6 @@ export function VorldXShell() {
 
   const openAddOrganization = useCallback(() => {
     setShowOrgSwitcher(false);
-    setIsMobileNavOpen(false);
     setSetupPanel("onboarding");
   }, []);
 
@@ -1415,6 +1634,76 @@ export function VorldXShell() {
           setPermissionRequestsLoading(false);
         }
         permissionRequestsInFlightRef.current = false;
+      }
+    },
+    [activeOrgId]
+  );
+
+  const loadApprovalCheckpoints = useCallback(
+    async (options?: { silent?: boolean; force?: boolean }) => {
+      if (!options?.force && approvalCheckpointsInFlightRef.current) {
+        return;
+      }
+      approvalCheckpointsInFlightRef.current = true;
+
+      const fetchSeq = ++approvalCheckpointsFetchSeqRef.current;
+      const orgId = activeOrgId;
+      if (!orgId) {
+        if (fetchSeq === approvalCheckpointsFetchSeqRef.current) {
+          setApprovalCheckpoints([]);
+          setApprovalCheckpointsLoading(false);
+        }
+        approvalCheckpointsInFlightRef.current = false;
+        return;
+      }
+
+      if (!options?.silent) {
+        setApprovalCheckpointsLoading(true);
+      }
+
+      try {
+        const response = await fetch(
+          `/api/approvals/checkpoints?orgId=${encodeURIComponent(orgId)}&limit=180`,
+          {
+            cache: "no-store"
+          }
+        );
+        const { payload, rawText } = await parseJsonBody<{
+          ok?: boolean;
+          message?: string;
+          checkpoints?: ApprovalCheckpointItem[];
+        }>(response);
+
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed loading approval checkpoints (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed loading approval checkpoints.")
+          );
+        }
+
+        if (fetchSeq !== approvalCheckpointsFetchSeqRef.current) {
+          return;
+        }
+
+        setApprovalCheckpoints(payload.checkpoints ?? []);
+      } catch (error) {
+        if (fetchSeq !== approvalCheckpointsFetchSeqRef.current) {
+          return;
+        }
+        if (!options?.silent) {
+          setControlMessage({
+            tone: "error",
+            text:
+              error instanceof Error ? error.message : "Failed loading approval checkpoints."
+          });
+        }
+      } finally {
+        if (fetchSeq === approvalCheckpointsFetchSeqRef.current && !options?.silent) {
+          setApprovalCheckpointsLoading(false);
+        }
+        approvalCheckpointsInFlightRef.current = false;
       }
     },
     [activeOrgId]
@@ -1664,6 +1953,21 @@ export function VorldXShell() {
 
   useEffect(() => {
     if (!resolvedOrg?.id) {
+      setApprovalCheckpoints([]);
+      return;
+    }
+    void loadApprovalCheckpoints();
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      void loadApprovalCheckpoints({ silent: true });
+    }, REQUESTS_POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [loadApprovalCheckpoints, resolvedOrg?.id]);
+
+  useEffect(() => {
+    if (!resolvedOrg?.id) {
       setPipelinePolicy(null);
       return;
     }
@@ -1680,10 +1984,9 @@ export function VorldXShell() {
   useEffect(() => {
     const requestedTab = searchParams.get("tab");
     if (requestedTab && NAV_ITEMS.some((item) => item.id === requestedTab)) {
-      setActiveTab(requestedTab as (typeof NAV_ITEMS)[number]["id"]);
-      setIsMobileNavOpen(false);
+      handleTabChange(requestedTab as NavItemId);
     }
-  }, [searchParams]);
+  }, [handleTabChange, searchParams]);
 
   useEffect(() => {
     const composioStatus = searchParams.get("composio");
@@ -1706,14 +2009,15 @@ export function VorldXShell() {
       });
     }
 
-    setActiveTab("control");
-    setIsMobileNavOpen(false);
+    handleTabChange("control");
     router.replace("/app");
-  }, [router, searchParams]);
+  }, [handleTabChange, router, searchParams]);
 
   useEffect(() => {
     permissionRequestsFetchSeqRef.current += 1;
     permissionRequestsInFlightRef.current = false;
+    approvalCheckpointsFetchSeqRef.current += 1;
+    approvalCheckpointsInFlightRef.current = false;
     pipelinePolicyInFlightRef.current = false;
     missionSchedulesInFlightRef.current = false;
     setDirectionTurns([]);
@@ -1722,12 +2026,24 @@ export function VorldXShell() {
     setHumanPlanDraft("");
     setDirectionPlanningResult(null);
     setControlEngaged(false);
+    setActiveTab("control");
     setControlMode("MINDSTORM");
+    setWorkspaceMode("BRAINSTORM");
+    setOperationsTab("plan");
+    setPrimaryWorkspaceTab("FOCUS");
+    setPrimaryTabLastSubtab(DEFAULT_PRIMARY_TAB_SUBTAB);
     setControlConversationDetail("REASONING_MIN");
+    setControlThreadHistory([]);
+    setActiveControlThreadId(null);
+    setControlHistoryHydrated(false);
     setShowRequestCenter(false);
     setPermissionRequestsLoading(false);
     setPermissionRequestActionId(null);
+    setApprovalCheckpoints([]);
+    setApprovalCheckpointsLoading(false);
+    setApprovalCheckpointActionId(null);
     setClearPermissionRequestsInFlight(false);
+    setControlScopedFlowIds([]);
     setMissionSchedules([]);
     setScheduleDraft({
       title: "",
@@ -1755,7 +2071,424 @@ export function VorldXShell() {
     setAgentRunInputSubmitting(false);
     setPipelinePolicy(null);
     setControlMessage(null);
+    setPendingAutoLaunchPrompt(null);
   }, [resolvedOrg?.id]);
+
+  useEffect(() => {
+    if (activeTab !== "control") {
+      return;
+    }
+    if (workspaceMode !== "BRAINSTORM" && workspaceMode !== "COMMAND") {
+      return;
+    }
+    setWorkspaceMode(controlMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
+  }, [activeTab, controlMode, workspaceMode]);
+
+  const controlHistoryStorageKey = useMemo(
+    () => (resolvedOrg?.id ? `vx-control-history:${resolvedOrg.id}` : ""),
+    [resolvedOrg?.id]
+  );
+
+  useEffect(() => {
+    if (!controlHistoryStorageKey || typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const raw = window.localStorage.getItem(controlHistoryStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          const restored: ControlThreadHistoryItem[] = [];
+          for (const candidate of parsed) {
+            const item =
+              candidate && typeof candidate === "object"
+                ? (candidate as Record<string, unknown>)
+                : null;
+            if (!item || typeof item.id !== "string" || typeof item.title !== "string") {
+              continue;
+            }
+            const mode = item.mode === "DIRECTION" ? "DIRECTION" : "MINDSTORM";
+            const launchScopeCandidate =
+              item.launchScope && typeof item.launchScope === "object"
+                ? (item.launchScope as Record<string, unknown>)
+                : null;
+            const launchScope =
+              launchScopeCandidate
+                ? {
+                    directionId:
+                      typeof launchScopeCandidate.directionId === "string"
+                        ? launchScopeCandidate.directionId
+                        : "",
+                    planId:
+                      typeof launchScopeCandidate.planId === "string"
+                        ? launchScopeCandidate.planId
+                        : "",
+                    permissionRequestIds: Array.isArray(launchScopeCandidate.permissionRequestIds)
+                      ? launchScopeCandidate.permissionRequestIds
+                          .map((value) => (typeof value === "string" ? value : ""))
+                          .filter(Boolean)
+                          .slice(0, 80)
+                      : [],
+                    flowIds: Array.isArray(launchScopeCandidate.flowIds)
+                      ? launchScopeCandidate.flowIds
+                          .map((value) => (typeof value === "string" ? value : ""))
+                          .filter(Boolean)
+                          .slice(0, 40)
+                      : []
+                  }
+                : undefined;
+            restored.push({
+              id: item.id,
+              title: item.title,
+              mode,
+              updatedAt:
+                typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+                  ? item.updatedAt
+                  : Date.now(),
+              turns: Array.isArray(item.turns) ? (item.turns as DirectionTurn[]) : [],
+              directionGiven: typeof item.directionGiven === "string" ? item.directionGiven : "",
+              planningResult:
+                item.planningResult && typeof item.planningResult === "object"
+                  ? (item.planningResult as DirectionPlanningResult)
+                  : null,
+              pendingPlanLaunchApproval:
+                item.pendingPlanLaunchApproval &&
+                typeof item.pendingPlanLaunchApproval === "object"
+                  ? (item.pendingPlanLaunchApproval as PendingPlanLaunchApproval)
+                  : null,
+              pendingToolkitApproval:
+                item.pendingToolkitApproval &&
+                typeof item.pendingToolkitApproval === "object"
+                  ? (item.pendingToolkitApproval as PendingToolkitApproval)
+                  : null,
+              pendingEmailApproval:
+                item.pendingEmailApproval && typeof item.pendingEmailApproval === "object"
+                  ? (item.pendingEmailApproval as PendingEmailApproval)
+                  : null,
+              agentRunResult:
+                item.agentRunResult && typeof item.agentRunResult === "object"
+                  ? (item.agentRunResult as AgentRunResponse)
+                  : null,
+              agentRunId: typeof item.agentRunId === "string" ? item.agentRunId : "",
+              agentRunInputValues:
+                item.agentRunInputValues && typeof item.agentRunInputValues === "object"
+                  ? Object.fromEntries(
+                      Object.entries(item.agentRunInputValues as Record<string, unknown>)
+                        .map(([key, value]) => [key, typeof value === "string" ? value : ""])
+                        .filter(([key]) => key.trim().length > 0)
+                    )
+                  : {},
+              agentRunPromptSnapshot:
+                typeof item.agentRunPromptSnapshot === "string"
+                  ? item.agentRunPromptSnapshot
+                  : "",
+              agentRunInputSourceUrl:
+                typeof item.agentRunInputSourceUrl === "string"
+                  ? item.agentRunInputSourceUrl
+                  : "",
+              launchScope
+            });
+          }
+          restored.sort((a, b) => b.updatedAt - a.updatedAt);
+          const slicedRestored = restored.slice(0, 30);
+
+          if (slicedRestored.length > 0) {
+            const first = slicedRestored[0];
+            setControlThreadHistory(slicedRestored);
+            setActiveControlThreadId(first.id);
+            setControlMode(first.mode);
+            setControlConversationDetail(
+              first.mode === "DIRECTION" ? "DIRECTION_GIVEN" : "REASONING_MIN"
+            );
+            setDirectionTurns(first.turns);
+            setDirectionPrompt(first.directionGiven);
+            setIntent(first.directionGiven);
+            setDirectionPlanningResult(first.planningResult ?? null);
+            setPendingPlanLaunchApproval(first.pendingPlanLaunchApproval ?? null);
+            setPendingToolkitApproval(first.pendingToolkitApproval ?? null);
+            setPendingEmailApproval(first.pendingEmailApproval ?? null);
+            setAgentRunResult(first.agentRunResult ?? null);
+            setAgentRunId(first.agentRunId ?? "");
+            setAgentRunInputValues(first.agentRunInputValues ?? {});
+            setAgentRunPromptSnapshot(first.agentRunPromptSnapshot ?? "");
+            setAgentRunInputSourceUrl(first.agentRunInputSourceUrl ?? "");
+            setControlScopedFlowIds(first.launchScope?.flowIds ?? []);
+            setControlEngaged(
+              first.turns.length > 0 ||
+                first.directionGiven.length > 0 ||
+                Boolean(first.planningResult) ||
+                Boolean(first.pendingPlanLaunchApproval) ||
+                Boolean(first.pendingToolkitApproval) ||
+                Boolean(first.pendingEmailApproval) ||
+                Boolean(first.agentRunResult)
+            );
+          }
+        }
+      }
+    } catch {
+      // Local history hydration is best-effort.
+    } finally {
+      setControlHistoryHydrated(true);
+    }
+  }, [controlHistoryStorageKey]);
+
+  useEffect(() => {
+    if (!controlHistoryStorageKey || typeof window === "undefined" || !controlHistoryHydrated) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(
+        controlHistoryStorageKey,
+        JSON.stringify(controlThreadHistory.slice(0, 30))
+      );
+    } catch {
+      // Local history persistence should never break core chat behavior.
+    }
+  }, [controlHistoryHydrated, controlHistoryStorageKey, controlThreadHistory]);
+
+  useEffect(() => {
+    if (!activeControlThreadId) {
+      return;
+    }
+    const scopedDirectionId = directionPlanningResult?.directionRecord?.id?.trim() ?? "";
+    const scopedPlanId = directionPlanningResult?.planRecord?.id?.trim() ?? "";
+    const scopedPermissionRequestIds = [
+      ...new Set(
+        (directionPlanningResult?.permissionRequests ?? [])
+          .map((item) => item.id?.trim())
+          .filter((value): value is string => Boolean(value))
+      )
+    ];
+    const scopedFlowIds = [
+      ...new Set(controlScopedFlowIds.map((item) => item.trim()).filter(Boolean))
+    ];
+    const launchScope =
+      scopedDirectionId ||
+      scopedPlanId ||
+      scopedPermissionRequestIds.length > 0 ||
+      scopedFlowIds.length > 0
+        ? {
+            directionId: scopedDirectionId,
+            planId: scopedPlanId,
+            permissionRequestIds: scopedPermissionRequestIds,
+            flowIds: scopedFlowIds
+          }
+        : undefined;
+    const hasThreadContent =
+      directionTurns.length > 0 ||
+      directionPrompt.trim().length > 0 ||
+      intent.trim().length > 0 ||
+      Boolean(directionPlanningResult) ||
+      Boolean(pendingPlanLaunchApproval) ||
+      Boolean(pendingToolkitApproval) ||
+      Boolean(pendingEmailApproval) ||
+      Boolean(agentRunResult);
+    if (!hasThreadContent) {
+      return;
+    }
+
+    const directionGiven = (intent.trim() || directionPrompt.trim()).slice(0, 1600);
+    const ownerTurn = directionTurns.find((turn) => turn.role === "owner");
+    const titleSource = ownerTurn?.content || directionGiven;
+    const title = titleSource
+      ? compactTaskTitle(titleSource, controlMode === "DIRECTION" ? "Command Session" : "Brainstorm Session")
+      : controlMode === "DIRECTION"
+        ? "Command Session"
+        : "Brainstorm Session";
+
+    setControlThreadHistory((previous) => {
+      const now = Date.now();
+      const next = [
+        {
+          id: activeControlThreadId,
+          title,
+          mode: controlMode,
+          updatedAt: now,
+          turns: directionTurns,
+          directionGiven,
+          planningResult: directionPlanningResult,
+          pendingPlanLaunchApproval,
+          pendingToolkitApproval,
+          pendingEmailApproval,
+          agentRunResult,
+          agentRunId,
+          agentRunInputValues,
+          agentRunPromptSnapshot,
+          agentRunInputSourceUrl,
+          launchScope
+        },
+        ...previous.filter((item) => item.id !== activeControlThreadId)
+      ].slice(0, 30);
+      return next;
+    });
+  }, [
+    activeControlThreadId,
+    controlMode,
+    directionPrompt,
+    directionPlanningResult,
+    directionTurns,
+    intent,
+    pendingPlanLaunchApproval,
+    pendingToolkitApproval,
+    pendingEmailApproval,
+    agentRunResult,
+    agentRunId,
+    agentRunInputValues,
+    agentRunPromptSnapshot,
+    agentRunInputSourceUrl,
+    controlScopedFlowIds
+  ]);
+
+  const handleCreateControlThread = useCallback(
+    (modeOverride?: ControlMode) => {
+      const nextMode = modeOverride ?? controlMode;
+      const nextId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const title = nextMode === "DIRECTION" ? "Command Session" : "Brainstorm Session";
+      setActiveControlThreadId(nextId);
+      setControlThreadHistory((previous) => [
+        {
+          id: nextId,
+          title,
+          mode: nextMode,
+          updatedAt: Date.now(),
+          turns: [],
+          directionGiven: "",
+          planningResult: null,
+          pendingPlanLaunchApproval: null,
+          pendingToolkitApproval: null,
+          pendingEmailApproval: null,
+          agentRunResult: null,
+          agentRunId: "",
+          agentRunInputValues: {},
+          agentRunPromptSnapshot: "",
+          agentRunInputSourceUrl: "",
+          launchScope: {
+            directionId: "",
+            planId: "",
+            permissionRequestIds: [],
+            flowIds: []
+          }
+        },
+        ...previous.filter((item) => item.id !== nextId)
+      ].slice(0, 30));
+      setDirectionTurns([]);
+      setDirectionPrompt("");
+      setIntent("");
+      setDirectionPlanningResult(null);
+      setPendingPlanLaunchApproval(null);
+      setPendingToolkitApproval(null);
+      setPendingEmailApproval(null);
+      setApprovedToolkitRequestId(null);
+      setAgentRunResult(null);
+      setAgentRunId("");
+      setAgentRunInputValues({});
+      setAgentRunPromptSnapshot("");
+      setAgentRunInputSourceUrl("");
+      setAgentRunInputFile(null);
+      setControlScopedFlowIds([]);
+      setControlMessage(null);
+      setControlMode(nextMode);
+      setControlConversationDetail(nextMode === "DIRECTION" ? "DIRECTION_GIVEN" : "REASONING_MIN");
+      setControlEngaged(false);
+      handleTabChange("control");
+    },
+    [controlMode, handleTabChange]
+  );
+
+  const handleLoadControlThread = useCallback(
+    (threadId: string) => {
+      const target = controlThreadHistory.find((item) => item.id === threadId);
+      if (!target) {
+        return;
+      }
+      setActiveControlThreadId(target.id);
+      setDirectionTurns(target.turns);
+      setDirectionPrompt(target.directionGiven);
+      setIntent(target.directionGiven);
+      setControlMode(target.mode);
+      setControlConversationDetail(target.mode === "DIRECTION" ? "DIRECTION_GIVEN" : "REASONING_MIN");
+      setDirectionPlanningResult(target.planningResult ?? null);
+      setPendingPlanLaunchApproval(target.pendingPlanLaunchApproval ?? null);
+      setPendingToolkitApproval(target.pendingToolkitApproval ?? null);
+      setPendingEmailApproval(target.pendingEmailApproval ?? null);
+      setApprovedToolkitRequestId(null);
+      setAgentRunResult(target.agentRunResult ?? null);
+      setAgentRunId(target.agentRunId ?? "");
+      setAgentRunInputValues(target.agentRunInputValues ?? {});
+      setAgentRunPromptSnapshot(target.agentRunPromptSnapshot ?? "");
+      setAgentRunInputSourceUrl(target.agentRunInputSourceUrl ?? "");
+      setAgentRunInputFile(null);
+      setControlScopedFlowIds(target.launchScope?.flowIds ?? []);
+      setControlMessage(null);
+      setControlEngaged(
+        target.turns.length > 0 ||
+          target.directionGiven.length > 0 ||
+          Boolean(target.planningResult) ||
+          Boolean(target.pendingPlanLaunchApproval) ||
+          Boolean(target.pendingToolkitApproval) ||
+          Boolean(target.pendingEmailApproval) ||
+          Boolean(target.agentRunResult)
+      );
+      handleTabChange("control");
+    },
+    [controlThreadHistory, handleTabChange]
+  );
+
+  const handleSwitchControlMode = useCallback(
+    (nextMode: ControlMode) => {
+      const currentThread = activeControlThreadId
+        ? controlThreadHistory.find((item) => item.id === activeControlThreadId) ?? null
+        : null;
+      if (currentThread?.mode === nextMode) {
+        setControlMode(nextMode);
+        setControlConversationDetail(nextMode === "DIRECTION" ? "DIRECTION_GIVEN" : "REASONING_MIN");
+        if (workspaceMode === "BRAINSTORM" || workspaceMode === "COMMAND") {
+          setWorkspaceMode(nextMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
+        }
+        setControlEngaged(
+          currentThread.turns.length > 0 ||
+            currentThread.directionGiven.length > 0 ||
+            Boolean(currentThread.planningResult) ||
+            Boolean(currentThread.pendingPlanLaunchApproval) ||
+            Boolean(currentThread.pendingToolkitApproval) ||
+            Boolean(currentThread.pendingEmailApproval) ||
+            Boolean(currentThread.agentRunResult)
+        );
+        handleTabChange("control");
+        return;
+      }
+
+      const latestForMode = controlThreadHistory.find((item) => item.mode === nextMode);
+      if (latestForMode) {
+        handleLoadControlThread(latestForMode.id);
+        return;
+      }
+
+      handleCreateControlThread(nextMode);
+    },
+    [
+      activeControlThreadId,
+      controlThreadHistory,
+      handleTabChange,
+      handleCreateControlThread,
+      handleLoadControlThread,
+      workspaceMode
+    ]
+  );
+
+  useEffect(() => {
+    if (activeControlThreadId || !resolvedOrg?.id || !controlHistoryHydrated) {
+      return;
+    }
+    handleCreateControlThread(controlMode);
+  }, [
+    activeControlThreadId,
+    controlHistoryHydrated,
+    controlMode,
+    handleCreateControlThread,
+    resolvedOrg?.id
+  ]);
 
   const presenceColor = useMemo(() => {
     const seed = Array.from(realtimeSessionId).reduce((sum, value) => sum + value.charCodeAt(0), 0);
@@ -1831,14 +2564,58 @@ export function VorldXShell() {
     }
     return 1;
   }, [predictedBurn]);
-  const pendingPermissionRequestCount = useMemo(
-    () => permissionRequests.filter((item) => item.status === "PENDING").length,
-    [permissionRequests]
+  const activeControlThread = useMemo(
+    () =>
+      activeControlThreadId
+        ? controlThreadHistory.find((item) => item.id === activeControlThreadId) ?? null
+        : null,
+    [activeControlThreadId, controlThreadHistory]
   );
-  const activePlanId = directionPlanningResult?.planRecord?.id?.trim() ?? "";
-  const activeDirectionId = directionPlanningResult?.directionRecord?.id?.trim() ?? "";
+  const activePlanId =
+    activeControlThread?.launchScope?.planId?.trim() ??
+    directionPlanningResult?.planRecord?.id?.trim() ??
+    "";
+  const activeDirectionId =
+    activeControlThread?.launchScope?.directionId?.trim() ??
+    directionPlanningResult?.directionRecord?.id?.trim() ??
+    "";
+  const activeScopedPermissionRequestIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const item of activeControlThread?.launchScope?.permissionRequestIds ?? []) {
+      const normalized = item.trim();
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+    for (const request of directionPlanningResult?.permissionRequests ?? []) {
+      if (request.id?.trim()) {
+        ids.add(request.id.trim());
+      }
+    }
+    return [...ids];
+  }, [
+    activeControlThread?.launchScope?.permissionRequestIds,
+    directionPlanningResult?.permissionRequests
+  ]);
+  const activeScopedFlowIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const item of activeControlThread?.launchScope?.flowIds ?? []) {
+      const normalized = item.trim();
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+    for (const item of controlScopedFlowIds) {
+      const normalized = item.trim();
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+    return [...ids];
+  }, [activeControlThread?.launchScope?.flowIds, controlScopedFlowIds]);
   const launchScopedPermissionRequests = useMemo(() => {
     const byId = new Map<string, PermissionRequestItem>();
+    const scopedIdSet = new Set(activeScopedPermissionRequestIds);
 
     for (const request of directionPlanningResult?.permissionRequests ?? []) {
       byId.set(request.id, request);
@@ -1850,7 +2627,8 @@ export function VorldXShell() {
         !matchesPlan &&
         activeDirectionId.length > 0 &&
         request.directionId === activeDirectionId;
-      if (matchesPlan || matchesDirection || byId.has(request.id)) {
+      const matchesScopedIds = scopedIdSet.has(request.id);
+      if (matchesPlan || matchesDirection || matchesScopedIds || byId.has(request.id)) {
         byId.set(request.id, request);
       }
     }
@@ -1859,6 +2637,7 @@ export function VorldXShell() {
   }, [
     activeDirectionId,
     activePlanId,
+    activeScopedPermissionRequestIds,
     directionPlanningResult?.permissionRequests,
     permissionRequests
   ]);
@@ -1875,6 +2654,46 @@ export function VorldXShell() {
   const launchPermissionRequestIds = useMemo(
     () => launchScopedPermissionRequests.map((item) => item.id),
     [launchScopedPermissionRequests]
+  );
+  const launchScopedApprovalCheckpoints = useMemo(() => {
+    const scopedFlowSet = new Set(activeScopedFlowIds);
+    if (scopedFlowSet.size === 0) {
+      return [] as ApprovalCheckpointItem[];
+    }
+    return approvalCheckpoints.filter((item) => {
+      const flowId = item.flowId?.trim();
+      return Boolean(flowId && scopedFlowSet.has(flowId));
+    });
+  }, [activeScopedFlowIds, approvalCheckpoints]);
+  const requestCenterPermissionRequests = useMemo(() => {
+    const commandScoped =
+      activeTab === "control" &&
+      controlMode === "DIRECTION" &&
+      launchScopedPermissionRequests.length > 0;
+    return commandScoped ? launchScopedPermissionRequests : permissionRequests;
+  }, [activeTab, controlMode, launchScopedPermissionRequests, permissionRequests]);
+  const requestCenterApprovalCheckpoints = useMemo(() => {
+    const commandScoped =
+      activeTab === "control" &&
+      controlMode === "DIRECTION" &&
+      launchScopedApprovalCheckpoints.length > 0;
+    return commandScoped ? launchScopedApprovalCheckpoints : approvalCheckpoints;
+  }, [activeTab, approvalCheckpoints, controlMode, launchScopedApprovalCheckpoints]);
+  const isRequestCenterScopedToCommand =
+    activeTab === "control" &&
+    controlMode === "DIRECTION" &&
+    (launchScopedPermissionRequests.length > 0 || launchScopedApprovalCheckpoints.length > 0);
+  const requestCenterPermissionPendingCount = useMemo(
+    () => requestCenterPermissionRequests.filter((item) => item.status === "PENDING").length,
+    [requestCenterPermissionRequests]
+  );
+  const requestCenterCheckpointPendingCount = useMemo(
+    () => requestCenterApprovalCheckpoints.filter((item) => item.status === "PENDING").length,
+    [requestCenterApprovalCheckpoints]
+  );
+  const requestCenterPendingCount = useMemo(
+    () => requestCenterPermissionPendingCount + requestCenterCheckpointPendingCount,
+    [requestCenterCheckpointPendingCount, requestCenterPermissionPendingCount]
   );
 
   useEffect(() => {
@@ -2262,6 +3081,13 @@ export function VorldXShell() {
       }
     };
 
+    const handleApprovalResolved = (envelope: any) => {
+      if (envelope?.orgId !== resolvedOrg.id) {
+        return;
+      }
+      void loadApprovalCheckpoints({ force: true, silent: true });
+    };
+
     socket.on("signature.captured", handleSignatureCaptured);
     socket.on("kill-switch.triggered", handleKillSwitch);
     socket.on("flow.updated", handleFlowUpdated);
@@ -2272,6 +3098,7 @@ export function VorldXShell() {
     socket.on("flow.rewound", handleFlowRewound);
     socket.on("task.paused", handleTaskPaused);
     socket.on("task.resumed", handleTaskResumed);
+    socket.on("approval.resolved", handleApprovalResolved);
 
     return () => {
       socket.off("signature.captured", handleSignatureCaptured);
@@ -2284,9 +3111,11 @@ export function VorldXShell() {
       socket.off("flow.rewound", handleFlowRewound);
       socket.off("task.paused", handleTaskPaused);
       socket.off("task.resumed", handleTaskResumed);
+      socket.off("approval.resolved", handleApprovalResolved);
     };
   }, [
     appendStructuredOrganizationTurn,
+    loadApprovalCheckpoints,
     promptForHumanInput,
     queueWorkflowSnapshotTurn,
     realtimeSessionId,
@@ -2329,6 +3158,56 @@ export function VorldXShell() {
 
     return { tabs, orgMatches, actions };
   }, [handleTabChange, openAddOrganization, orgs, searchQuery, toggleGhostMode]);
+
+  const operationNavItems = useMemo(
+    () =>
+      OPERATION_TAB_IDS.map((id) => NAV_ITEM_MAP[id]).filter(
+        (item): item is (typeof NAV_ITEMS)[number] => Boolean(item)
+      ),
+    []
+  );
+
+  const activePrimaryNavItems = useMemo(
+    () => operationNavItems.filter((item) => item.primary === primaryWorkspaceTab),
+    [operationNavItems, primaryWorkspaceTab]
+  );
+
+  const handlePrimaryWorkspaceTabSwitch = useCallback(
+    (nextTab: PrimaryWorkspaceTabId) => {
+      const targetSubTab = primaryTabLastSubtab[nextTab] ?? DEFAULT_PRIMARY_TAB_SUBTAB[nextTab];
+      if (OPERATION_TAB_SET.has(targetSubTab)) {
+        handleOperationTabChange(targetSubTab as OperationTabId);
+        return;
+      }
+      handleTabChange(targetSubTab);
+    },
+    [handleOperationTabChange, handleTabChange, primaryTabLastSubtab]
+  );
+
+  const handleWorkspaceModeSwitch = useCallback(
+    (nextMode: WorkspaceMode) => {
+      if (nextMode === "BRAINSTORM") {
+        handleSwitchControlMode("MINDSTORM");
+        setWorkspaceMode("BRAINSTORM");
+        return;
+      }
+      if (nextMode === "COMMAND") {
+        handleSwitchControlMode("DIRECTION");
+        setWorkspaceMode("COMMAND");
+        return;
+      }
+      if (nextMode === "OPERATIONS") {
+        handleOperationTabChange(operationsTab);
+        return;
+      }
+      if (nextMode === "HUB") {
+        handleTabChange("hub");
+        return;
+      }
+      handleTabChange("calendar");
+    },
+    [handleOperationTabChange, handleSwitchControlMode, handleTabChange, operationsTab]
+  );
 
   const loadMissionSchedules = useCallback(
     async (silent?: boolean, force?: boolean) => {
@@ -2727,7 +3606,7 @@ export function VorldXShell() {
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
-          text: "Direction candidate updated from organization response."
+          text: "Command candidate updated from organization response."
         });
       }
 
@@ -2755,20 +3634,20 @@ export function VorldXShell() {
           prompt: message,
           reason:
             payload.intentRouting?.reason ||
-            "Direction mode detected execution intent. Routing to planning pipeline.",
+            "Command mode detected execution intent. Routing to planning pipeline.",
           toolkitHints
         });
         setControlMode("DIRECTION");
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
-          text: "Direction intent routed to planning pipeline."
+          text: "Command intent routed to planning pipeline."
         });
       }
     } catch (error) {
       setControlMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Direction chat failed."
+        text: error instanceof Error ? error.message : "Command chat failed."
       });
     } finally {
       setDirectionChatInFlight(false);
@@ -2787,6 +3666,7 @@ export function VorldXShell() {
       options?: {
         toolkitHints?: string[];
         navigateToPlanTab?: boolean;
+        autoLaunch?: boolean;
       }
     ) => {
       const direction = (rawDirection ?? intent).trim();
@@ -2796,7 +3676,7 @@ export function VorldXShell() {
       if (!direction) {
         setControlMessage({
           tone: "warning",
-          text: "Write a direction paragraph first."
+          text: "Write a command prompt first."
         });
         return;
       }
@@ -2913,11 +3793,43 @@ export function VorldXShell() {
             requiredToolkits: planToolkits
           })
         });
-        setPendingPlanLaunchApproval({
-          prompt: refinedDirection,
-          toolkits: planToolkits,
-          reason: "Plan ready. User approval required before launching workflow."
-        });
+        const pathwaySteps = payload.primaryPlan.pathway ?? [];
+        if (pathwaySteps.length > 0) {
+          const preview = pathwaySteps
+            .slice(0, 4)
+            .map((step) => `${step.line}. ${step.taskTitle} -> ${step.ownerRole}`)
+            .join("\n");
+          setDirectionTurns((prev) => [
+            ...prev,
+            {
+              id: `pathway-${Date.now()}`,
+              role: "organization",
+              content: `Pathway ready with ${pathwaySteps.length} ordered step(s).\n${preview}`
+            }
+          ]);
+        }
+        if (options?.autoLaunch) {
+          setPendingPlanLaunchApproval(null);
+          setPendingAutoLaunchPrompt(refinedDirection);
+          appendStructuredOrganizationTurn({
+            content: "Plan approved for automatic launch. Moving from planning to execution.",
+            meta: {
+              kind: "workflow_event",
+              title: "Auto Launch Scheduled",
+              message:
+                "Command mode generated a plan and queued immediate launch using this approved command.",
+              eventName: "plan.auto_launch",
+              status: "QUEUED",
+              timestamp: Date.now()
+            }
+          });
+        } else {
+          setPendingPlanLaunchApproval({
+            prompt: refinedDirection,
+            toolkits: planToolkits,
+            reason: "Plan ready. User approval required before launching workflow."
+          });
+        }
         setPendingToolkitApproval(null);
         setApprovedToolkitRequestId(null);
         setControlConversationDetail("DIRECTION_GIVEN");
@@ -2966,13 +3878,18 @@ export function VorldXShell() {
           ]);
         }
 
-        await loadPermissionRequests({ force: true });
+        await Promise.all([
+          loadPermissionRequests({ force: true }),
+          loadApprovalCheckpoints({ force: true })
+        ]);
         const autoSquadCreatedCount = autoSquadCreated.length;
         setControlMessage({
           tone: "success",
-          text: `Plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}${autoSquadCreatedCount > 0 ? ` Auto-squad created ${autoSquadCreatedCount} agents.` : autoSquad?.triggered ? " Auto-squad detected existing matching agents." : ""} Review in Plan section and approve launch.`
+          text: options?.autoLaunch
+            ? `Plans prepared and queued for auto launch.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}${autoSquadCreatedCount > 0 ? ` Auto-squad created ${autoSquadCreatedCount} agents.` : autoSquad?.triggered ? " Auto-squad detected existing matching agents." : ""}`
+            : `Plans prepared.${payload.requestCount ? ` ${payload.requestCount} permission requests raised.` : ""}${autoSquadCreatedCount > 0 ? ` Auto-squad created ${autoSquadCreatedCount} agents.` : autoSquad?.triggered ? " Auto-squad detected existing matching agents." : ""} Review in Plan section and approve launch.`
         });
-        if (options?.navigateToPlanTab !== false) {
+        if (options?.navigateToPlanTab !== false && !options?.autoLaunch) {
           handleTabChange("plan");
         }
       } catch (error) {
@@ -2992,6 +3909,7 @@ export function VorldXShell() {
       handleTabChange,
       humanPlanDraft,
       intent,
+      loadApprovalCheckpoints,
       loadPermissionRequests,
       resolvedOrg?.id
     ]
@@ -3028,7 +3946,10 @@ export function VorldXShell() {
           );
         }
 
-        await loadPermissionRequests({ force: true });
+        await Promise.all([
+          loadPermissionRequests({ force: true }),
+          loadApprovalCheckpoints({ force: true })
+        ]);
       } catch (error) {
         setControlMessage({
           tone: "error",
@@ -3038,7 +3959,61 @@ export function VorldXShell() {
         setPermissionRequestActionId(null);
       }
     },
-    [loadPermissionRequests, resolvedOrg?.id]
+    [loadApprovalCheckpoints, loadPermissionRequests, resolvedOrg?.id]
+  );
+
+  const handleApprovalCheckpointDecision = useCallback(
+    async (checkpointId: string, decision: "APPROVE" | "REJECT") => {
+      if (!resolvedOrg?.id) {
+        return;
+      }
+      setApprovalCheckpointActionId(checkpointId);
+      try {
+        const response = await fetch(
+          `/api/approvals/checkpoints/${encodeURIComponent(checkpointId)}/resolve`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              orgId: resolvedOrg.id,
+              decision
+            })
+          }
+        );
+
+        const { payload, rawText } = await parseJsonBody<{
+          ok?: boolean;
+          message?: string;
+          warning?: string;
+        }>(response);
+        if (!response.ok || !payload?.ok) {
+          throw new Error(
+            payload?.message ??
+              (rawText
+                ? `Failed updating checkpoint (${response.status}): ${rawText.slice(0, 180)}`
+                : "Failed updating checkpoint.")
+          );
+        }
+
+        await loadApprovalCheckpoints({ force: true });
+        if (payload.warning) {
+          setControlMessage({
+            tone: "warning",
+            text: payload.warning
+          });
+        }
+      } catch (error) {
+        setControlMessage({
+          tone: "error",
+          text: error instanceof Error ? error.message : "Checkpoint update failed."
+        });
+      } finally {
+        setApprovalCheckpointActionId(null);
+      }
+    },
+    [loadApprovalCheckpoints, resolvedOrg?.id]
   );
 
   const handleClearPermissionRequests = useCallback(async () => {
@@ -3868,6 +4843,7 @@ export function VorldXShell() {
           directionId: directionPlanningResult?.directionRecord?.id || undefined,
           planId: directionPlanningResult?.planRecord?.id || undefined,
           planWorkflows: directionPlanningResult?.primaryPlan?.workflows ?? undefined,
+          planPathway: directionPlanningResult?.primaryPlan?.pathway ?? undefined,
           swarmDensity,
           predictedBurn,
           requiredSignatures,
@@ -3932,6 +4908,10 @@ export function VorldXShell() {
           ? payload.flow.id.trim()
           : "";
       if (launchedFlowId) {
+        setControlScopedFlowIds((previous) => [
+          launchedFlowId,
+          ...previous.filter((item) => item !== launchedFlowId)
+        ].slice(0, 40));
         appendStructuredOrganizationTurn({
           content:
             flowStatus === "DRAFT"
@@ -3951,6 +4931,7 @@ export function VorldXShell() {
           }
         });
         queueWorkflowSnapshotTurn(launchedFlowId, "Live Workflow Runtime");
+        void loadApprovalCheckpoints({ force: true });
       }
 
       handleTabChange("flow");
@@ -3984,6 +4965,7 @@ export function VorldXShell() {
     resolvedOrg?.id,
     queueWorkflowSnapshotTurn,
     launchPermissionRequestIds,
+    loadApprovalCheckpoints,
     pipelinePolicy?.enforcePlanBeforeExecution,
     pipelinePolicy?.requireDetailedPlan,
     pipelinePolicy?.requireMultiWorkflowDecomposition,
@@ -4267,6 +5249,41 @@ export function VorldXShell() {
     pendingChatPlanRoute
   ]);
 
+  useEffect(() => {
+    const prompt = pendingAutoLaunchPrompt?.trim();
+    if (!prompt) {
+      return;
+    }
+    if (directionPlanningInFlight || launchInFlight) {
+      return;
+    }
+    if (!directionPlanningResult?.planRecord?.id) {
+      return;
+    }
+
+    let cancelled = false;
+    setPendingAutoLaunchPrompt(null);
+    const run = async () => {
+      try {
+        await handleLaunchMainAgent(prompt);
+      } finally {
+        if (!cancelled) {
+          setPendingAutoLaunchPrompt(null);
+        }
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    directionPlanningInFlight,
+    directionPlanningResult?.planRecord?.id,
+    handleLaunchMainAgent,
+    launchInFlight,
+    pendingAutoLaunchPrompt
+  ]);
+
   const handleGlobalKillSwitch = useCallback(async () => {
     if (typeof window !== "undefined") {
       const confirmed = window.confirm(
@@ -4332,136 +5349,9 @@ export function VorldXShell() {
     }
   }, [resolvedOrg?.id]);
 
-  const agentRunConnectUrl =
-    agentRunResult?.error?.code === "INTEGRATION_NOT_CONNECTED"
-      ? (typeof agentRunResult.error?.details?.connectUrl === "string"
-          ? agentRunResult.error?.details?.connectUrl
-          : "") || "/app?tab=hub&hubScope=TOOLS&toolkit=gmail"
-      : "";
-
   return (
     <div className="vx-shell relative min-h-screen bg-vx-bg text-slate-100 transition-all duration-500">
       <div className="flex h-[100dvh] overflow-hidden">
-        {isMobileNavOpen ? (
-          <button
-            type="button"
-            aria-label="Close navigation"
-            onClick={() => setIsMobileNavOpen(false)}
-            className="fixed inset-0 z-40 bg-black/70 md:hidden"
-          />
-        ) : null}
-        <aside
-          className={`fixed inset-y-0 left-0 z-50 flex h-full w-[84vw] max-w-80 shrink-0 flex-col border-r border-white/10 bg-[#05070a]/95 backdrop-blur-2xl transition-transform duration-300 md:relative md:inset-auto md:z-auto md:w-auto md:max-w-none md:translate-x-0 ${
-            isMobileNavOpen ? "translate-x-0" : "-translate-x-full"
-          } ${
-            isSidebarCollapsed ? "md:w-24" : "md:w-80"
-          }`}
-        >
-          <div className="flex h-24 items-center gap-4 border-b border-white/10 px-6">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-white/10">
-              <Zap className={themeStyle.accent} size={22} />
-            </div>
-            {!isSidebarCollapsed && (
-              <div className="min-w-0">
-                <p className="truncate font-display text-xl font-black tracking-tight">
-                  {resolvedOrg?.name ?? "Workspace Explorer"}
-                </p>
-                <p className="text-xs text-slate-500">Command OS</p>
-              </div>
-            )}
-          </div>
-
-          <div className="vx-scrollbar flex-1 space-y-4 overflow-y-auto px-3 py-6">
-            {NAV_GROUPS.map((group) => (
-              <div key={group.id} className="space-y-2">
-                {!isSidebarCollapsed ? (
-                  <p className="px-2 text-[11px] font-medium tracking-[0.08em] text-slate-500">
-                    {group.label}
-                  </p>
-                ) : null}
-                {NAV_ITEMS.filter((item) => item.group === group.id).map((item) => (
-                  <button
-                    key={item.id}
-                    onClick={() => handleTabChange(item.id)}
-                    className={`flex w-full items-center rounded-2xl px-4 py-3 text-left transition ${
-                      activeTab === item.id
-                        ? `vx-panel ${themeStyle.border}`
-                        : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
-                    }`}
-                  >
-                    <item.icon size={20} className={activeTab === item.id ? themeStyle.accent : ""} />
-                    {!isSidebarCollapsed ? (
-                      <div className="ml-4 min-w-0">
-                        <p className="text-sm font-semibold text-slate-100">{item.label}</p>
-                        <p className="text-xs text-slate-500">{item.helper}</p>
-                      </div>
-                    ) : null}
-                  </button>
-                ))}
-              </div>
-            ))}
-          </div>
-
-          <div className="border-t border-white/10 px-3 py-3">
-            <div className="rounded-2xl border border-white/10 bg-black/35 p-2">
-              {!isSidebarCollapsed ? (
-                <>
-                  <p className="px-2 text-xs font-medium text-slate-500">Account</p>
-                  <p className="truncate px-2 pt-1 text-sm text-slate-200">{user?.email ?? "session user"}</p>
-                  <div className="mt-2 grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => handleTabChange("settings")}
-                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-white/20 bg-white/5 px-2 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
-                    >
-                      <UserCog size={12} />
-                      Settings
-                    </button>
-                    <button
-                      onClick={() => void handleSignOut()}
-                      disabled={signOutInFlight}
-                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                    >
-                      {signOutInFlight ? (
-                        <Loader2 size={12} className="animate-spin" />
-                      ) : (
-                        <LogOut size={12} />
-                      )}
-                      Logout
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  <button
-                    onClick={() => handleTabChange("settings")}
-                    className="flex items-center justify-center rounded-xl border border-white/20 bg-white/5 p-2 text-slate-200 transition hover:bg-white/10"
-                    title="Account settings"
-                  >
-                    <UserCog size={16} />
-                  </button>
-                  <button
-                    onClick={() => void handleSignOut()}
-                    disabled={signOutInFlight}
-                    className="flex items-center justify-center rounded-xl border border-red-500/35 bg-red-500/10 p-2 text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                    title="Logout"
-                  >
-                    {signOutInFlight ? <Loader2 size={16} className="animate-spin" /> : <LogOut size={16} />}
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="hidden border-t border-white/10 p-4 md:block">
-            <button
-              onClick={() => setIsSidebarCollapsed((prev) => !prev)}
-              className="flex w-full items-center justify-center rounded-2xl bg-white/5 p-3 text-slate-300 transition hover:bg-white/10"
-            >
-              <LayoutGrid size={20} />
-            </button>
-          </div>
-        </aside>
-
         <main className="relative flex h-full min-w-0 flex-1 flex-col overflow-hidden">
           <header className="relative z-30 flex min-h-24 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#05070a]/50 px-4 py-3 backdrop-blur-xl md:h-24 md:flex-nowrap md:px-10 md:py-0">
             <div
@@ -4522,7 +5412,6 @@ export function VorldXShell() {
                         key={org.id}
                         onMouseDown={() => {
                           setCurrentOrg(org);
-                          setIsMobileNavOpen(false);
                           setSearchQuery("");
                           setSearchOpen(false);
                         }}
@@ -4581,15 +5470,18 @@ export function VorldXShell() {
                     setShowRequestCenter((prev) => !prev);
                     setShowOrgSwitcher(false);
                     setShowUtilityMenu(false);
-                    void loadPermissionRequests({ force: true });
+                    void Promise.all([
+                      loadPermissionRequests({ force: true }),
+                      loadApprovalCheckpoints({ force: true })
+                    ]);
                   }}
                   className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
                 >
                   <Bell size={14} />
                   <span className="hidden sm:inline">Requests</span>
-                  {pendingPermissionRequestCount > 0 ? (
+                  {requestCenterPendingCount > 0 ? (
                     <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[11px] font-bold text-white">
-                      {pendingPermissionRequestCount}
+                      {requestCenterPendingCount}
                     </span>
                   ) : null}
                 </button>
@@ -4605,14 +5497,6 @@ export function VorldXShell() {
               >
                 <Activity size={14} />
                 <span className="hidden sm:inline">Utilities</span>
-              </button>
-
-              <button
-                onClick={() => setIsMobileNavOpen((prev) => !prev)}
-                className="md:hidden"
-                aria-label="Toggle navigation"
-              >
-                {isMobileNavOpen ? <X size={20} /> : <Menu size={20} />}
               </button>
             </div>
 
@@ -4665,6 +5549,28 @@ export function VorldXShell() {
                     <span className="ml-1 text-xs text-slate-400">{activeUsers.length} online</span>
                   </div>
                 </div>
+
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleTabChange("settings");
+                      setShowUtilityMenu(false);
+                    }}
+                    className="rounded-xl border border-white/20 bg-white/5 px-2.5 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
+                  >
+                    Settings
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSignOut()}
+                    disabled={signOutInFlight}
+                    className="inline-flex items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2.5 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                  >
+                    {signOutInFlight ? <Loader2 size={12} className="animate-spin" /> : null}
+                    Logout
+                  </button>
+                </div>
               </div>
             ) : null}
 
@@ -4687,7 +5593,6 @@ export function VorldXShell() {
                       onClick={() => {
                         setCurrentOrg(org);
                         setShowOrgSwitcher(false);
-                        setIsMobileNavOpen(false);
                       }}
                       className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition ${
                         resolvedOrg?.id === org.id
@@ -4719,10 +5624,17 @@ export function VorldXShell() {
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <div>
                     <p className="text-xs font-medium text-slate-500">Request center</p>
-                    <p className="text-xs text-slate-600">Pending {pendingPermissionRequestCount}</p>
+                    <p className="text-xs text-slate-600">
+                      Pending {requestCenterPendingCount} (Permissions {requestCenterPermissionPendingCount} | Checkpoints {requestCenterCheckpointPendingCount})
+                    </p>
+                    <p className="text-[10px] text-slate-500">
+                      {isRequestCenterScopedToCommand ? "Scope: current command chat" : "Scope: organization"}
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    {canReviewPermissionRequests && permissionRequests.length > 0 ? (
+                    {canReviewPermissionRequests &&
+                    requestCenterPermissionRequests.length > 0 &&
+                    !isRequestCenterScopedToCommand ? (
                       <button
                         onClick={() => void handleClearPermissionRequests()}
                         disabled={clearPermissionRequestsInFlight}
@@ -4741,18 +5653,26 @@ export function VorldXShell() {
                   </div>
                 </div>
 
-                {permissionRequestsLoading ? (
+                {permissionRequestsLoading || approvalCheckpointsLoading ? (
                   <div className="inline-flex items-center gap-2 px-2 py-3 text-xs text-slate-400">
                     <Loader2 size={13} className="animate-spin" />
                     Loading requests...
                   </div>
-                ) : permissionRequests.length === 0 ? (
+                ) : requestCenterPermissionRequests.length === 0 &&
+                  requestCenterApprovalCheckpoints.length === 0 ? (
                   <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-4 text-xs text-slate-500">
-                    No permission requests right now.
+                    No permission requests or checkpoints right now.
                   </p>
                 ) : (
                   <div className="vx-scrollbar max-h-[55vh] space-y-2 overflow-y-auto pr-1">
-                    {permissionRequests.map((item) => (
+                    {requestCenterPermissionRequests.length > 0 ? (
+                      <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/8 p-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-cyan-200">
+                          Permission Requests
+                        </p>
+                      </div>
+                    ) : null}
+                    {requestCenterPermissionRequests.map((item) => (
                       <div
                         key={item.id}
                         className="rounded-2xl border border-white/10 bg-black/25 p-3"
@@ -4813,6 +5733,65 @@ export function VorldXShell() {
                         ) : null}
                       </div>
                     ))}
+
+                    {requestCenterApprovalCheckpoints.length > 0 ? (
+                      <div className="rounded-xl border border-violet-500/25 bg-violet-500/8 p-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-violet-200">
+                          Approval Checkpoints
+                        </p>
+                      </div>
+                    ) : null}
+                    {requestCenterApprovalCheckpoints.map((item) => (
+                      <div key={item.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-white">Checkpoint {item.id.slice(0, 8)}</p>
+                            <p className="text-xs text-slate-500">
+                              {item.status} | Flow {item.flowId ? item.flowId.slice(0, 8) : "N/A"} | Task {item.taskId ? item.taskId.slice(0, 8) : "N/A"}
+                            </p>
+                          </div>
+                          {item.status === "PENDING" ? (
+                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
+                              Pending
+                            </span>
+                          ) : (
+                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
+                              {item.status}
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Requested {new Date(item.requestedAt).toLocaleString()}
+                        </p>
+                        {item.resolutionNote ? (
+                          <p className="mt-1 text-xs text-slate-400">Resolution note: {item.resolutionNote}</p>
+                        ) : null}
+
+                        {item.status === "PENDING" ? (
+                          <div className="mt-2 flex items-center gap-2">
+                            <button
+                              onClick={() =>
+                                void handleApprovalCheckpointDecision(item.id, "APPROVE")
+                              }
+                              disabled={approvalCheckpointActionId === item.id}
+                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                            >
+                              {approvalCheckpointActionId === item.id ? "Working..." : "Approve"}
+                            </button>
+                            <button
+                              onClick={() =>
+                                void handleApprovalCheckpointDecision(item.id, "REJECT")
+                              }
+                              disabled={approvalCheckpointActionId === item.id}
+                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -4820,12 +5799,55 @@ export function VorldXShell() {
           </header>
 
           <section
-            className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-4 py-6 md:px-10 md:py-10 ${
+            className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-4 py-6 pb-28 md:px-10 md:py-10 md:pb-32 ${
               resolvedOrg && activeTab === "control"
-                ? "min-h-0 overflow-hidden py-4 md:py-6"
+                ? "min-h-0 overflow-y-auto py-4 pb-44 md:py-6 md:pb-48"
                 : "overflow-y-auto"
             }`}
           >
+            {resolvedOrg && workspaceMode === "OPERATIONS" ? (
+              <div className="mb-4 space-y-2">
+                <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/35 p-2">
+                  {PRIMARY_WORKSPACE_TABS.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => handlePrimaryWorkspaceTabSwitch(tab.id)}
+                      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
+                        primaryWorkspaceTab === tab.id
+                          ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                          : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+                      }`}
+                    >
+                      <tab.icon size={13} />
+                      {tab.label}
+                      <span className="hidden text-[10px] font-normal text-slate-400 lg:inline">
+                        {tab.helper}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/25 p-2">
+                  {activePrimaryNavItems.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => handleOperationTabChange(item.id as OperationTabId)}
+                      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
+                        activeTab === item.id
+                          ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                          : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+                      }`}
+                    >
+                      <item.icon size={13} />
+                      {item.navLabel}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {orgBootstrapStatus === "loading" && !resolvedOrg ? (
               <WorkspaceBootstrapState themeStyle={themeStyle} />
             ) : orgBootstrapStatus === "failed" && !resolvedOrg ? (
@@ -4847,27 +5869,110 @@ export function VorldXShell() {
                 }}
               />
             ) : activeTab === "control" ? (
-              <ControlDeckHumanTouch
-                mode={controlMode}
-                appTheme={theme}
-                turns={directionTurns}
-                message={controlMessage}
-                onModeChange={(nextMode) => {
-                  setControlMode(nextMode);
-                  setControlEngaged(true);
-                  if (nextMode === "DIRECTION") {
-                    setControlConversationDetail("DIRECTION_GIVEN");
-                  } else {
-                    setControlConversationDetail("REASONING_MIN");
-                  }
+              <ControlDeckSurface
+                themeStyle={{
+                  accent: themeStyle.accent,
+                  accentSoft: themeStyle.accentSoft,
+                  border: themeStyle.border
                 }}
+                mode={controlMode}
+                conversationDetail={controlConversationDetail}
+                engaged={controlEngaged}
+                directionGiven={intent}
+                turns={directionTurns}
+                directionModelId={directionModelId}
+                directionModels={DIRECTION_MODELS}
                 directionChatInFlight={directionChatInFlight}
                 directionPlanningInFlight={directionPlanningInFlight}
+                planningResult={directionPlanningResult}
+                message={controlMessage}
+                onDismissMessage={() => setControlMessage(null)}
+                agentRunResult={agentRunResult}
+                agentRunInputValues={agentRunInputValues}
+                pendingPlanLaunchApproval={pendingPlanLaunchApproval}
+                pendingEmailApproval={pendingEmailApproval}
+                pendingToolkitApproval={pendingToolkitApproval}
+                agentInputSourceUrl={agentRunInputSourceUrl}
+                agentInputFile={agentRunInputFile}
                 agentInputSubmitting={agentRunInputSubmitting}
                 agentActionBusy={launchInFlight || toolkitConnectInFlight}
-                onSendMessage={async (message, modeForMessage) => {
+                historyItems={controlThreadHistory}
+                activeHistoryId={activeControlThreadId}
+                onCreateThread={handleCreateControlThread}
+                onSelectThread={handleLoadControlThread}
+                onModeChange={handleSwitchControlMode}
+                onConversationDetailChange={setControlConversationDetail}
+                onDirectionGivenChange={setIntent}
+                onAgentInputValueChange={(key, value) =>
+                  setAgentRunInputValues((prev) => ({
+                    ...prev,
+                    [key]: value
+                  }))
+                }
+                onAgentInputSourceUrlChange={setAgentRunInputSourceUrl}
+                onAgentInputFileChange={setAgentRunInputFile}
+                onSubmitAgentInputs={() => {
+                  void handleSubmitAgentInputs();
+                }}
+                onRejectAgentInput={handleRejectAgentInput}
+                onApprovePlanLaunch={() => {
+                  void handleApprovePlanLaunch();
+                }}
+                onRejectPlanLaunch={handleRejectPlanLaunch}
+                onApproveEmailDraft={() => {
+                  void handleApproveEmailDraft();
+                }}
+                onRejectEmailDraft={handleRejectEmailDraft}
+                onApproveToolkitAccess={() => {
+                  void handleApproveToolkitAccess();
+                }}
+                onRejectToolkitAccess={handleRejectToolkitAccess}
+                onOpenTools={() => handleTabChange("hub")}
+                onDirectionModelChange={setDirectionModelId}
+                onEngageWithMode={(nextMode) => {
+                  handleSwitchControlMode(nextMode);
+                  setControlEngaged(true);
+                }}
+                onVoiceIntent={handleVoiceIntent}
+                isRecordingIntent={isRecordingIntent}
+                onSendMessage={async (message, modeForMessage, attachmentPayload) => {
+                  const attachments = attachmentPayload?.files ?? [];
+                  const basePrompt = message.trim();
+                  if (!basePrompt && attachments.length === 0) {
+                    return;
+                  }
+
+                  if (!activeControlThreadId) {
+                    handleCreateControlThread(modeForMessage);
+                  }
+
+                  let prompt = basePrompt || "Use the attached files as the command context.";
+                  const attachmentRefs: string[] = [];
+                  if (attachments.length > 0) {
+                    try {
+                      for (const file of attachments) {
+                        const fileRef = await uploadHumanInputToHub({
+                          file,
+                          name: file.name
+                        });
+                        attachmentRefs.push(fileRef);
+                      }
+                    } catch (error) {
+                      setControlMessage({
+                        tone: "error",
+                        text: error instanceof Error ? error.message : "Failed to upload attachments."
+                      });
+                      return;
+                    }
+                    prompt = `${prompt}\n\nHub attachment refs: ${attachmentRefs.join(", ")}`;
+                    setControlMessage({
+                      tone: "success",
+                      text: `Attached ${attachments.length} file(s) to Hub input context.`
+                    });
+                  }
+
                   if (modeForMessage === "MINDSTORM") {
-                    const trimmed = message.trim();
+                    const trimmed = prompt.trim();
                     if (!trimmed) {
                       return;
                     }
@@ -4951,11 +6056,11 @@ export function VorldXShell() {
                       return;
                     }
 
-                    setDirectionPrompt(message);
-                    await handleDirectionChat(message, "MINDSTORM");
+                    setDirectionPrompt(trimmed);
+                    await handleDirectionChat(trimmed, "MINDSTORM");
                     return;
                   }
-                  const trimmed = message.trim();
+                  const trimmed = prompt.trim();
                   if (!trimmed) {
                     return;
                   }
@@ -5068,7 +6173,12 @@ export function VorldXShell() {
                   setAgentRunInputSourceUrl("");
                   setAgentRunInputFile(null);
                   setIntent(trimmed);
-                  await handleDirectionChat(trimmed, "DIRECTION");
+                  setDirectionPrompt(trimmed);
+                  await handleGenerateDirectionPlans(trimmed, {
+                    toolkitHints: inferToolkitsFromDirectionPrompt(trimmed),
+                    navigateToPlanTab: false,
+                    autoLaunch: true
+                  });
                 }}
               />
             ) : activeTab === "flow" ? (
@@ -5101,6 +6211,15 @@ export function VorldXShell() {
               />
             ) : activeTab === "plan" ? (
               <PlanConsole
+                orgId={resolvedOrg.id}
+                themeStyle={{
+                  accent: themeStyle.accent,
+                  accentSoft: themeStyle.accentSoft,
+                  border: themeStyle.border
+                }}
+              />
+            ) : activeTab === "calendar" ? (
+              <CalendarConsole
                 orgId={resolvedOrg.id}
                 themeStyle={{
                   accent: themeStyle.accent,
@@ -5145,15 +6264,6 @@ export function VorldXShell() {
                   border: themeStyle.border
                 }}
               />
-            ) : activeTab === "collab" ? (
-              <CollaborationConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-              />
             ) : activeTab === "settings" ? (
               <SettingsConsole
                 orgId={resolvedOrg.id}
@@ -5176,6 +6286,71 @@ export function VorldXShell() {
             )}
           </section>
         </main>
+      </div>
+
+      <div className="pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4">
+        <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-white/15 bg-[#060b13]/92 p-1 shadow-[0_18px_50px_rgba(0,0,0,0.55)] backdrop-blur-xl">
+          <button
+            type="button"
+            onClick={() => handleWorkspaceModeSwitch("BRAINSTORM")}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+              workspaceMode === "BRAINSTORM"
+                ? "bg-cyan-500/20 text-cyan-100"
+                : "text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            <Bot size={14} />
+            Brainstorming
+          </button>
+          <button
+            type="button"
+            onClick={() => handleWorkspaceModeSwitch("COMMAND")}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+              workspaceMode === "COMMAND"
+                ? "bg-cyan-500/20 text-cyan-100"
+                : "text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            <Command size={14} />
+            Command
+          </button>
+          <button
+            type="button"
+            onClick={() => handleWorkspaceModeSwitch("OPERATIONS")}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+              workspaceMode === "OPERATIONS"
+                ? "bg-cyan-500/20 text-cyan-100"
+                : "text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            <Workflow size={14} />
+            Operations
+          </button>
+          <button
+            type="button"
+            onClick={() => handleWorkspaceModeSwitch("HUB")}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+              workspaceMode === "HUB"
+                ? "bg-cyan-500/20 text-cyan-100"
+                : "text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            <FolderOpen size={14} />
+            Hub
+          </button>
+          <button
+            type="button"
+            onClick={() => handleWorkspaceModeSwitch("CALENDAR")}
+            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+              workspaceMode === "CALENDAR"
+                ? "bg-cyan-500/20 text-cyan-100"
+                : "text-slate-300 hover:bg-white/10"
+            }`}
+          >
+            <CalendarDays size={14} />
+            Calendar
+          </button>
+        </div>
       </div>
 
       <div
@@ -5505,6 +6680,7 @@ function ControlDeckSurface({
   directionPlanningInFlight,
   planningResult,
   message,
+  onDismissMessage,
   agentRunResult,
   agentRunInputValues,
   pendingPlanLaunchApproval,
@@ -5514,6 +6690,10 @@ function ControlDeckSurface({
   agentInputFile,
   agentInputSubmitting,
   agentActionBusy,
+  historyItems,
+  activeHistoryId,
+  onCreateThread,
+  onSelectThread,
   onModeChange,
   onConversationDetailChange,
   onDirectionGivenChange,
@@ -5547,6 +6727,7 @@ function ControlDeckSurface({
   directionPlanningInFlight: boolean;
   planningResult: DirectionPlanningResult | null;
   message: ControlMessage | null;
+  onDismissMessage?: () => void;
   agentRunResult: AgentRunResponse | null;
   agentRunInputValues: Record<string, string>;
   pendingPlanLaunchApproval: PendingPlanLaunchApproval | null;
@@ -5556,6 +6737,10 @@ function ControlDeckSurface({
   agentInputFile: File | null;
   agentInputSubmitting: boolean;
   agentActionBusy: boolean;
+  historyItems: ControlThreadHistoryItem[];
+  activeHistoryId: string | null;
+  onCreateThread: (mode?: ControlMode) => void;
+  onSelectThread: (threadId: string) => void;
   onModeChange: (value: ControlMode) => void;
   onConversationDetailChange: (value: ControlConversationDetail) => void;
   onDirectionGivenChange: (value: string) => void;
@@ -5573,17 +6758,23 @@ function ControlDeckSurface({
   onOpenTools: () => void;
   onDirectionModelChange: (value: (typeof DIRECTION_MODELS)[number]["id"]) => void;
   onEngageWithMode: (value: ControlMode) => void;
-  onSendMessage: (message: string, mode: ControlMode) => Promise<void>;
+  onSendMessage: (
+    message: string,
+    mode: ControlMode,
+    attachments?: ComposerAttachmentPayload
+  ) => Promise<void>;
   onVoiceIntent: () => void;
   isRecordingIntent: boolean;
 }) {
   const [composer, setComposer] = useState("");
   const [sending, setSending] = useState(false);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [showActionQueue, setShowActionQueue] = useState(true);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const hasConversation = turns.length > 0;
   const hasDirectionDraft = directionGiven.trim().length > 0;
   const isBusy =
@@ -5593,27 +6784,39 @@ function ControlDeckSurface({
     agentActionBusy ||
     agentInputSubmitting;
   const isApprovalBusy = sending || agentActionBusy || agentInputSubmitting;
-  const showLanding = !hasConversation && !hasDirectionDraft;
   const requiredInputs = agentRunResult?.status === "needs_input" ? agentRunResult.required_inputs ?? [] : [];
   const hasActionCards =
-    Boolean(planningResult?.analysis) ||
     Boolean(pendingPlanLaunchApproval) ||
     Boolean(pendingToolkitApproval) ||
     Boolean(pendingEmailApproval) ||
     agentRunResult?.status === "needs_input";
-  const actionQueueCount = Number(Boolean(planningResult?.analysis)) +
-    Number(Boolean(pendingPlanLaunchApproval)) +
+  const showLanding =
+    !hasConversation &&
+    !hasDirectionDraft &&
+    !hasActionCards &&
+    !planningResult?.analysis;
+  const actionQueueCount = Number(Boolean(pendingPlanLaunchApproval)) +
     Number(Boolean(pendingToolkitApproval)) +
     Number(Boolean(pendingEmailApproval)) +
     Number(agentRunResult?.status === "needs_input");
+  const showCommandDraftPanel = false;
+  const modeHistoryItems = useMemo(
+    () => historyItems.filter((item) => item.mode === mode),
+    [historyItems, mode]
+  );
+  const workspaceTitle = mode === "DIRECTION" ? "Command Workspace" : "Brainstorm Workspace";
+  const workspaceSubtitle =
+    mode === "DIRECTION"
+      ? "Codex-style command execution with planning and run trace."
+      : "Idea exploration, quick strategy, and freeform discussion.";
   const placeholder =
     mode === "MINDSTORM"
       ? "Ask anything about ideas, planning, or execution..."
-      : "Give the direction the organization should shift toward...";
+      : "Describe the command. We will analyze, plan, execute, and report in this thread.";
   const heroTitle =
     mode === "MINDSTORM"
       ? "What should we work on next?"
-      : "Where should the organization move next?";
+      : "What command should run next?";
 
   useEffect(() => {
     if (!showAttachMenu) {
@@ -5649,9 +6852,26 @@ function ControlDeckSurface({
     onOpenTools();
   }, [onOpenTools]);
 
+  const handlePickFiles = useCallback(() => {
+    setShowAttachMenu(false);
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileSelection = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(event.target.files ?? []);
+    if (picked.length > 0) {
+      setSelectedFiles((previous) => [...previous, ...picked]);
+    }
+    event.currentTarget.value = "";
+  }, []);
+
+  const handleRemoveSelectedFile = useCallback((targetIndex: number) => {
+    setSelectedFiles((previous) => previous.filter((_, index) => index !== targetIndex));
+  }, []);
+
   const handleSend = useCallback(async () => {
     const text = composer.trim();
-    if (!text || isBusy) {
+    if ((!text && selectedFiles.length === 0) || isBusy) {
       return;
     }
 
@@ -5660,15 +6880,25 @@ function ControlDeckSurface({
       if (!engaged) {
         onEngageWithMode(mode);
       }
-      await onSendMessage(text, mode);
-      if (mode === "DIRECTION") {
+      await onSendMessage(text, mode, { files: selectedFiles });
+      if (mode === "DIRECTION" && text) {
         onDirectionGivenChange(text);
       }
       setComposer("");
+      setSelectedFiles([]);
     } finally {
       setSending(false);
     }
-  }, [composer, engaged, isBusy, mode, onDirectionGivenChange, onEngageWithMode, onSendMessage]);
+  }, [
+    composer,
+    engaged,
+    isBusy,
+    mode,
+    onDirectionGivenChange,
+    onEngageWithMode,
+    onSendMessage,
+    selectedFiles
+  ]);
 
   const composerBar = (
     <div className="relative overflow-visible rounded-[24px] border border-white/15 bg-[#02060d]/90 p-1.5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] backdrop-blur-xl sm:rounded-[30px] sm:p-2">
@@ -5695,7 +6925,7 @@ function ControlDeckSurface({
               <button
                 type="button"
                 role="menuitem"
-                onClick={handleCloseAttachMenu}
+                onClick={handlePickFiles}
                 className="flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left text-sm font-medium text-slate-100 transition hover:bg-white/10"
               >
                 <span className="inline-flex items-center gap-2.5">
@@ -5773,6 +7003,14 @@ function ControlDeckSurface({
           ) : null}
         </div>
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          onChange={handleFileSelection}
+          className="hidden"
+        />
+
         <textarea
           value={composer}
           onChange={(event) => setComposer(event.target.value)}
@@ -5797,13 +7035,34 @@ function ControlDeckSurface({
 
         <button
           onClick={() => void handleSend()}
-          disabled={isBusy || !composer.trim()}
+          disabled={isBusy || (!composer.trim() && selectedFiles.length === 0)}
           className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-400/45 bg-gradient-to-br from-cyan-300 to-emerald-300 text-slate-950 shadow-[0_10px_24px_rgba(34,211,238,0.35)] transition hover:brightness-105 disabled:opacity-60 sm:h-10 sm:w-10"
-          title={mode === "MINDSTORM" ? "Send Message" : "Generate Plan"}
+          title={mode === "MINDSTORM" ? "Send Message" : "Run Command"}
         >
           {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUpRight size={16} />}
         </button>
       </div>
+
+      {selectedFiles.length > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-1.5 px-1">
+          {selectedFiles.map((file, index) => (
+            <span
+              key={`${file.name}-${file.size}-${index}`}
+              className="inline-flex max-w-full items-center gap-1 rounded-full border border-white/20 bg-white/10 px-2 py-1 text-[11px] text-slate-100"
+            >
+              <span className="max-w-[11rem] truncate">{file.name}</span>
+              <button
+                type="button"
+                onClick={() => handleRemoveSelectedFile(index)}
+                className="rounded-full p-0.5 text-slate-300 transition hover:bg-white/15 hover:text-white"
+                aria-label={`Remove ${file.name}`}
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 
@@ -5812,7 +7071,8 @@ function ControlDeckSurface({
       <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-xs text-slate-500">Control interface</p>
-          <p className="text-sm font-medium text-slate-200 sm:text-base">Talk to your organization</p>
+          <p className="text-sm font-medium text-slate-200 sm:text-base">{workspaceTitle}</p>
+          <p className="mt-0.5 text-xs text-slate-400">{workspaceSubtitle}</p>
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
@@ -5835,20 +7095,28 @@ function ControlDeckSurface({
                   : "text-slate-300 hover:bg-white/10"
               }`}
             >
-              Direction
+              Command
             </button>
           </div>
 
           <button
             type="button"
-            onClick={() => setShowActionQueue((prev) => !prev)}
-            className={`inline-flex items-center justify-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
-              showActionQueue
-                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+            onClick={() => setShowHistoryPanel((prev) => !prev)}
+            className={`inline-flex items-center justify-center rounded-full border px-4 py-2 text-xs font-semibold transition ${
+              showHistoryPanel
+                ? "border-cyan-400/40 bg-cyan-500/12 text-cyan-200"
                 : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
             }`}
           >
-            Action Queue {hasActionCards ? `(${actionQueueCount})` : "(0)"}
+            History
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onCreateThread(mode)}
+            className="inline-flex items-center justify-center rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-300 transition hover:bg-white/10"
+          >
+            New Chat
           </button>
 
           <button
@@ -5860,10 +7128,78 @@ function ControlDeckSurface({
                 : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
             }`}
           >
-            Advanced
+            Advanced {showAdvanced ? "On" : "Off"}
           </button>
         </div>
       </div>
+
+      {message ? (
+        <div
+          className={`inline-flex max-w-full items-center gap-2 self-start rounded-xl border px-3 py-2 text-xs backdrop-blur ${
+            message.tone === "success"
+              ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+              : message.tone === "warning"
+                ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                : "border-red-500/40 bg-red-500/15 text-red-300"
+          }`}
+        >
+          <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+            {message.text}
+          </span>
+          {onDismissMessage ? (
+            <button
+              type="button"
+              onClick={onDismissMessage}
+              className="shrink-0 rounded-full border border-white/20 p-1 text-slate-200 transition hover:bg-white/10"
+              aria-label="Dismiss status message"
+            >
+              <X size={12} />
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {showHistoryPanel ? (
+        <div className="vx-scrollbar max-h-44 overflow-y-auto rounded-2xl border border-white/10 bg-black/25 p-2">
+          <p className="px-2 pb-1 text-[10px] uppercase tracking-[0.16em] text-slate-500">
+            {mode === "DIRECTION" ? "Command history" : "Brainstorm history"}
+          </p>
+          {modeHistoryItems.length === 0 ? (
+            <p className="px-2 py-2 text-xs text-slate-500">
+              No {mode === "DIRECTION" ? "command" : "brainstorm"} history yet.
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {modeHistoryItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    onSelectThread(item.id);
+                    setShowHistoryPanel(false);
+                  }}
+                  className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2 text-left transition ${
+                    activeHistoryId === item.id
+                      ? "border border-cyan-500/35 bg-cyan-500/10 text-cyan-100"
+                      : "border border-transparent text-slate-300 hover:border-white/10 hover:bg-white/5"
+                  }`}
+                >
+                  <span className="min-w-0">
+                    <span className="block truncate text-xs font-semibold">
+                      {item.title || "Untitled Session"}
+                    </span>
+                    <span className="block text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                      {item.mode === "DIRECTION" ? "Command" : "Brainstorm"} |{" "}
+                      {new Date(item.updatedAt).toLocaleString()}
+                    </span>
+                  </span>
+                  <ChevronRight size={14} className="shrink-0 text-slate-500" />
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : null}
 
       {showAdvanced ? (
         <div className={`vx-panel grid gap-3 rounded-2xl p-3 sm:grid-cols-[minmax(0,280px)_1fr] ${themeStyle.border}`}>
@@ -5911,7 +7247,7 @@ function ControlDeckSurface({
                     : "text-slate-300 hover:bg-white/10"
                 }`}
               >
-                Show direction
+                Show command context
               </button>
             </div>
           </div>
@@ -5919,10 +7255,10 @@ function ControlDeckSurface({
       ) : null}
 
       <div
-        className={`vx-panel relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#030a12]/90 p-3 shadow-[0_28px_70px_rgba(0,0,0,0.5)] sm:rounded-[30px] sm:p-4 ${themeStyle.border}`}
+        className={`vx-panel relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#060a10]/96 p-3 shadow-[0_28px_70px_rgba(0,0,0,0.5)] sm:rounded-[30px] sm:p-4 ${themeStyle.border}`}
       >
-        <div className="pointer-events-none absolute -left-20 top-0 h-52 w-52 rounded-full bg-cyan-500/10 blur-3xl" />
-        <div className="pointer-events-none absolute -right-16 bottom-0 h-52 w-52 rounded-full bg-emerald-500/10 blur-3xl" />
+        <div className="pointer-events-none absolute -left-20 top-0 h-52 w-52 rounded-full bg-cyan-500/6 blur-3xl" />
+        <div className="pointer-events-none absolute -right-16 bottom-0 h-52 w-52 rounded-full bg-emerald-500/5 blur-3xl" />
         {showLanding ? (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-3">
             <h2 className="text-center font-display text-3xl font-black tracking-[0.01em] text-slate-100 md:text-5xl">
@@ -5936,40 +7272,35 @@ function ControlDeckSurface({
                 </p>
               </div>
             ) : null}
-
-            <div className="mt-8 w-full max-w-4xl">{composerBar}</div>
           </div>
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col gap-3">
-            {conversationDetail === "DIRECTION_GIVEN" && hasDirectionDraft ? (
-              <div className="rounded-2xl border border-cyan-500/25 bg-gradient-to-b from-cyan-500/10 via-cyan-500/5 to-transparent p-3">
+            {showCommandDraftPanel ? (
+              <div className="rounded-2xl border border-cyan-400/35 bg-[#0b121b] p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs text-cyan-200/85">Direction draft</p>
-                  <span className="text-xs text-cyan-100/65">
+                  <p className="text-xs font-semibold text-cyan-200">
+                    Command draft
+                  </p>
+                  <span className="text-xs text-cyan-100/80">
                     {directionGiven.trim().length} chars
                   </span>
                 </div>
                 <textarea
                   value={directionGiven}
                   onChange={(event) => onDirectionGivenChange(event.target.value)}
-                  className="mt-2 h-20 w-full resize-none rounded-xl border border-white/15 bg-black/45 px-3 py-2 text-sm leading-6 text-slate-100 outline-none"
+                  className="mt-2 h-20 w-full resize-none rounded-xl border border-white/20 bg-[#05080f] px-3 py-2 text-sm leading-6 text-slate-100 outline-none"
                 />
               </div>
             ) : null}
 
-            {hasActionCards && showActionQueue ? (
-              <div className="vx-scrollbar max-h-[38vh] space-y-3 overflow-y-auto pr-0 sm:pr-1">
+            {hasActionCards ? (
+              <div className="vx-scrollbar max-h-[17vh] space-y-3 overflow-y-auto pr-0 sm:pr-1">
                 <div className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">
-                  <p className="text-xs font-semibold text-slate-200">Action Queue</p>
+                  <p className="text-xs font-semibold text-slate-200">
+                    Action Queue ({actionQueueCount})
+                  </p>
                   <p className="text-xs text-slate-500">Review approvals and missing inputs.</p>
                 </div>
-                {planningResult?.analysis ? (
-                  <div className="max-h-40 overflow-y-auto rounded-2xl border border-cyan-500/30 bg-gradient-to-b from-cyan-500/15 via-cyan-500/8 to-transparent px-3 py-2 text-sm leading-6 text-cyan-100">
-                    <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                      {planningResult.analysis}
-                    </p>
-                  </div>
-                ) : null}
 
                 {pendingPlanLaunchApproval ? (
                   <div className="rounded-2xl border border-cyan-500/35 bg-gradient-to-b from-cyan-500/14 to-cyan-500/6 p-3">
@@ -6168,48 +7499,37 @@ function ControlDeckSurface({
               </div>
             ) : null}
 
-            <div className="vx-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto pr-0 sm:pr-1">
+            <div className="vx-scrollbar h-[50vh] min-h-[320px] max-h-[65vh] flex-1 space-y-3 overflow-y-auto rounded-2xl border border-white/10 bg-[#050910]/72 p-2.5 pb-24 pr-0 sm:h-[58vh] sm:min-h-[420px] sm:max-h-[72vh] sm:pr-1 sm:p-3 sm:pb-28">
               {turns.map((turn) => (
                 <div
                   key={turn.id}
-                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.3)] backdrop-blur sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
+                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.35)] backdrop-blur sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
                     turn.role === "owner"
-                      ? "ml-auto border-cyan-300/45 bg-gradient-to-br from-cyan-500/30 to-cyan-500/12 text-cyan-50 shadow-[0_14px_34px_rgba(34,211,238,0.26)]"
-                      : "mr-auto border-slate-600/55 bg-slate-900/90 text-slate-100"
+                      ? "ml-auto border-cyan-300/55 bg-cyan-500/22 text-white shadow-[0_14px_34px_rgba(34,211,238,0.2)]"
+                      : "mr-auto border-slate-500/55 bg-[#0b1220] text-slate-100"
                   }`}
                 >
                   <p
                     className={`text-xs font-semibold ${
-                      turn.role === "owner" ? "text-cyan-100/85" : "text-slate-300/90"
+                      turn.role === "owner" ? "text-cyan-100" : "text-slate-300"
                     }`}
                   >
                     {turn.role === "owner" ? "You" : "Organization"}
                     {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
                   </p>
-                  <p className="mt-1.5 whitespace-pre-wrap break-words font-sans text-[15px] leading-6 tracking-normal text-slate-100 [overflow-wrap:anywhere]">
+                  <p className="mt-1.5 whitespace-pre-wrap break-words font-sans text-[12px] leading-5 tracking-normal text-slate-50 [overflow-wrap:anywhere]">
                     {turn.content}
                   </p>
                 </div>
               ))}
             </div>
-
-            <div className="mx-auto w-full max-w-4xl pt-1">{composerBar}</div>
           </div>
         )}
 
-        {message ? (
-          <div
-            className={`mt-3 rounded-xl border px-3 py-2 text-xs backdrop-blur ${
-              message.tone === "success"
-                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
-                : message.tone === "warning"
-                  ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
-                  : "border-red-500/40 bg-red-500/15 text-red-300"
-            }`}
-          >
-            {message.text}
-          </div>
-        ) : null}
+      </div>
+
+      <div className="pointer-events-none fixed inset-x-0 bottom-[4.7rem] z-30 flex justify-center px-4">
+        <div className="pointer-events-auto w-full max-w-4xl">{composerBar}</div>
       </div>
     </div>
   );

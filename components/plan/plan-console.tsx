@@ -142,6 +142,18 @@ interface PlanDependencyView {
   reason: string;
 }
 
+interface PlanPathwayStepView {
+  stepId: string;
+  line: number;
+  workflowTitle: string;
+  taskTitle: string;
+  ownerRole: string;
+  executionMode: string;
+  trigger: string;
+  dueWindow: string;
+  dependsOn: string[];
+}
+
 interface ExecutionPlanView {
   objective: string;
   organizationFitSummary: string;
@@ -151,6 +163,7 @@ interface ExecutionPlanView {
   resourcePlan: PlanResourceAllocationView[];
   approvalCheckpoints: PlanApprovalCheckpointView[];
   dependencies: PlanDependencyView[];
+  pathway: PlanPathwayStepView[];
   workflows: PlanWorkflowView[];
   risks: string[];
   successMetrics: string[];
@@ -263,6 +276,31 @@ function normalizeDependency(value: unknown): PlanDependencyView | null {
   };
 }
 
+function normalizePathwayStep(value: unknown, index: number): PlanPathwayStepView | null {
+  const record = asRecord(value);
+  const workflowTitle = asTrimmedText(record.workflowTitle);
+  const taskTitle = asTrimmedText(record.taskTitle);
+  if (!workflowTitle || !taskTitle) return null;
+  const parsedLine =
+    typeof record.line === "number"
+      ? record.line
+      : typeof record.line === "string"
+        ? Number.parseInt(record.line, 10)
+        : Number.NaN;
+  const line = Number.isFinite(parsedLine) && parsedLine > 0 ? Math.floor(parsedLine) : index + 1;
+  return {
+    stepId: asTrimmedText(record.stepId) || `pathway-step-${line}`,
+    line,
+    workflowTitle,
+    taskTitle,
+    ownerRole: asTrimmedText(record.ownerRole) || "EMPLOYEE",
+    executionMode: asTrimmedText(record.executionMode) || "HYBRID",
+    trigger: asTrimmedText(record.trigger) || "After previous step completion",
+    dueWindow: asTrimmedText(record.dueWindow) || "Execution window",
+    dependsOn: asStringList(record.dependsOn, 10)
+  };
+}
+
 function normalizeExecutionPlan(value: Record<string, unknown> | null): ExecutionPlanView {
   const record = asRecord(value);
   const workflowRows = Array.isArray(record.workflows) ? record.workflows : [];
@@ -270,6 +308,7 @@ function normalizeExecutionPlan(value: Record<string, unknown> | null): Executio
   const resourceRows = Array.isArray(record.resourcePlan) ? record.resourcePlan : [];
   const approvalRows = Array.isArray(record.approvalCheckpoints) ? record.approvalCheckpoints : [];
   const dependencyRows = Array.isArray(record.dependencies) ? record.dependencies : [];
+  const pathwayRows = Array.isArray(record.pathway) ? record.pathway : [];
 
   return {
     objective: asTrimmedText(record.objective),
@@ -292,6 +331,11 @@ function normalizeExecutionPlan(value: Record<string, unknown> | null): Executio
       .map((item) => normalizeDependency(item))
       .filter((item): item is PlanDependencyView => Boolean(item))
       .slice(0, 20),
+    pathway: pathwayRows
+      .map((item, index) => normalizePathwayStep(item, index))
+      .filter((item): item is PlanPathwayStepView => Boolean(item))
+      .sort((a, b) => a.line - b.line)
+      .slice(0, 120),
     workflows: workflowRows.slice(0, 12).map((workflow, index) => {
       const workflowRecord = asRecord(workflow);
       const tasks = Array.isArray(workflowRecord.tasks) ? workflowRecord.tasks : [];
@@ -558,6 +602,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const activeMilestoneCount = activePlanView.milestones.length;
   const activeResourceCount = activePlanView.resourcePlan.length;
   const activeCheckpointCount = activePlanView.approvalCheckpoints.length;
+  const activePathwayCount = activePlanView.pathway.length;
   const selectedUpdatedAt = selectedPlan ? new Date(selectedPlan.updatedAt).toLocaleString() : "No plan selected";
   const planInsightsById = useMemo(() => {
     return plans.reduce<
@@ -568,9 +613,11 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
           primaryStepCount: number;
           primaryApprovalCount: number;
           primaryDetailScore: number;
+          primaryPathwayCount: number;
           fallbackWorkflowCount: number;
           fallbackStepCount: number;
           fallbackDetailScore: number;
+          fallbackPathwayCount: number;
         }
       >
     >((accumulator, item) => {
@@ -583,9 +630,11 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
         primaryStepCount: primaryPlanSteps.length,
         primaryApprovalCount: primaryPlanSteps.filter((step) => step.requiresApproval).length,
         primaryDetailScore: primary.detailScore,
+        primaryPathwayCount: primary.pathway.length,
         fallbackWorkflowCount: fallback.workflows.length,
         fallbackStepCount: fallbackPlanSteps.length,
-        fallbackDetailScore: fallback.detailScore
+        fallbackDetailScore: fallback.detailScore,
+        fallbackPathwayCount: fallback.pathway.length
       };
       return accumulator;
     }, {});
@@ -711,6 +760,12 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                           </span>
                         </div>
                         <p className="text-[10px] text-slate-400">
+                          Pathway steps:{" "}
+                          <span className="font-semibold text-cyan-100">{insight.primaryPathwayCount}</span>
+                          {" / "}
+                          <span className="font-semibold text-amber-100">{insight.fallbackPathwayCount}</span>
+                        </p>
+                        <p className="text-[10px] text-slate-400">
                           Approvals required: <span className="font-semibold text-amber-100">{insight.primaryApprovalCount}</span>
                         </p>
                         <p className="text-[10px] text-slate-400">
@@ -828,7 +883,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                 />
               </label>
 
-              <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+              <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-7">
                 <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/10 p-3">
                   <p className="inline-flex items-center gap-2 text-[11px] text-cyan-200">
                     <Layers3 size={12} />
@@ -849,6 +904,13 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                     Approvals
                   </p>
                   <p className="mt-2 text-2xl font-black text-amber-100">{activeApprovalCount}</p>
+                </div>
+                <div className="rounded-2xl border border-indigo-500/25 bg-indigo-500/10 p-3">
+                  <p className="inline-flex items-center gap-2 text-[11px] text-indigo-200">
+                    <WorkflowIcon size={12} />
+                    Pathway
+                  </p>
+                  <p className="mt-2 text-2xl font-black text-indigo-100">{activePathwayCount}</p>
                 </div>
                 <div className="rounded-2xl border border-violet-500/25 bg-violet-500/10 p-3">
                   <p className="inline-flex items-center gap-2 text-[11px] text-violet-200">
@@ -1038,6 +1100,43 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
                         <p className="mt-2 text-xs text-slate-500">No approval checkpoints mapped.</p>
                       )}
                     </div>
+                  </div>
+
+                  <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                    <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                      Pathway Sequence ({activePathwayCount})
+                    </p>
+                    {activePlanView.pathway.length > 0 ? (
+                      <ol className="mt-2 space-y-2">
+                        {activePlanView.pathway.map((item, index) => (
+                          <li
+                            key={`${planViewTab}-pathway-${item.stepId}-${index}`}
+                            className="rounded-lg border border-white/10 bg-black/20 p-2 text-xs text-slate-200"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <p className="font-semibold text-slate-100">
+                                {item.line}. {item.workflowTitle}{" -> "}{item.taskTitle}
+                              </p>
+                              <span className="rounded-full border border-white/15 bg-black/30 px-2 py-0.5 text-[10px] text-slate-300">
+                                {item.ownerRole} | {item.executionMode}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-[11px] text-slate-400">
+                              Trigger: {item.trigger} | Window: {item.dueWindow}
+                            </p>
+                            {item.dependsOn.length > 0 ? (
+                              <p className="mt-1 text-[11px] text-slate-500">
+                                Depends on: {item.dependsOn.join(", ")}
+                              </p>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p className="mt-2 text-xs text-slate-500">
+                        No pathway sequence available in this plan view.
+                      </p>
+                    )}
                   </div>
 
                   {activePlanView.dependencies.length > 0 ? (
