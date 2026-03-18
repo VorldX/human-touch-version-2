@@ -47,6 +47,24 @@ export const agentMemoryConfig = {
   },
   retrieval: {
     defaultTopK: parsePositiveInt(process.env.AGENT_MEMORY_TOP_K, 6),
+    crossEncoderTopK: parsePositiveInt(
+      process.env.AGENT_MEMORY_CROSS_ENCODER_TOP_K,
+      3
+    ),
+    crossEncoderCandidatePool: parsePositiveInt(
+      process.env.AGENT_MEMORY_CROSS_ENCODER_CANDIDATE_POOL,
+      12
+    ),
+    crossEncoderTimeoutMs: parsePositiveInt(
+      process.env.AGENT_MEMORY_CROSS_ENCODER_TIMEOUT_MS,
+      4500
+    ),
+    crossEncoderModel:
+      process.env.AGENT_MEMORY_CROSS_ENCODER_MODEL?.trim() || "bge-reranker-v2-m3",
+    crossEncoderEndpoint:
+      process.env.AGENT_MEMORY_CROSS_ENCODER_ENDPOINT?.trim() || "",
+    crossEncoderApiKey:
+      process.env.AGENT_MEMORY_CROSS_ENCODER_API_KEY?.trim() || "",
     candidateMultiplier: parsePositiveInt(
       process.env.AGENT_MEMORY_SEARCH_CANDIDATE_MULTIPLIER,
       4
@@ -58,6 +76,22 @@ export const agentMemoryConfig = {
       0.6,
       0.99
     ),
+    timeWeighted: {
+      alpha: parseFloatInRange(process.env.AGENT_MEMORY_TIME_ALPHA, 0.72, 0, 1),
+      beta: parseFloatInRange(process.env.AGENT_MEMORY_TIME_BETA, 0.28, 0, 1),
+      lambdaPerHour: parseFloatInRange(
+        process.env.AGENT_MEMORY_TIME_LAMBDA_PER_HOUR,
+        0.08,
+        0.0001,
+        5
+      ),
+      gcThreshold: parseFloatInRange(
+        process.env.AGENT_MEMORY_TIME_GC_THRESHOLD,
+        0.2,
+        0,
+        1
+      )
+    },
     rankingWeights: {
       similarity: parseFloatInRange(
         process.env.AGENT_MEMORY_WEIGHT_SIMILARITY,

@@ -1,5 +1,8 @@
 import "server-only";
 
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { Composio } from "@composio/core";
 import type { Prisma } from "@prisma/client";
 
@@ -69,6 +72,111 @@ const DEFAULT_ALLOWLIST = [
 type UserIntegrationRow = NonNullable<
   Awaited<ReturnType<typeof prisma.userIntegration.findFirst>>
 >;
+
+let cachedLocalEnvMap: Map<string, string> | null = null;
+
+function parseEnvFileContent(raw: string) {
+  const parsed = new Map<string, string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+    const [, key, value] = match;
+    parsed.set(key, value);
+  }
+  return parsed;
+}
+
+function getLocalEnvMap() {
+  if (cachedLocalEnvMap) {
+    return cachedLocalEnvMap;
+  }
+
+  const map = new Map<string, string>();
+  const nodeEnv = process.env.NODE_ENV?.trim() || "development";
+  const envFilesInLoadOrder = [
+    ".env",
+    `.env.${nodeEnv}`,
+    ".env.local",
+    `.env.${nodeEnv}.local`
+  ];
+
+  for (const relativeFile of envFilesInLoadOrder) {
+    const absoluteFile = resolve(process.cwd(), relativeFile);
+    if (!existsSync(absoluteFile)) {
+      continue;
+    }
+    const content = readFileSync(absoluteFile, "utf8");
+    const parsed = parseEnvFileContent(content);
+    for (const [key, value] of parsed.entries()) {
+      map.set(key, value);
+    }
+  }
+
+  cachedLocalEnvMap = map;
+  return map;
+}
+
+function resolveRuntimeEnv(name: string) {
+  const fromProcess = normalizeEnvValue(process.env[name]);
+  if (fromProcess) {
+    return fromProcess;
+  }
+
+  const fromLocalEnv = normalizeEnvValue(getLocalEnvMap().get(name));
+  if (fromLocalEnv) {
+    return fromLocalEnv;
+  }
+  return undefined;
+}
+
+function resolveRuntimeEnvDiagnostics(name: string) {
+  const processRaw = process.env[name];
+  const processNormalized = normalizeEnvValue(processRaw);
+  const localRaw = getLocalEnvMap().get(name);
+  const localNormalized = normalizeEnvValue(localRaw);
+  return {
+    processRawPresent: typeof processRaw === "string",
+    processNormalizedPresent: Boolean(processNormalized),
+    localRawPresent: typeof localRaw === "string",
+    localNormalizedPresent: Boolean(localNormalized)
+  };
+}
+
+function normalizeEnvValue(value: string | undefined) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  const wrappedInDoubleQuotes = trimmed.startsWith('"') && trimmed.endsWith('"');
+  const wrappedInSingleQuotes = trimmed.startsWith("'") && trimmed.endsWith("'");
+  if (wrappedInDoubleQuotes || wrappedInSingleQuotes) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function parseBooleanRuntime(value: string | undefined, fallback = false) {
+  const normalized = normalizeEnvValue(value).toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
 
 function asJson(value: Record<string, unknown> | undefined): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value ?? {})) as Prisma.InputJsonValue;
@@ -143,41 +251,70 @@ function parseCustomToolkitAuthConfigs(allowlistedToolkits: string[]) {
 }
 
 function parseBooleanEnv(name: string, fallback: boolean) {
-  const raw = process.env[name];
-  if (typeof raw !== "string") {
-    return fallback;
-  }
-  const normalized = raw.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) {
-    return true;
-  }
-  if (["0", "false", "no", "off"].includes(normalized)) {
-    return false;
-  }
-  return fallback;
+  return parseBooleanRuntime(resolveRuntimeEnv(name), fallback);
 }
 
-function resolveComposioApiKey() {
-  const apiKey = process.env.COMPOSIO_API_KEY?.trim() ?? "";
+function resolveComposioApiKeyState() {
+  const apiKey = normalizeEnvValue(resolveRuntimeEnv("COMPOSIO_API_KEY"));
   if (!apiKey) {
-    return "";
+    return {
+      apiKey: "",
+      reason: "missing" as const
+    };
   }
 
   // Treat template placeholders as unset so local/dev environments don't keep
   // retrying Composio endpoints with invalid credentials.
   if (/^replace_with_/i.test(apiKey)) {
-    return "";
+    return {
+      apiKey: "",
+      reason: "placeholder" as const
+    };
   }
 
-  return apiKey;
+  return {
+    apiKey,
+    reason: "configured" as const
+  };
+}
+
+function resolveComposioApiKey() {
+  return resolveComposioApiKeyState().apiKey;
+}
+
+function composioFeatureEnabledRuntime() {
+  return parseBooleanRuntime(
+    resolveRuntimeEnv("FEATURE_COMPOSIO_INTEGRATIONS"),
+    featureFlags.composioIntegrations
+  );
 }
 
 function enabled() {
-  return featureFlags.composioIntegrations && Boolean(resolveComposioApiKey());
+  return composioFeatureEnabledRuntime() && Boolean(resolveComposioApiKey());
 }
 
 export function composioIntegrationEnabled() {
   return enabled();
+}
+
+export function composioIntegrationStatus() {
+  const featureEnabled = composioFeatureEnabledRuntime();
+  const apiKeyState = resolveComposioApiKeyState();
+  const apiKeyConfigured = Boolean(apiKeyState.apiKey);
+  return {
+    enabled: featureEnabled && apiKeyConfigured,
+    featureEnabled,
+    apiKeyConfigured,
+    apiKeyReason: apiKeyState.reason,
+    diagnostics:
+      process.env.NODE_ENV === "production"
+        ? undefined
+        : {
+            cwd: process.cwd(),
+            featureEnv: resolveRuntimeEnvDiagnostics("FEATURE_COMPOSIO_INTEGRATIONS"),
+            apiKeyEnv: resolveRuntimeEnvDiagnostics("COMPOSIO_API_KEY")
+          }
+  };
 }
 
 export const isConnectedIntegrationStatus = isConnectedIntegrationStatusCore;

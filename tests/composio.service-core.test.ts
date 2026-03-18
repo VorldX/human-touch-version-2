@@ -785,8 +785,9 @@ test("executeToolAction strips sender_email-like fields for Gmail send actions",
 
   assert.equal(result.successful, true);
   assert.ok(executedArguments);
-  assert.equal(executedArguments?.to, "a@example.com");
-  assert.equal(executedArguments?.cc, "cc@example.com");
+  const sentArgs = executedArguments as Record<string, unknown>;
+  assert.equal(sentArgs["to"], "a@example.com");
+  assert.equal(sentArgs["cc"], "cc@example.com");
   assert.equal("sender_email" in (executedArguments ?? {}), false);
   assert.equal("from_email" in (executedArguments ?? {}), false);
   assert.equal("from" in (executedArguments ?? {}), false);

@@ -4,8 +4,11 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { prisma } from "@/lib/db/prisma";
 import { executeAgentTool } from "@/lib/agent/tools/execute";
+import { featureFlags } from "@/lib/config/feature-flags";
 import { resolveIntegrationActor } from "@/lib/integrations/composio/request-context";
+import { hashIdempotencyRequest, withIdempotency } from "@/lib/migration/idempotency";
 import { resolveInternalApiKey } from "@/lib/security/internal-api";
+import { executeToolViaGateway } from "@/lib/tools/tool-gateway";
 
 type ExecuteBody = {
   orgId?: string;
@@ -15,6 +18,8 @@ type ExecuteBody = {
   action?: string;
   arguments?: Record<string, unknown>;
   taskId?: string;
+  agentId?: string;
+  runId?: string;
 } | null;
 
 function internalAgentKey() {
@@ -130,31 +135,83 @@ export async function POST(request: NextRequest) {
     return actorResult.response;
   }
 
-  const result = await executeAgentTool({
-    orgId: actorResult.actor.orgId,
-    userId: actorResult.actor.userId,
-    toolkit,
-    action,
-    arguments:
-      body?.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
-        ? body.arguments
-        : {},
-    ...(body?.taskId?.trim() ? { taskId: body.taskId.trim() } : {})
-  });
+  const safeArgs =
+    body?.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
+      ? body.arguments
+      : {};
+  const safeTaskId = body?.taskId?.trim() || undefined;
+  const safeAgentId = body?.agentId?.trim() || undefined;
+  const safeRunId = body?.runId?.trim() || undefined;
 
-  if (!result.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: result.error,
-        attempts: result.attempts
-      },
-      { status: statusFromErrorCode(result.error.code) }
-    );
+  const execute = async (): Promise<{ code: number; body: Record<string, unknown> }> => {
+    const gatewayResult = featureFlags.useToolGateway
+      ? await executeToolViaGateway({
+          orgId: actorResult.actor.orgId,
+          userId: actorResult.actor.userId,
+          toolkit,
+          action,
+          arguments: safeArgs,
+          ...(safeTaskId ? { taskId: safeTaskId } : {}),
+          ...(safeAgentId ? { agentId: safeAgentId } : {}),
+          ...(safeRunId ? { runId: safeRunId } : {})
+        })
+      : null;
+
+    const result =
+      gatewayResult?.result ??
+      (await executeAgentTool({
+        orgId: actorResult.actor.orgId,
+        userId: actorResult.actor.userId,
+        toolkit,
+        action,
+        arguments: safeArgs,
+        ...(safeTaskId ? { taskId: safeTaskId } : {})
+      }));
+
+    if (!result.ok) {
+      return {
+        code: statusFromErrorCode(result.error.code),
+        body: {
+          ok: false,
+          error: result.error,
+          attempts: result.attempts,
+          ...(gatewayResult?.receiptId ? { receiptId: gatewayResult.receiptId } : {})
+        }
+      };
+    }
+
+    return {
+      code: 200,
+      body: {
+        ok: true,
+        result,
+        ...(gatewayResult?.receiptId ? { receiptId: gatewayResult.receiptId } : {})
+      }
+    };
+  };
+
+  const idempotencyKey = request.headers.get("x-idempotency-key")?.trim() || "";
+  if (idempotencyKey) {
+    const replay = await withIdempotency({
+      orgId: actorResult.actor.orgId,
+      scope: "TOOL_EXECUTE",
+      key: idempotencyKey,
+      requestHash: hashIdempotencyRequest({
+        orgId: actorResult.actor.orgId,
+        userId: actorResult.actor.userId,
+        toolkit,
+        action,
+        arguments: safeArgs,
+        taskId: safeTaskId,
+        agentId: safeAgentId,
+        runId: safeRunId
+      }),
+      execute
+    });
+
+    return NextResponse.json(replay.body, { status: replay.code });
   }
 
-  return NextResponse.json({
-    ok: true,
-    result
-  });
+  const live = await execute();
+  return NextResponse.json(live.body, { status: live.code });
 }

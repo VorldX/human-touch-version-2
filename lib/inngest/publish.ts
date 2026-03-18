@@ -1,5 +1,9 @@
 import "server-only";
 
+import { featureFlags } from "@/lib/config/feature-flags";
+import { decideExecutionMode } from "@/lib/migration/strangler-router";
+import { logInfo, logWarn } from "@/lib/observability/logger";
+import { dispatchLegacyEventToQueueShadow } from "@/lib/queue/shadow-dispatch";
 import { buildInternalApiHeaders } from "@/lib/security/internal-api";
 
 export interface PublishResult {
@@ -65,6 +69,66 @@ export async function publishInngestEvent(
   eventName: string,
   data: Record<string, unknown>
 ): Promise<PublishResult> {
+  const orgId = typeof data.orgId === "string" ? data.orgId.trim() : "";
+  const decision = orgId
+    ? decideExecutionMode({ orgId })
+    : {
+        mode: "legacy_only" as const,
+        sourceOfTruth: "legacy_inngest_route" as const,
+        shadowTarget: null
+      };
+  const shouldMirrorQueue =
+    featureFlags.useQueueExecutionShadow ||
+    (decision.mode === "shadow" && decision.shadowTarget === "queue_runtime");
+  const shouldUseQueuePrimary =
+    featureFlags.useQueueExecution ||
+    (decision.mode === "queue_primary" && decision.sourceOfTruth === "queue_runtime");
+
+  if (shouldMirrorQueue || shouldUseQueuePrimary) {
+    const shadowPublish = await dispatchLegacyEventToQueueShadow({
+      name: eventName,
+      data
+    });
+
+    if (
+      shouldUseQueuePrimary &&
+      shadowPublish.ok &&
+      featureFlags.disableLegacyInngestDispatch
+    ) {
+      logInfo({
+        service: "inngest-publish",
+        orgId,
+        runId: typeof data.flowId === "string" ? data.flowId : undefined,
+        traceId: typeof data.traceId === "string" ? data.traceId : undefined,
+        event: "queue_primary_dispatch",
+        message: `Queue primary accepted ${eventName}`,
+        meta: {
+          outboxId: shadowPublish.outboxId ?? null
+        }
+      });
+      return {
+        ok: true,
+        message: `Queue primary dispatch accepted (${shadowPublish.outboxId ?? "outboxed"}).`
+      };
+    }
+
+    if (shouldUseQueuePrimary && !shadowPublish.ok) {
+      // Safety valve: queue primary falls back to legacy dispatch if queue path is unavailable.
+      logWarn({
+        service: "inngest-publish",
+        orgId,
+        runId: typeof data.flowId === "string" ? data.flowId : undefined,
+        traceId: typeof data.traceId === "string" ? data.traceId : undefined,
+        event: "queue_primary_fallback",
+        message: `Queue primary failed for ${eventName}, using legacy dispatch.`,
+        meta: {
+          reason: shadowPublish.reason,
+          error: shadowPublish.error ?? null
+        }
+      });
+    }
+  }
+
   const payload = [
     {
       name: eventName,

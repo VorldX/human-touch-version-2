@@ -729,3 +729,150 @@ model UserIntegration {
   @@index([orgId, userId])
   @@map("user_integrations")
 }
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+}
+
+enum OutboxEventStatus {
+  PENDING
+  DISPATCHING
+  DISPATCHED
+  FAILED
+}
+
+enum TaskLifecycleState {
+  CREATED
+  QUEUED
+  RUNNING
+  WAITING_TOOL
+  RETRYING
+  FAILED
+  COMPLETED
+}
+
+enum ToolExecutionStatus {
+  REQUESTED
+  SUCCEEDED
+  FAILED
+  TIMEOUT
+}
+
+model IdempotencyKey {
+  id           String            @id @default(cuid())
+  orgId        String
+  scope        String
+  key          String
+  requestHash  String
+  responseCode Int?
+  responseBody Json?
+  status       IdempotencyStatus @default(IN_PROGRESS)
+  expiresAt    DateTime
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@unique([orgId, scope, key])
+  @@index([expiresAt])
+}
+
+model ExecutionOutboxEvent {
+  id           String           @id @default(cuid())
+  orgId        String
+  runId        String
+  eventName    String
+  eventKey     String
+  payload      Json
+  traceId      String
+  status       OutboxEventStatus @default(PENDING)
+  retryCount   Int              @default(0)
+  availableAt  DateTime         @default(now())
+  dispatchedAt DateTime?
+  lastError    String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([orgId, eventKey])
+  @@index([status, availableAt])
+  @@index([runId])
+}
+
+model TaskExecutionState {
+  id              String            @id @default(cuid())
+  orgId           String
+  runId           String
+  taskId          String
+  state           TaskLifecycleState @default(CREATED)
+  assignedAgentId String?
+  priority        Int               @default(100)
+  version         Int               @default(1)
+  lastError       String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  attempts        TaskExecutionAttempt[]
+
+  @@unique([taskId])
+  @@index([runId, state, priority])
+}
+
+model TaskExecutionAttempt {
+  id          String            @id @default(cuid())
+  orgId       String
+  runId       String
+  taskId      String
+  attemptNo   Int
+  state       TaskLifecycleState
+  startedAt   DateTime          @default(now())
+  endedAt     DateTime?
+  workerId    String?
+  errorCode   String?
+  errorMessage String?
+  tokenInput  Int?
+  tokenOutput Int?
+  latencyMs   Int?
+
+  task        TaskExecutionState @relation(fields: [taskId], references: [taskId], onDelete: Cascade)
+
+  @@unique([taskId, attemptNo])
+  @@index([runId, state])
+}
+
+model ToolExecutionReceipt {
+  id           String             @id @default(cuid())
+  orgId        String
+  runId        String
+  taskId       String
+  attemptNo    Int
+  toolCallId   String
+  agentId      String?
+  tool         String
+  action       String
+  argsHash     String
+  resultHash   String?
+  status       ToolExecutionStatus
+  errorCode    String?
+  errorMessage String?
+  latencyMs    Int?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@unique([orgId, toolCallId])
+  @@index([taskId, attemptNo])
+  @@index([runId, status, createdAt])
+}
+
+model DeadLetterEvent {
+  id            String   @id @default(cuid())
+  orgId         String
+  runId         String?
+  failedJobName String
+  failedJobId   String
+  reason        String
+  payload       Json?
+  createdAt     DateTime @default(now())
+
+  @@index([orgId, createdAt])
+  @@index([runId])
+}

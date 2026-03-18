@@ -308,8 +308,10 @@ function inferPlannerFallback(
     }
   }
 
+  const hasRecipientEmailInPrompt = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(prompt);
   const sendIntent =
     /\b(send|submit|deliver|compose|draft|write|create|make|generate)\b[\s\S]*\b(email|mail)\b/i.test(prompt) ||
+    (hasRecipientEmailInPrompt && /\b(send|submit|deliver)\b/i.test(prompt)) ||
     (Boolean(draftSource) &&
       (/\b(send|approve|confirm|go ahead|ship it|send it)\b/i.test(prompt) ||
         isResendRequestMessage(prompt))) ||

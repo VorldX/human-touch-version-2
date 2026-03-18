@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   ComposioServiceError,
   composioAllowlistedToolkits,
-  composioIntegrationEnabled,
+  composioIntegrationStatus,
   getConnections,
   isConnectedIntegrationStatus,
   listAvailableToolkits
@@ -13,11 +13,17 @@ import {
 import { resolveIntegrationActor } from "@/lib/integrations/composio/request-context";
 
 export async function GET(request: NextRequest) {
-  if (!composioIntegrationEnabled()) {
+  const integrationStatus = composioIntegrationStatus();
+  if (!integrationStatus.enabled) {
     const allowlisted = composioAllowlistedToolkits();
     return NextResponse.json({
       ok: true,
       enabled: false,
+      reason: !integrationStatus.featureEnabled
+        ? "FEATURE_COMPOSIO_INTEGRATIONS is disabled."
+        : integrationStatus.apiKeyReason === "placeholder"
+          ? "COMPOSIO_API_KEY is a placeholder value."
+          : "COMPOSIO_API_KEY is missing or invalid.",
       allowlistedToolkits: allowlisted,
       toolkits: allowlisted.map((slug) => ({
         slug,
@@ -76,7 +82,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       ok: true,
-      enabled: composioIntegrationEnabled(),
+      enabled: integrationStatus.enabled,
       allowlistedToolkits: composioAllowlistedToolkits(),
       toolkits: merged
     });

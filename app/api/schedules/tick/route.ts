@@ -5,6 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { listDueMissionSchedules } from "@/lib/schedule/mission-schedules";
 import { runMissionSchedule } from "@/lib/schedule/mission-runner";
 import { runTaskTimeoutWatchdog } from "@/lib/orchestration/watchdog";
+import { enqueueIdleSessionsForOrg } from "@/lib/dna/phase2";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
 function asBoolean(value: unknown) {
@@ -67,6 +68,9 @@ export async function POST(request: NextRequest) {
     orgId,
     now
   });
+  const idleBatch = await enqueueIdleSessionsForOrg({
+    tenantId: orgId
+  });
   const dueSchedules = await listDueMissionSchedules(orgId, now);
   const queue = dueSchedules
     .sort((a, b) => new Date(a.nextRunAt).getTime() - new Date(b.nextRunAt).getTime())
@@ -79,6 +83,7 @@ export async function POST(request: NextRequest) {
       now: now.toISOString(),
       dueCount: dueSchedules.length,
       queuedCount: queue.length,
+      idleBatch,
       schedules: queue
     });
   }
@@ -125,6 +130,7 @@ export async function POST(request: NextRequest) {
     orgId,
     now: now.toISOString(),
     watchdog,
+    idleBatch,
     dueCount: dueSchedules.length,
     queuedCount: queue.length,
     launchedCount: launched.length,

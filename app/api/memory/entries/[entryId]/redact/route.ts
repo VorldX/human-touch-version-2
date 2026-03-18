@@ -1,9 +1,10 @@
 export const dynamic = "force-dynamic";
 
-import { Prisma } from "@prisma/client";
+import { LogType, Prisma } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
 import { prisma } from "@/lib/db/prisma";
+import { buildComplianceHash } from "@/lib/security/audit";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface RouteContext {
@@ -44,13 +45,57 @@ export async function POST(request: NextRequest, context: RouteContext) {
       { status: 404 }
     );
   }
+  if (entry.redactedAt) {
+    return NextResponse.json({
+      ok: true,
+      entry
+    });
+  }
 
-  const updated = await prisma.memoryEntry.update({
-    where: { id: entryId },
-    data: {
-      value: Prisma.DbNull,
-      redactedAt: new Date()
-    }
+  const actionType = "MEMORY_ENTRY_REDACT";
+  const redactedAt = new Date();
+  const complianceHash = buildComplianceHash({
+    actionType,
+    orgId,
+    flowId: entry.flowId,
+    taskId: entry.taskId,
+    memoryEntryId: entry.id,
+    tier: entry.tier,
+    key: entry.key,
+    actor: access.actor.userId,
+    timestamp: redactedAt.toISOString()
+  });
+  const humanActorId = access.actor.isInternal ? null : access.actor.userId;
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const nextEntry = await tx.memoryEntry.update({
+      where: { id: entryId },
+      data: {
+        value: Prisma.DbNull,
+        redactedAt
+      }
+    });
+
+    await tx.log.create({
+      data: {
+        orgId,
+        type: LogType.SCRUB,
+        actor: "MEMORY_API",
+        message: `Memory entry ${nextEntry.id} redacted (${nextEntry.tier}/${nextEntry.key}).`
+      }
+    });
+
+    await tx.complianceAudit.create({
+      data: {
+        orgId,
+        flowId: nextEntry.flowId,
+        humanActorId,
+        actionType,
+        complianceHash
+      }
+    });
+
+    return nextEntry;
   });
 
   return NextResponse.json({

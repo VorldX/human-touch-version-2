@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import {
   ComposioServiceError,
-  composioIntegrationEnabled,
+  composioIntegrationStatus,
   createConnection,
   getConnections
 } from "@/lib/integrations/composio/service";
@@ -19,10 +19,17 @@ type ConnectBody = {
 } | null;
 
 export async function GET(request: NextRequest) {
-  if (!composioIntegrationEnabled()) {
+  const integrationStatus = composioIntegrationStatus();
+  if (!integrationStatus.enabled) {
     return NextResponse.json({
       ok: true,
       enabled: false,
+      reason: !integrationStatus.featureEnabled
+        ? "FEATURE_COMPOSIO_INTEGRATIONS is disabled."
+        : integrationStatus.apiKeyReason === "placeholder"
+          ? "COMPOSIO_API_KEY is a placeholder value."
+          : "COMPOSIO_API_KEY is missing or invalid.",
+      ...(integrationStatus.diagnostics ? { diagnostics: integrationStatus.diagnostics } : {}),
       connections: []
     });
   }
@@ -59,12 +66,14 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  if (!composioIntegrationEnabled()) {
+  const integrationStatus = composioIntegrationStatus();
+  if (!integrationStatus.enabled) {
     return NextResponse.json(
       {
         ok: false,
-        message:
-          "App integrations are disabled. Set FEATURE_COMPOSIO_INTEGRATIONS=true and COMPOSIO_API_KEY."
+        message: !integrationStatus.featureEnabled
+          ? "App integrations are disabled. Set FEATURE_COMPOSIO_INTEGRATIONS=true."
+          : "App integrations are disabled. Set a valid COMPOSIO_API_KEY."
       },
       { status: 503 }
     );

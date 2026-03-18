@@ -162,7 +162,8 @@ export async function buildDnaProfileFromStorage(input: BuildDnaProfileInput) {
     },
     select: {
       id: true,
-      url: true
+      url: true,
+      metadata: true
     }
   });
 
@@ -170,7 +171,14 @@ export async function buildDnaProfileFromStorage(input: BuildDnaProfileInput) {
   for (const asset of assets) {
     // Intentional sequential read for predictable ordering.
     // eslint-disable-next-line no-await-in-loop
-    const text = await readAssetText(asset.url);
+    const metadata = asRecord(asset.metadata);
+    const metadataContent =
+      typeof metadata.content === "string"
+        ? metadata.content
+        : typeof metadata.rawText === "string"
+          ? metadata.rawText
+          : "";
+    const text = metadataContent || (await readAssetText(asset.url));
     if (text) {
       chunks.push(text);
     }

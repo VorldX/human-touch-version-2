@@ -15,6 +15,7 @@ import {
   SpendEventType,
   TaskStatus
 } from "@prisma/client";
+import { serve } from "inngest/next";
 import { NextRequest, NextResponse } from "next/server";
 
 import { createDeterministicEmbedding, toPgVectorLiteral } from "@/lib/ai/embeddings";
@@ -49,6 +50,8 @@ import { inferUnverifiedExternalActionClaim } from "@/lib/agent/hallucination-gu
 import { assessTaskComplexity } from "@/lib/agent/orchestration/complexity";
 import { buildAgentContextPack } from "@/lib/agent/orchestration/context-compiler";
 import { decideDelegation } from "@/lib/agent/orchestration/delegation-policy";
+import { inngest } from "@/lib/inngest/client";
+import { inngestFunctions } from "@/lib/inngest/functions";
 import {
   createAgentRun,
   createApprovalCheckpoint,
@@ -67,6 +70,7 @@ import { prisma } from "@/lib/db/prisma";
 import { recordPassivePolicy, recordPassiveSpend } from "@/lib/enterprise/passive";
 import { readLocalUploadByUrl, toPreviewText } from "@/lib/hub/storage";
 import { getToolsForAgent, inferRequestedToolkits } from "@/lib/integrations/composio/service";
+import { shadowWriteTaskStateFromLegacyEvent } from "@/lib/migration/task-state-machine-shadow";
 import { publishRealtimeEvent } from "@/lib/realtime/publish";
 import { createJoltProofStub } from "@/lib/security/crypto";
 import { emitOrchestrationEvent } from "@/lib/orchestration/event-log";
@@ -117,6 +121,11 @@ const ALLOWED_INTERNAL_EVENTS = new Set([
   "vorldx/flow.progress",
   "vorldx/dna.ingest"
 ]);
+
+const inngestServeHandlers = serve({
+  client: inngest,
+  functions: inngestFunctions
+});
 
 function parsePositiveEnvInt(name: string, fallback: number) {
   const raw = Number(process.env[name]);
@@ -2868,7 +2877,8 @@ async function executeTaskById(
         summary: contextPack.summary,
         delegatedTo: activeLogicalAgent.id,
         executionMode: contextPack.executionMode,
-        contextSelectionTrace: contextPack.selectionTrace ?? null
+        contextSelectionTrace: contextPack.selectionTrace ?? null,
+        graphHighlights: contextPack.graphHighlights
       }),
       decisionType: effectiveDecision.decision,
       decisionReason: effectiveDecision.reason,
@@ -2890,6 +2900,7 @@ async function executeTaskById(
     contextPack: toInputJsonValue({
       summary: contextPack.summary,
       memoryHighlights: contextPack.memoryHighlights,
+      graphHighlights: contextPack.graphHighlights,
       dnaHighlights: contextPack.dnaHighlights,
       executionMode: contextPack.executionMode,
       budgetSnapshot: contextPack.budgetSnapshot,
@@ -5755,6 +5766,24 @@ async function processRequest(request: NextRequest) {
     // Sequential handling is intentional to preserve event order.
     // eslint-disable-next-line no-await-in-loop
     const result = await handleEvent(event, request.nextUrl.origin);
+
+    if (featureFlags.useTaskStateMachine && event.name) {
+      try {
+        // Shadow-write only; legacy task table remains source-of-truth during migration.
+        // eslint-disable-next-line no-await-in-loop
+        await shadowWriteTaskStateFromLegacyEvent({
+          name: event.name,
+          data: event.data ?? {}
+        });
+      } catch (error) {
+        console.warn(
+          "[task-state-shadow] write failed",
+          event.name,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+
     results.push({
       name: event.name ?? "unknown",
       ...result
@@ -5771,21 +5800,30 @@ async function processRequest(request: NextRequest) {
   );
 }
 
-export async function GET() {
-  return NextResponse.json(
-    {
-      ok: true,
-      message: "Inngest endpoint is online and event mutation handlers are active."
-    },
-    { status: 200 }
-  );
+export async function GET(request: NextRequest) {
+  if (hasValidInternalApiKey(request)) {
+    return NextResponse.json(
+      {
+        ok: true,
+        message: "Inngest endpoint is online and event mutation handlers are active."
+      },
+      { status: 200 }
+    );
+  }
+  return inngestServeHandlers.GET(request, null);
 }
 
 export async function POST(request: NextRequest) {
+  if (!hasValidInternalApiKey(request)) {
+    return inngestServeHandlers.POST(request, null);
+  }
   return processRequest(request);
 }
 
 export async function PUT(request: NextRequest) {
+  if (!hasValidInternalApiKey(request)) {
+    return inngestServeHandlers.PUT(request, null);
+  }
   return processRequest(request);
 }
 

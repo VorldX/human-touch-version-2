@@ -14,6 +14,7 @@ import {
   ChevronRight,
   ClipboardList,
   Command,
+  Compass,
   Database,
   FileText,
   FolderOpen,
@@ -60,7 +61,7 @@ const NAV_ITEMS = [
   {
     id: "control",
     label: "Control Deck",
-    navLabel: "All Commands",
+    navLabel: "Compass",
     helper: "Chat + approvals",
     primary: "FOCUS",
     icon: LayoutDashboard
@@ -83,9 +84,9 @@ const NAV_ITEMS = [
   },
   {
     id: "direction",
-    label: "Command",
+    label: "Direction",
     navLabel: "Pathway",
-    helper: "Command strategy",
+    helper: "Direction strategy",
     primary: "FOCUS",
     icon: Target
   },
@@ -143,7 +144,7 @@ const PRIMARY_WORKSPACE_TABS = [
   {
     id: "FOCUS",
     label: "Focus",
-    helper: "Commands, planning, and pathway",
+    helper: "Discussions, directions, and pathway",
     icon: Target
   },
   {
@@ -162,13 +163,14 @@ const PRIMARY_WORKSPACE_TABS = [
 
 type NavItemId = (typeof NAV_ITEMS)[number]["id"];
 type PrimaryWorkspaceTabId = (typeof PRIMARY_WORKSPACE_TABS)[number]["id"];
-type WorkspaceMode = "BRAINSTORM" | "COMMAND" | "OPERATIONS" | "HUB" | "CALENDAR";
+type WorkspaceMode = "COMPASS" | "FLOW" | "HUB";
 
 const OPERATION_TAB_IDS = [
   "plan",
   "flow",
   "direction",
   "blueprint",
+  "calendar",
   "squad",
   "memory",
   "settings"
@@ -257,6 +259,7 @@ interface ControlMessage {
 }
 
 type AgentRunStatus = "needs_input" | "needs_confirmation" | "completed" | "error";
+type ControlSurfaceTab = ControlMode | "STRINGS";
 
 interface AgentRunResponse {
   status: AgentRunStatus;
@@ -568,6 +571,97 @@ function compactTaskTitle(value: string, fallback: string) {
   const compact = value.replace(/\s+/g, " ").trim();
   if (!compact) return fallback;
   return compact.length > 96 ? `${compact.slice(0, 93)}...` : compact;
+}
+
+function controlThreadKindLabel(mode: ControlMode) {
+  return mode === "DIRECTION" ? "Direction" : "Discussion";
+}
+
+function controlThreadDefaultTitle(mode: ControlMode) {
+  return `${controlThreadKindLabel(mode)} String`;
+}
+
+function controlThreadDisplayTitle(item: ControlThreadHistoryItem) {
+  const raw = item.title.trim();
+  if (!raw || raw === "Command Session" || raw === "Brainstorm Session") {
+    return controlThreadDefaultTitle(item.mode);
+  }
+  return raw;
+}
+
+function controlThreadPreview(item: ControlThreadHistoryItem) {
+  const lastOwnerTurn = [...item.turns].reverse().find((turn) => turn.role === "owner")?.content ?? "";
+  const source =
+    (item.mode === "DIRECTION" ? item.directionGiven : "").trim() ||
+    lastOwnerTurn.trim() ||
+    item.directionGiven.trim() ||
+    item.turns[item.turns.length - 1]?.content?.trim() ||
+    "";
+  return compactTaskTitle(source, "No discussion or direction yet.");
+}
+
+function controlThreadRailScope(item: ControlThreadHistoryItem) {
+  if ((item.launchScope?.flowIds?.length ?? 0) > 0) {
+    return "EXECUTION" as const;
+  }
+  if (
+    (item.launchScope?.permissionRequestIds?.length ?? 0) > 0 ||
+    Boolean(item.pendingPlanLaunchApproval) ||
+    Boolean(item.pendingToolkitApproval) ||
+    Boolean(item.pendingEmailApproval) ||
+    item.agentRunResult?.status === "needs_input"
+  ) {
+    return "GOVERNANCE" as const;
+  }
+  return "FOCUS" as const;
+}
+
+function controlThreadScopeBadgeClass(scope: "FOCUS" | "EXECUTION" | "GOVERNANCE") {
+  if (scope === "EXECUTION") {
+    return "border-cyan-500/35 bg-cyan-500/12 text-cyan-200";
+  }
+  if (scope === "GOVERNANCE") {
+    return "border-amber-500/35 bg-amber-500/12 text-amber-200";
+  }
+  return "border-emerald-500/35 bg-emerald-500/12 text-emerald-200";
+}
+
+function formatRelativeTimeShort(timestamp: number) {
+  const deltaMs = Date.now() - timestamp;
+  const absMinutes = Math.max(0, Math.round(deltaMs / 60000));
+  if (absMinutes < 60) {
+    return `~${absMinutes}m ago`;
+  }
+  const hours = Math.round(absMinutes / 60);
+  if (hours < 24) {
+    return `~${hours}h ago`;
+  }
+  const days = Math.round(hours / 24);
+  return `~${days}d ago`;
+}
+
+function toLocalDateKey(input: number | string | Date) {
+  const value = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(value.getTime())) {
+    return "";
+  }
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function buildLocalMonthGrid(monthCursor: Date) {
+  const year = monthCursor.getFullYear();
+  const month = monthCursor.getMonth();
+  const monthStart = new Date(year, month, 1);
+  const gridStart = new Date(monthStart);
+  gridStart.setDate(1 - monthStart.getDay());
+  return Array.from({ length: 42 }, (_, index) => {
+    const day = new Date(gridStart);
+    day.setDate(gridStart.getDate() + index);
+    return day;
+  });
 }
 
 function workflowAgentLabelFromTaskTrace(input: {
@@ -1172,10 +1266,12 @@ export function VorldXShell() {
   const pushNotification = useVorldXStore((state) => state.pushNotification);
 
   const [activeTab, setActiveTab] = useState<NavItemId>("control");
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("BRAINSTORM");
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("COMPASS");
   const [operationsTab, setOperationsTab] = useState<OperationTabId>("plan");
   const [primaryWorkspaceTab, setPrimaryWorkspaceTab] =
     useState<PrimaryWorkspaceTabId>("FOCUS");
+  const [flowCalendarSelectedDate, setFlowCalendarSelectedDate] = useState<string | null>(null);
+  const [flowSelectedStringId, setFlowSelectedStringId] = useState<string | null>(null);
   const [primaryTabLastSubtab, setPrimaryTabLastSubtab] = useState<
     Record<PrimaryWorkspaceTabId, NavItemId>
   >(DEFAULT_PRIMARY_TAB_SUBTAB);
@@ -1483,14 +1579,14 @@ export function VorldXShell() {
       const primaryTab = getPrimaryWorkspaceTabForNavItem(tab);
       setActiveTab(tab);
       setPrimaryWorkspaceTab(primaryTab);
-      if (tab === "control" || OPERATION_TAB_SET.has(tab)) {
+      if (OPERATION_TAB_SET.has(tab)) {
         setPrimaryTabLastSubtab((previous) =>
           previous[primaryTab] === tab ? previous : { ...previous, [primaryTab]: tab }
         );
       }
 
       if (tab === "control") {
-        setWorkspaceMode(controlMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
+        setWorkspaceMode("COMPASS");
         return;
       }
 
@@ -1499,18 +1595,13 @@ export function VorldXShell() {
         return;
       }
 
-      if (tab === "calendar") {
-        setWorkspaceMode("CALENDAR");
-        return;
-      }
-
       if (OPERATION_TAB_SET.has(tab)) {
         syncOperationSubtab(tab as OperationTabId);
-        setWorkspaceMode("OPERATIONS");
+        setWorkspaceMode("FLOW");
         return;
       }
     },
-    [controlMode, syncOperationSubtab]
+    [syncOperationSubtab]
   );
 
   const handleOperationTabChange = useCallback(
@@ -2028,7 +2119,7 @@ export function VorldXShell() {
     setControlEngaged(false);
     setActiveTab("control");
     setControlMode("MINDSTORM");
-    setWorkspaceMode("BRAINSTORM");
+    setWorkspaceMode("COMPASS");
     setOperationsTab("plan");
     setPrimaryWorkspaceTab("FOCUS");
     setPrimaryTabLastSubtab(DEFAULT_PRIMARY_TAB_SUBTAB);
@@ -2078,11 +2169,11 @@ export function VorldXShell() {
     if (activeTab !== "control") {
       return;
     }
-    if (workspaceMode !== "BRAINSTORM" && workspaceMode !== "COMMAND") {
+    if (workspaceMode === "COMPASS") {
       return;
     }
-    setWorkspaceMode(controlMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
-  }, [activeTab, controlMode, workspaceMode]);
+    setWorkspaceMode("COMPASS");
+  }, [activeTab, workspaceMode]);
 
   const controlHistoryStorageKey = useMemo(
     () => (resolvedOrg?.id ? `vx-control-history:${resolvedOrg.id}` : ""),
@@ -2292,10 +2383,8 @@ export function VorldXShell() {
     const ownerTurn = directionTurns.find((turn) => turn.role === "owner");
     const titleSource = ownerTurn?.content || directionGiven;
     const title = titleSource
-      ? compactTaskTitle(titleSource, controlMode === "DIRECTION" ? "Command Session" : "Brainstorm Session")
-      : controlMode === "DIRECTION"
-        ? "Command Session"
-        : "Brainstorm Session";
+      ? compactTaskTitle(titleSource, controlThreadDefaultTitle(controlMode))
+      : controlThreadDefaultTitle(controlMode);
 
     setControlThreadHistory((previous) => {
       const now = Date.now();
@@ -2344,7 +2433,7 @@ export function VorldXShell() {
     (modeOverride?: ControlMode) => {
       const nextMode = modeOverride ?? controlMode;
       const nextId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const title = nextMode === "DIRECTION" ? "Command Session" : "Brainstorm Session";
+      const title = controlThreadDefaultTitle(nextMode);
       setActiveControlThreadId(nextId);
       setControlThreadHistory((previous) => [
         {
@@ -2443,8 +2532,8 @@ export function VorldXShell() {
       if (currentThread?.mode === nextMode) {
         setControlMode(nextMode);
         setControlConversationDetail(nextMode === "DIRECTION" ? "DIRECTION_GIVEN" : "REASONING_MIN");
-        if (workspaceMode === "BRAINSTORM" || workspaceMode === "COMMAND") {
-          setWorkspaceMode(nextMode === "DIRECTION" ? "COMMAND" : "BRAINSTORM");
+        if (workspaceMode !== "COMPASS") {
+          setWorkspaceMode("COMPASS");
         }
         setControlEngaged(
           currentThread.turns.length > 0 ||
@@ -2571,6 +2660,26 @@ export function VorldXShell() {
         : null,
     [activeControlThreadId, controlThreadHistory]
   );
+  const flowSelectedString = useMemo(
+    () =>
+      flowSelectedStringId
+        ? controlThreadHistory.find((item) => item.id === flowSelectedStringId) ?? null
+        : null,
+    [controlThreadHistory, flowSelectedStringId]
+  );
+  const flowSelectedStringLabel = flowSelectedString ? controlThreadDisplayTitle(flowSelectedString) : "";
+  const flowSelectedStringPlanId = flowSelectedString?.launchScope?.planId?.trim() ?? "";
+  const flowSelectedStringDirectionId = flowSelectedString?.launchScope?.directionId?.trim() ?? "";
+  const flowSelectedStringFlowIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const value of flowSelectedString?.launchScope?.flowIds ?? []) {
+      const normalized = value.trim();
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+    return [...ids];
+  }, [flowSelectedString?.launchScope?.flowIds]);
   const activePlanId =
     activeControlThread?.launchScope?.planId?.trim() ??
     directionPlanningResult?.planRecord?.id?.trim() ??
@@ -3186,27 +3295,17 @@ export function VorldXShell() {
 
   const handleWorkspaceModeSwitch = useCallback(
     (nextMode: WorkspaceMode) => {
-      if (nextMode === "BRAINSTORM") {
-        handleSwitchControlMode("MINDSTORM");
-        setWorkspaceMode("BRAINSTORM");
+      if (nextMode === "COMPASS") {
+        handleTabChange("control");
         return;
       }
-      if (nextMode === "COMMAND") {
-        handleSwitchControlMode("DIRECTION");
-        setWorkspaceMode("COMMAND");
-        return;
-      }
-      if (nextMode === "OPERATIONS") {
+      if (nextMode === "FLOW") {
         handleOperationTabChange(operationsTab);
         return;
       }
-      if (nextMode === "HUB") {
-        handleTabChange("hub");
-        return;
-      }
-      handleTabChange("calendar");
+      handleTabChange("hub");
     },
-    [handleOperationTabChange, handleSwitchControlMode, handleTabChange, operationsTab]
+    [handleOperationTabChange, handleTabChange, operationsTab]
   );
 
   const loadMissionSchedules = useCallback(
@@ -3606,7 +3705,7 @@ export function VorldXShell() {
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
-          text: "Command candidate updated from organization response."
+          text: "Direction candidate updated from organization response."
         });
       }
 
@@ -3634,20 +3733,20 @@ export function VorldXShell() {
           prompt: message,
           reason:
             payload.intentRouting?.reason ||
-            "Command mode detected execution intent. Routing to planning pipeline.",
+            "Direction mode detected execution intent. Routing to planning pipeline.",
           toolkitHints
         });
         setControlMode("DIRECTION");
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
           tone: "success",
-          text: "Command intent routed to planning pipeline."
+          text: "Direction intent routed to planning pipeline."
         });
       }
     } catch (error) {
       setControlMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Command chat failed."
+        text: error instanceof Error ? error.message : "Direction chat failed."
       });
     } finally {
       setDirectionChatInFlight(false);
@@ -3676,7 +3775,7 @@ export function VorldXShell() {
       if (!direction) {
         setControlMessage({
           tone: "warning",
-          text: "Write a command prompt first."
+          text: "Write a direction prompt first."
         });
         return;
       }
@@ -3817,7 +3916,7 @@ export function VorldXShell() {
               kind: "workflow_event",
               title: "Auto Launch Scheduled",
               message:
-                "Command mode generated a plan and queued immediate launch using this approved command.",
+                "Direction mode generated a plan and queued immediate launch using this approved direction.",
               eventName: "plan.auto_launch",
               status: "QUEUED",
               timestamp: Date.now()
@@ -5350,8 +5449,8 @@ export function VorldXShell() {
   }, [resolvedOrg?.id]);
 
   return (
-    <div className="vx-shell relative min-h-screen bg-vx-bg text-slate-100 transition-all duration-500">
-      <div className="flex h-[100dvh] overflow-hidden">
+    <div className="vx-shell relative h-[100dvh] overflow-hidden bg-vx-bg text-slate-100 transition-all duration-500">
+      <div className="flex h-full overflow-hidden">
         <main className="relative flex h-full min-w-0 flex-1 flex-col overflow-hidden">
           <header className="relative z-30 flex min-h-24 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#05070a]/50 px-4 py-3 backdrop-blur-xl md:h-24 md:flex-nowrap md:px-10 md:py-0">
             <div
@@ -5628,7 +5727,7 @@ export function VorldXShell() {
                       Pending {requestCenterPendingCount} (Permissions {requestCenterPermissionPendingCount} | Checkpoints {requestCenterCheckpointPendingCount})
                     </p>
                     <p className="text-[10px] text-slate-500">
-                      {isRequestCenterScopedToCommand ? "Scope: current command chat" : "Scope: organization"}
+                      {isRequestCenterScopedToCommand ? "Scope: current direction string" : "Scope: organization"}
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -5801,53 +5900,12 @@ export function VorldXShell() {
           <section
             className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-4 py-6 pb-28 md:px-10 md:py-10 md:pb-32 ${
               resolvedOrg && activeTab === "control"
-                ? "min-h-0 overflow-y-auto py-4 pb-44 md:py-6 md:pb-48"
+                ? "min-h-0 overflow-hidden py-4 pb-44 md:py-6 md:pb-48"
+                : resolvedOrg && workspaceMode === "FLOW"
+                  ? "min-h-0 overflow-hidden py-4 pb-24 md:py-6 md:pb-28"
                 : "overflow-y-auto"
             }`}
           >
-            {resolvedOrg && workspaceMode === "OPERATIONS" ? (
-              <div className="mb-4 space-y-2">
-                <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/35 p-2">
-                  {PRIMARY_WORKSPACE_TABS.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => handlePrimaryWorkspaceTabSwitch(tab.id)}
-                      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
-                        primaryWorkspaceTab === tab.id
-                          ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
-                          : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
-                      }`}
-                    >
-                      <tab.icon size={13} />
-                      {tab.label}
-                      <span className="hidden text-[10px] font-normal text-slate-400 lg:inline">
-                        {tab.helper}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/25 p-2">
-                  {activePrimaryNavItems.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onClick={() => handleOperationTabChange(item.id as OperationTabId)}
-                      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
-                        activeTab === item.id
-                          ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
-                          : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
-                      }`}
-                    >
-                      <item.icon size={13} />
-                      {item.navLabel}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-
             {orgBootstrapStatus === "loading" && !resolvedOrg ? (
               <WorkspaceBootstrapState themeStyle={themeStyle} />
             ) : orgBootstrapStatus === "failed" && !resolvedOrg ? (
@@ -5946,7 +6004,7 @@ export function VorldXShell() {
                     handleCreateControlThread(modeForMessage);
                   }
 
-                  let prompt = basePrompt || "Use the attached files as the command context.";
+                  let prompt = basePrompt || "Use the attached files as the direction context.";
                   const attachmentRefs: string[] = [];
                   if (attachments.length > 0) {
                     try {
@@ -6181,52 +6239,189 @@ export function VorldXShell() {
                   });
                 }}
               />
-            ) : activeTab === "flow" ? (
-              <WorkflowConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-                onTaskNeedsInput={promptForHumanInput}
-              />
-            ) : activeTab === "blueprint" ? (
-              <BlueprintConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-              />
-            ) : activeTab === "direction" ? (
-              <DirectionConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-              />
-            ) : activeTab === "plan" ? (
-              <PlanConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-              />
-            ) : activeTab === "calendar" ? (
-              <CalendarConsole
-                orgId={resolvedOrg.id}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-              />
+            ) : resolvedOrg && workspaceMode === "FLOW" ? (
+              <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[280px_minmax(0,1fr)] 2xl:grid-cols-[292px_minmax(0,1fr)]">
+                <FlowSidebarRail
+                  themeStyle={{
+                    accent: themeStyle.accent,
+                    accentSoft: themeStyle.accentSoft,
+                    border: themeStyle.border
+                  }}
+                  selectedDate={flowCalendarSelectedDate}
+                  onSelectedDateChange={setFlowCalendarSelectedDate}
+                  selectedStringId={flowSelectedStringId}
+                  onSelectedStringChange={setFlowSelectedStringId}
+                  stringItems={controlThreadHistory}
+                />
+                <div className="flex min-h-0 flex-col gap-4">
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/35 p-2">
+                      {PRIMARY_WORKSPACE_TABS.map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => handlePrimaryWorkspaceTabSwitch(tab.id)}
+                          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
+                            primaryWorkspaceTab === tab.id
+                              ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                              : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+                          }`}
+                        >
+                          <tab.icon size={13} />
+                          {tab.label}
+                          <span className="hidden text-[10px] font-normal text-slate-400 lg:inline">
+                            {tab.helper}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/25 p-2">
+                      {activePrimaryNavItems.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => handleOperationTabChange(item.id as OperationTabId)}
+                          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
+                            activeTab === item.id
+                              ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                              : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
+                          }`}
+                        >
+                          <item.icon size={13} />
+                          {item.navLabel}
+                        </button>
+                      ))}
+                    </div>
+
+                    {flowCalendarSelectedDate ? (
+                      <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/10 px-3 py-2 text-[11px] text-cyan-100">
+                        Flow filtered to {new Date(`${flowCalendarSelectedDate}T00:00:00`).toLocaleDateString()}
+                      </div>
+                    ) : null}
+
+                    {flowSelectedString ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-100">
+                        <span className="line-clamp-1">String filter: {flowSelectedStringLabel}</span>
+                        <button
+                          type="button"
+                          onClick={() => setFlowSelectedStringId(null)}
+                          className="rounded-full border border-white/15 bg-black/25 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200 transition hover:bg-white/10"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="vx-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
+                    {activeTab === "flow" ? (
+                      <WorkflowConsole
+                        key={`flow-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                        dateFilter={flowCalendarSelectedDate}
+                        flowIdFilter={flowSelectedStringFlowIds}
+                        stringFilterLabel={flowSelectedStringLabel || null}
+                        onTaskNeedsInput={promptForHumanInput}
+                      />
+                    ) : activeTab === "blueprint" ? (
+                      <BlueprintConsole
+                        key={`blueprint-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                      />
+                    ) : activeTab === "direction" ? (
+                      <DirectionConsole
+                        key={`direction-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                        dateFilter={flowCalendarSelectedDate}
+                        directionIdFilter={flowSelectedStringDirectionId || null}
+                        flowIdFilter={flowSelectedStringFlowIds}
+                        stringFilterLabel={flowSelectedStringLabel || null}
+                      />
+                    ) : activeTab === "plan" ? (
+                      <PlanConsole
+                        key={`plan-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                        dateFilter={flowCalendarSelectedDate}
+                        planIdFilter={flowSelectedStringPlanId || null}
+                        directionIdFilter={flowSelectedStringDirectionId || null}
+                        stringFilterLabel={flowSelectedStringLabel || null}
+                      />
+                    ) : activeTab === "calendar" ? (
+                      <CalendarConsole
+                        key={`calendar-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                      />
+                    ) : activeTab === "squad" ? (
+                      <SquadConsole
+                        key={`squad-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                      />
+                    ) : activeTab === "memory" ? (
+                      <MemoryConsole
+                        key={`memory-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                        dateFilter={flowCalendarSelectedDate}
+                        flowIdFilter={flowSelectedStringFlowIds}
+                        stringFilterLabel={flowSelectedStringLabel || null}
+                      />
+                    ) : activeTab === "settings" ? (
+                      <SettingsConsole
+                        key={`settings-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
+                        initialLane={
+                          requestedSettingsLane === "webhooks" ||
+                          requestedSettingsLane === "identity" ||
+                          requestedSettingsLane === "rails" ||
+                          requestedSettingsLane === "orchestration"
+                            ? requestedSettingsLane
+                            : undefined
+                        }
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              </div>
             ) : activeTab === "hub" ? (
               <HubConsole
                 orgId={resolvedOrg.id}
@@ -6292,39 +6487,27 @@ export function VorldXShell() {
         <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-white/15 bg-[#060b13]/92 p-1 shadow-[0_18px_50px_rgba(0,0,0,0.55)] backdrop-blur-xl">
           <button
             type="button"
-            onClick={() => handleWorkspaceModeSwitch("BRAINSTORM")}
+            onClick={() => handleWorkspaceModeSwitch("COMPASS")}
             className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "BRAINSTORM"
+              workspaceMode === "COMPASS"
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
             }`}
           >
-            <Bot size={14} />
-            Brainstorming
+            <Compass size={14} />
+            Compass
           </button>
           <button
             type="button"
-            onClick={() => handleWorkspaceModeSwitch("COMMAND")}
+            onClick={() => handleWorkspaceModeSwitch("FLOW")}
             className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "COMMAND"
-                ? "bg-cyan-500/20 text-cyan-100"
-                : "text-slate-300 hover:bg-white/10"
-            }`}
-          >
-            <Command size={14} />
-            Command
-          </button>
-          <button
-            type="button"
-            onClick={() => handleWorkspaceModeSwitch("OPERATIONS")}
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "OPERATIONS"
+              workspaceMode === "FLOW"
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
             }`}
           >
             <Workflow size={14} />
-            Operations
+            Flow
           </button>
           <button
             type="button"
@@ -6337,18 +6520,6 @@ export function VorldXShell() {
           >
             <FolderOpen size={14} />
             Hub
-          </button>
-          <button
-            type="button"
-            onClick={() => handleWorkspaceModeSwitch("CALENDAR")}
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "CALENDAR"
-                ? "bg-cyan-500/20 text-cyan-100"
-                : "text-slate-300 hover:bg-white/10"
-            }`}
-          >
-            <CalendarDays size={14} />
-            Calendar
           </button>
         </div>
       </div>
@@ -6667,6 +6838,294 @@ export function VorldXShell() {
   );
 }
 
+function FlowSidebarRail({
+  themeStyle,
+  selectedDate,
+  onSelectedDateChange,
+  selectedStringId,
+  onSelectedStringChange,
+  stringItems
+}: {
+  themeStyle: { accent: string; accentSoft: string; border: string };
+  selectedDate: string | null;
+  onSelectedDateChange: (value: string | null) => void;
+  selectedStringId: string | null;
+  onSelectedStringChange: (value: string | null) => void;
+  stringItems: ControlThreadHistoryItem[];
+}) {
+  const [monthCursor, setMonthCursor] = useState(() => {
+    const anchor = selectedDate
+      ? new Date(`${selectedDate}T00:00:00`)
+      : stringItems[0]?.updatedAt
+        ? new Date(stringItems[0].updatedAt)
+        : new Date();
+    return new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+  });
+
+  useEffect(() => {
+    if (!selectedDate) {
+      return;
+    }
+    const selectedDay = new Date(`${selectedDate}T00:00:00`);
+    if (Number.isNaN(selectedDay.getTime())) {
+      return;
+    }
+    const nextMonthCursor = new Date(selectedDay.getFullYear(), selectedDay.getMonth(), 1);
+    if (
+      monthCursor.getFullYear() !== nextMonthCursor.getFullYear() ||
+      monthCursor.getMonth() !== nextMonthCursor.getMonth()
+    ) {
+      setMonthCursor(nextMonthCursor);
+    }
+  }, [monthCursor, selectedDate]);
+
+  const stringCountsByDay = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of stringItems) {
+      const key = toLocalDateKey(item.updatedAt);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [stringItems]);
+
+  const monthGridDays = useMemo(() => buildLocalMonthGrid(monthCursor), [monthCursor]);
+
+  const visibleStrings = useMemo(() => {
+    const filtered = selectedDate
+      ? stringItems.filter((item) => toLocalDateKey(item.updatedAt) === selectedDate)
+      : stringItems;
+    return [...filtered].sort((left, right) => right.updatedAt - left.updatedAt);
+  }, [selectedDate, stringItems]);
+
+  useEffect(() => {
+    if (!selectedStringId) {
+      return;
+    }
+    if (visibleStrings.some((item) => item.id === selectedStringId)) {
+      return;
+    }
+    onSelectedStringChange(null);
+  }, [onSelectedStringChange, selectedStringId, visibleStrings]);
+
+  const scopeSummary = useMemo(() => {
+    const summary = {
+      FOCUS: 0,
+      EXECUTION: 0,
+      GOVERNANCE: 0
+    };
+    for (const item of visibleStrings) {
+      summary[controlThreadRailScope(item)] += 1;
+    }
+    return summary;
+  }, [visibleStrings]);
+
+  const selectedDateLabel = selectedDate
+    ? new Date(`${selectedDate}T00:00:00`).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric"
+      })
+    : "All dates";
+
+  return (
+    <aside className="flex h-full min-h-0 flex-col xl:max-w-[272px]">
+      <div
+        className={`vx-panel flex h-full min-h-0 flex-col overflow-hidden rounded-[26px] p-2 ${themeStyle.border}`}
+      >
+        <div className="shrink-0 rounded-[20px] border border-white/10 bg-[linear-gradient(180deg,rgba(13,18,28,0.92),rgba(8,12,19,0.86))] p-1.5">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
+                Calendar
+              </p>
+              <p className="mt-1 text-[13px] font-medium text-slate-100">
+                {monthCursor.toLocaleDateString(undefined, { month: "long", year: "numeric" })}
+              </p>
+              <p className="mt-1 text-[8px] text-slate-400">Filters Flow.</p>
+            </div>
+            <div className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-black/30 p-1">
+              <button
+                type="button"
+                onClick={() => onSelectedDateChange(null)}
+                className={`rounded-full border px-1.5 py-1 text-[10px] transition ${
+                  selectedDate === null
+                    ? "border-cyan-400/35 bg-cyan-500/12 text-cyan-100"
+                    : "border-white/10 text-slate-300 hover:bg-white/10"
+                }`}
+              >
+                All
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setMonthCursor((prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1))
+                }
+                className="rounded-full border border-white/10 px-1.5 py-1 text-[10px] text-slate-300 transition hover:bg-white/10"
+              >
+                Prev
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setMonthCursor((prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1))
+                }
+                className="rounded-full border border-white/10 px-1.5 py-1 text-[10px] text-slate-300 transition hover:bg-white/10"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-1.5 grid grid-cols-7 gap-1 text-center text-[8px] uppercase tracking-[0.16em] text-slate-500">
+            {["S", "M", "T", "W", "T", "F", "S"].map((label, index) => (
+              <span key={`${label}-${index}`}>{label}</span>
+            ))}
+          </div>
+
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {monthGridDays.map((day) => {
+              const dayKey = toLocalDateKey(day);
+              const isSelected = dayKey === selectedDate;
+              const isCurrentMonth = day.getMonth() === monthCursor.getMonth();
+              const count = stringCountsByDay.get(dayKey) ?? 0;
+
+              return (
+                <button
+                  key={`${dayKey}-${day.getTime()}`}
+                  type="button"
+                  onClick={() => onSelectedDateChange(selectedDate === dayKey ? null : dayKey)}
+                  className={`flex h-7 flex-col items-center justify-center rounded-md border text-[9px] transition ${
+                    isSelected
+                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100 shadow-[0_0_0_1px_rgba(34,211,238,0.12)]"
+                      : isCurrentMonth
+                        ? "border-white/10 bg-black/20 text-slate-200 hover:bg-white/10"
+                        : "border-transparent text-slate-500 hover:bg-white/5"
+                  }`}
+                >
+                  <span>{day.getDate()}</span>
+                  <span
+                    className={`mt-0.5 h-1 w-1 rounded-full ${
+                      count > 0 ? "bg-cyan-300" : "bg-transparent"
+                    }`}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-2 flex min-h-0 flex-1 flex-col rounded-[20px] border border-white/10 bg-[#050910]/72 p-2">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
+                Signal Chain
+              </p>
+              <p className="mt-1 text-sm text-slate-200">{selectedDateLabel}</p>
+            </div>
+            <span className="rounded-full border border-white/10 bg-black/30 px-3 py-1 text-[11px] font-semibold text-slate-300">
+              {visibleStrings.length}
+            </span>
+          </div>
+
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {(["FOCUS", "EXECUTION", "GOVERNANCE"] as const).map((scope) => (
+              <span
+                key={scope}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.16em] ${controlThreadScopeBadgeClass(scope)}`}
+              >
+                {scope}
+                <span className="text-slate-100">{scopeSummary[scope]}</span>
+              </span>
+            ))}
+          </div>
+
+          <div className="mt-2 min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-black/20 p-2">
+            {visibleStrings.length === 0 ? (
+              <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 text-center text-sm text-slate-500">
+                {selectedDate ? "No strings for this date." : "No strings yet."}
+              </div>
+            ) : (
+              <div className="vx-scrollbar relative h-full overflow-y-auto overscroll-contain pr-1">
+                <div className="absolute bottom-3 left-[15px] top-3 w-[2px] bg-gradient-to-b from-emerald-400/80 via-cyan-400/55 to-cyan-500/10 shadow-[0_0_18px_rgba(34,211,238,0.25)]" />
+                <div className="space-y-3 pl-10">
+                  {visibleStrings.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() =>
+                        onSelectedStringChange(selectedStringId === item.id ? null : item.id)
+                      }
+                      className="relative block w-full text-left"
+                    >
+                      <span
+                        className={`absolute -left-[2.02rem] top-5 h-4 w-4 rounded-full border-2 ring-4 ring-[#050910] ${
+                          item.mode === "DIRECTION"
+                            ? "border-cyan-200 bg-cyan-400 shadow-[0_0_16px_rgba(34,211,238,0.65)]"
+                            : "border-emerald-200 bg-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.6)]"
+                        }`}
+                      />
+                      <article
+                        className={`rounded-[20px] border p-2.5 shadow-[0_14px_36px_rgba(0,0,0,0.28)] transition ${
+                          selectedStringId === item.id
+                            ? "border-cyan-400/45 bg-[linear-gradient(180deg,rgba(8,24,34,0.98),rgba(6,18,28,0.94))]"
+                            : "border-white/10 bg-[linear-gradient(180deg,rgba(8,12,18,0.96),rgba(6,10,16,0.88))] hover:border-white/20"
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span
+                                className={`inline-flex max-w-full items-center rounded-sm border px-2 py-0.5 text-[10px] font-black uppercase tracking-[0.16em] ${
+                                  item.mode === "DIRECTION"
+                                    ? "border-cyan-500/35 bg-cyan-500/12 text-cyan-200"
+                                    : "border-emerald-500/35 bg-emerald-500/12 text-emerald-200"
+                                }`}
+                              >
+                                {controlThreadDisplayTitle(item)}
+                              </span>
+                              <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">
+                                {controlThreadKindLabel(item.mode)}
+                              </span>
+                              <span
+                                className={`inline-flex rounded-sm border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${controlThreadScopeBadgeClass(
+                                  controlThreadRailScope(item)
+                                )}`}
+                              >
+                                {controlThreadRailScope(item)}
+                              </span>
+                            </div>
+                            <p className="mt-2 text-[11px] font-semibold text-emerald-300">
+                              {new Date(item.updatedAt).toLocaleDateString(undefined, {
+                                month: "short",
+                                day: "numeric"
+                              })}{" "}
+                              |{" "}
+                              {new Date(item.updatedAt).toLocaleTimeString([], {
+                                hour: "2-digit",
+                                minute: "2-digit"
+                              })}
+                            </p>
+                            <p className="mt-2 text-sm leading-6 text-slate-200">
+                              {controlThreadPreview(item)}
+                            </p>
+                          </div>
+                          <span className="shrink-0 pt-0.5 text-[11px] text-slate-500">
+                            {formatRelativeTimeShort(item.updatedAt)}
+                          </span>
+                        </div>
+                      </article>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
 function ControlDeckSurface({
   themeStyle,
   mode,
@@ -6768,7 +7227,7 @@ function ControlDeckSurface({
 }) {
   const [composer, setComposer] = useState("");
   const [sending, setSending] = useState(false);
-  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+  const [surfaceTab, setSurfaceTab] = useState<ControlSurfaceTab>(mode);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
@@ -6800,23 +7259,31 @@ function ControlDeckSurface({
     Number(Boolean(pendingEmailApproval)) +
     Number(agentRunResult?.status === "needs_input");
   const showCommandDraftPanel = false;
-  const modeHistoryItems = useMemo(
-    () => historyItems.filter((item) => item.mode === mode),
-    [historyItems, mode]
-  );
-  const workspaceTitle = mode === "DIRECTION" ? "Command Workspace" : "Brainstorm Workspace";
+  const stringItems = useMemo(() => historyItems, [historyItems]);
+  const isStringsView = surfaceTab === "STRINGS";
+  const workspaceTitle = isStringsView
+    ? "Strings Workspace"
+    : mode === "DIRECTION"
+      ? "Direction Workspace"
+      : "Discussion Workspace";
   const workspaceSubtitle =
-    mode === "DIRECTION"
-      ? "Codex-style command execution with planning and run trace."
-      : "Idea exploration, quick strategy, and freeform discussion.";
+    isStringsView
+      ? "Open any discussion or direction string in the same workspace."
+      : mode === "DIRECTION"
+        ? "Direction-first execution with planning and run trace."
+        : "Idea exploration, quick strategy, and freeform discussion.";
   const placeholder =
     mode === "MINDSTORM"
       ? "Ask anything about ideas, planning, or execution..."
-      : "Describe the command. We will analyze, plan, execute, and report in this thread.";
+      : "Describe the direction. We will analyze, plan, execute, and report in this thread.";
   const heroTitle =
     mode === "MINDSTORM"
       ? "What should we work on next?"
-      : "What command should run next?";
+      : "What direction should run next?";
+
+  useEffect(() => {
+    setSurfaceTab((current) => (current === "STRINGS" ? current : mode));
+  }, [mode]);
 
   useEffect(() => {
     if (!showAttachMenu) {
@@ -7037,7 +7504,7 @@ function ControlDeckSurface({
           onClick={() => void handleSend()}
           disabled={isBusy || (!composer.trim() && selectedFiles.length === 0)}
           className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-400/45 bg-gradient-to-br from-cyan-300 to-emerald-300 text-slate-950 shadow-[0_10px_24px_rgba(34,211,238,0.35)] transition hover:brightness-105 disabled:opacity-60 sm:h-10 sm:w-10"
-          title={mode === "MINDSTORM" ? "Send Message" : "Run Command"}
+          title={mode === "MINDSTORM" ? "Send Message" : "Run Direction"}
         >
           {isBusy ? <Loader2 size={16} className="animate-spin" /> : <ArrowUpRight size={16} />}
         </button>
@@ -7067,7 +7534,11 @@ function ControlDeckSurface({
   );
 
   return (
-    <div className="mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-3 sm:gap-4">
+    <div
+      className={`mx-auto flex min-h-0 w-full max-w-6xl flex-col gap-3 sm:gap-4 ${
+        isStringsView ? "h-[calc(100%+6rem)] md:h-[calc(100%+7rem)]" : "h-full"
+      }`}
+    >
       <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-xs text-slate-500">Control interface</p>
@@ -7078,45 +7549,58 @@ function ControlDeckSurface({
         <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
           <div className="inline-flex w-full max-w-full flex-wrap rounded-full border border-white/15 bg-black/45 p-1 shadow-[0_10px_30px_rgba(0,0,0,0.35)] sm:w-auto">
             <button
-              onClick={() => onModeChange("MINDSTORM")}
+              onClick={() => {
+                setSurfaceTab("MINDSTORM");
+                onModeChange("MINDSTORM");
+              }}
               className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold transition sm:flex-none sm:px-5 ${
-                mode === "MINDSTORM"
+                surfaceTab === "MINDSTORM"
                   ? "bg-gradient-to-r from-cyan-200 to-white text-slate-950 shadow-[0_8px_18px_rgba(148,163,184,0.35)]"
                   : "text-slate-300 hover:bg-white/10"
               }`}
             >
-              Brainstorm
+              Discussion
             </button>
             <button
-              onClick={() => onModeChange("DIRECTION")}
+              onClick={() => {
+                setSurfaceTab("DIRECTION");
+                onModeChange("DIRECTION");
+              }}
               className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold transition sm:flex-none sm:px-5 ${
-                mode === "DIRECTION"
+                surfaceTab === "DIRECTION"
                   ? "bg-gradient-to-r from-cyan-200 to-white text-slate-950 shadow-[0_8px_18px_rgba(148,163,184,0.35)]"
                   : "text-slate-300 hover:bg-white/10"
               }`}
             >
-              Command
+              Direction
+            </button>
+            <button
+              type="button"
+              onClick={() => setSurfaceTab("STRINGS")}
+              className={`flex-1 rounded-full px-4 py-2 text-xs font-semibold transition sm:flex-none sm:px-5 ${
+                surfaceTab === "STRINGS"
+                  ? "bg-gradient-to-r from-cyan-200 to-white text-slate-950 shadow-[0_8px_18px_rgba(148,163,184,0.35)]"
+                  : "text-slate-300 hover:bg-white/10"
+              }`}
+            >
+              Strings
             </button>
           </div>
 
           <button
             type="button"
-            onClick={() => setShowHistoryPanel((prev) => !prev)}
+            onClick={() => {
+              const nextMode = surfaceTab === "STRINGS" ? mode : surfaceTab;
+              setSurfaceTab(nextMode);
+              onCreateThread(nextMode);
+            }}
             className={`inline-flex items-center justify-center rounded-full border px-4 py-2 text-xs font-semibold transition ${
-              showHistoryPanel
-                ? "border-cyan-400/40 bg-cyan-500/12 text-cyan-200"
+              isStringsView
+                ? "border-cyan-400/25 bg-cyan-500/10 text-cyan-100 hover:bg-cyan-500/15"
                 : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
             }`}
           >
-            History
-          </button>
-
-          <button
-            type="button"
-            onClick={() => onCreateThread(mode)}
-            className="inline-flex items-center justify-center rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-300 transition hover:bg-white/10"
-          >
-            New Chat
+            New String
           </button>
 
           <button
@@ -7159,49 +7643,7 @@ function ControlDeckSurface({
         </div>
       ) : null}
 
-      {showHistoryPanel ? (
-        <div className="vx-scrollbar max-h-44 overflow-y-auto rounded-2xl border border-white/10 bg-black/25 p-2">
-          <p className="px-2 pb-1 text-[10px] uppercase tracking-[0.16em] text-slate-500">
-            {mode === "DIRECTION" ? "Command history" : "Brainstorm history"}
-          </p>
-          {modeHistoryItems.length === 0 ? (
-            <p className="px-2 py-2 text-xs text-slate-500">
-              No {mode === "DIRECTION" ? "command" : "brainstorm"} history yet.
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {modeHistoryItems.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => {
-                    onSelectThread(item.id);
-                    setShowHistoryPanel(false);
-                  }}
-                  className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2 text-left transition ${
-                    activeHistoryId === item.id
-                      ? "border border-cyan-500/35 bg-cyan-500/10 text-cyan-100"
-                      : "border border-transparent text-slate-300 hover:border-white/10 hover:bg-white/5"
-                  }`}
-                >
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-semibold">
-                      {item.title || "Untitled Session"}
-                    </span>
-                    <span className="block text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                      {item.mode === "DIRECTION" ? "Command" : "Brainstorm"} |{" "}
-                      {new Date(item.updatedAt).toLocaleString()}
-                    </span>
-                  </span>
-                  <ChevronRight size={14} className="shrink-0 text-slate-500" />
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      ) : null}
-
-      {showAdvanced ? (
+      {showAdvanced && !isStringsView ? (
         <div className={`vx-panel grid gap-3 rounded-2xl p-3 sm:grid-cols-[minmax(0,280px)_1fr] ${themeStyle.border}`}>
           <label className="space-y-1">
             <span className="text-xs text-slate-500">Model</span>
@@ -7247,7 +7689,7 @@ function ControlDeckSurface({
                     : "text-slate-300 hover:bg-white/10"
                 }`}
               >
-                Show command context
+                Show direction context
               </button>
             </div>
           </div>
@@ -7259,7 +7701,58 @@ function ControlDeckSurface({
       >
         <div className="pointer-events-none absolute -left-20 top-0 h-52 w-52 rounded-full bg-cyan-500/6 blur-3xl" />
         <div className="pointer-events-none absolute -right-16 bottom-0 h-52 w-52 rounded-full bg-emerald-500/5 blur-3xl" />
-        {showLanding ? (
+        {isStringsView ? (
+          <div className="relative flex min-h-0 flex-1 flex-col gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-black/25 px-3 py-2">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Strings</p>
+                <p className="text-sm text-slate-300">
+                  Review all discussion and direction strings, then open one in place.
+                </p>
+              </div>
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold text-slate-300">
+                {stringItems.length} total
+              </span>
+            </div>
+
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#050910]/72 p-2.5 sm:p-3">
+              {stringItems.length === 0 ? (
+                <div className="flex h-full min-h-[240px] items-center justify-center rounded-2xl border border-dashed border-white/10 bg-black/20 px-6 text-center text-sm text-slate-500">
+                  No strings yet. Create a new discussion or direction string to get started.
+                </div>
+              ) : (
+                stringItems.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => {
+                      onSelectThread(item.id);
+                      setSurfaceTab(item.mode);
+                    }}
+                    className={`flex w-full items-start justify-between gap-3 rounded-2xl border px-4 py-3 text-left transition ${
+                      activeHistoryId === item.id
+                        ? "border-cyan-500/35 bg-cyan-500/10 text-cyan-100"
+                        : "border-white/10 bg-black/20 text-slate-300 hover:border-white/20 hover:bg-white/5"
+                    }`}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-semibold">
+                        {controlThreadDisplayTitle(item)}
+                      </span>
+                      <span className="mt-1 block text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                        {controlThreadKindLabel(item.mode)} | {new Date(item.updatedAt).toLocaleString()}
+                      </span>
+                      <span className="mt-2 block whitespace-pre-wrap text-xs leading-5 text-slate-400 [overflow-wrap:anywhere]">
+                        {controlThreadPreview(item)}
+                      </span>
+                    </span>
+                    <ChevronRight size={16} className="mt-1 shrink-0 text-slate-500" />
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        ) : showLanding ? (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center px-3">
             <h2 className="text-center font-display text-3xl font-black tracking-[0.01em] text-slate-100 md:text-5xl">
               {heroTitle}
@@ -7279,7 +7772,7 @@ function ControlDeckSurface({
               <div className="rounded-2xl border border-cyan-400/35 bg-[#0b121b] p-3">
                 <div className="flex items-center justify-between gap-2">
                   <p className="text-xs font-semibold text-cyan-200">
-                    Command draft
+                    Direction draft
                   </p>
                   <span className="text-xs text-cyan-100/80">
                     {directionGiven.trim().length} chars
@@ -7499,7 +7992,7 @@ function ControlDeckSurface({
               </div>
             ) : null}
 
-            <div className="vx-scrollbar h-[50vh] min-h-[320px] max-h-[65vh] flex-1 space-y-3 overflow-y-auto rounded-2xl border border-white/10 bg-[#050910]/72 p-2.5 pb-24 pr-0 sm:h-[58vh] sm:min-h-[420px] sm:max-h-[72vh] sm:pr-1 sm:p-3 sm:pb-28">
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#050910]/72 p-2.5 pb-24 pr-0 sm:p-3 sm:pb-28 sm:pr-1">
               {turns.map((turn) => (
                 <div
                   key={turn.id}
@@ -7528,9 +8021,11 @@ function ControlDeckSurface({
 
       </div>
 
-      <div className="pointer-events-none fixed inset-x-0 bottom-[4.7rem] z-30 flex justify-center px-4">
-        <div className="pointer-events-auto w-full max-w-4xl">{composerBar}</div>
-      </div>
+      {!isStringsView ? (
+        <div className="pointer-events-none fixed inset-x-0 bottom-[4.7rem] z-30 flex justify-center px-4">
+          <div className="pointer-events-auto w-full max-w-4xl">{composerBar}</div>
+        </div>
+      ) : null}
     </div>
   );
 }

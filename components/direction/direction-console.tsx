@@ -63,6 +63,10 @@ interface DirectionConsoleProps {
     accentSoft?: string;
     border: string;
   };
+  dateFilter?: string | null;
+  directionIdFilter?: string | null;
+  flowIdFilter?: string[] | null;
+  stringFilterLabel?: string | null;
 }
 
 type HistoryFilter = "ALL" | DirectionStatus;
@@ -180,7 +184,37 @@ function buildCircularGraph(autopsy: DirectionAutopsy | null) {
   return { nodes, edges };
 }
 
-export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
+function toConsoleDateKey(value: string | number | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function matchesDateFilter(dateFilter: string | null, ...values: Array<string | number | Date | null | undefined>) {
+  if (!dateFilter) {
+    return true;
+  }
+  return values.some((value) => {
+    if (!value) {
+      return false;
+    }
+    return toConsoleDateKey(value) === dateFilter;
+  });
+}
+
+export function DirectionConsole({
+  orgId,
+  themeStyle,
+  dateFilter = null,
+  directionIdFilter = null,
+  flowIdFilter = null,
+  stringFilterLabel = null
+}: DirectionConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
   const { user } = useFirebaseAuth();
 
@@ -208,23 +242,34 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
     [directions, selectedDirectionId]
   );
   const graph = useMemo(() => buildCircularGraph(autopsy), [autopsy]);
+  const dateScopedDirections = useMemo(() => {
+    return directions.filter((item) => {
+      if (!matchesDateFilter(dateFilter, item.updatedAt, item.lastExecutedAt)) {
+        return false;
+      }
+      if (directionIdFilter && item.id !== directionIdFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [dateFilter, directionIdFilter, directions]);
   const historyCounts = useMemo(() => {
     const count = {
-      ALL: directions.length,
+      ALL: dateScopedDirections.length,
       ACTIVE: 0,
       DRAFT: 0,
       ARCHIVED: 0
     };
-    directions.forEach((item) => {
+    dateScopedDirections.forEach((item) => {
       if (item.status === "ACTIVE") count.ACTIVE += 1;
       if (item.status === "DRAFT") count.DRAFT += 1;
       if (item.status === "ARCHIVED") count.ARCHIVED += 1;
     });
     return count;
-  }, [directions]);
+  }, [dateScopedDirections]);
   const filteredDirections = useMemo(() => {
     const q = historyQuery.trim().toLowerCase();
-    return directions.filter((item) => {
+    return dateScopedDirections.filter((item) => {
       if (historyFilter !== "ALL" && item.status !== historyFilter) {
         return false;
       }
@@ -238,7 +283,21 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         (item.ownerEmail ?? "").toLowerCase().includes(q)
       );
     });
-  }, [directions, historyFilter, historyQuery]);
+  }, [dateScopedDirections, historyFilter, historyQuery]);
+  const filteredWorkflows = useMemo(() => {
+    const normalizedFlowIds = new Set(
+      (flowIdFilter ?? []).map((item) => item.trim()).filter(Boolean)
+    );
+    return workflows.filter((item) => {
+      if (!matchesDateFilter(dateFilter, item.updatedAt)) {
+        return false;
+      }
+      if (normalizedFlowIds.size > 0 && !normalizedFlowIds.has(item.id)) {
+        return false;
+      }
+      return true;
+    });
+  }, [dateFilter, flowIdFilter, workflows]);
 
   const loadDirections = useCallback(
     async (silent?: boolean) => {
@@ -355,6 +414,13 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
     if (!selectedDirectionId) return;
     void loadDirectionDetail(selectedDirectionId);
   }, [loadDirectionDetail, selectedDirectionId]);
+
+  useEffect(() => {
+    if (selectedDirectionId && dateScopedDirections.some((item) => item.id === selectedDirectionId)) {
+      return;
+    }
+    setSelectedDirectionId(dateScopedDirections[0]?.id ?? null);
+  }, [dateScopedDirections, selectedDirectionId]);
 
   useEffect(() => {
     if (selectedDirectionId) {
@@ -513,6 +579,14 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
         <div>
           <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Direction</h2>
           <p className="text-xs text-slate-500">Strategy workspace</p>
+          {dateFilter ? (
+            <p className="mt-1 text-[11px] text-cyan-300">
+              Filtered to {new Date(`${dateFilter}T00:00:00`).toLocaleDateString()}
+            </p>
+          ) : null}
+          {stringFilterLabel ? (
+            <p className="mt-1 text-[11px] text-emerald-300">String: {stringFilterLabel}</p>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -573,7 +647,11 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
               </div>
             ) : filteredDirections.length === 0 ? (
               <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs text-slate-500">
-                No directions match this history filter.
+                {directionIdFilter
+                  ? "No directions linked to the selected string."
+                  : dateFilter
+                    ? "No directions match the selected date and history filter."
+                    : "No directions match this history filter."}
               </p>
             ) : (
               filteredDirections.map((item) => (
@@ -743,10 +821,16 @@ export function DirectionConsole({ orgId, themeStyle }: DirectionConsoleProps) {
                 <div className="space-y-2 rounded-2xl border border-white/10 bg-black/25 p-3">
                   <p className="text-xs font-medium text-slate-500">Workflow history</p>
                   <div className="max-h-64 space-y-2 overflow-y-auto">
-                    {workflows.length === 0 ? (
-                      <p className="text-xs text-slate-500">No workflows yet.</p>
+                    {filteredWorkflows.length === 0 ? (
+                      <p className="text-xs text-slate-500">
+                        {flowIdFilter?.length
+                          ? "No workflows linked to the selected string."
+                          : dateFilter
+                            ? "No workflows for selected date."
+                            : "No workflows yet."}
+                      </p>
                     ) : (
-                      workflows.map((item) => (
+                      filteredWorkflows.map((item) => (
                         <article key={item.id} className="rounded-xl border border-white/10 bg-black/30 p-2">
                           <p className="line-clamp-2 text-sm text-slate-200">{item.prompt}</p>
                           <p className="text-xs text-slate-500">

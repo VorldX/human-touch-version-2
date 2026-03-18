@@ -7,12 +7,16 @@ const PUBLIC_API_PATHS = new Set([
   "/api/auth/session",
   "/api/auth/session/login",
   "/api/auth/session/logout",
+  "/api/inngest",
   "/api/inngest/serve",
   "/api/integrations/composio/oauth/callback"
 ]);
 
 function isPublicApiPath(pathname: string) {
   if (PUBLIC_API_PATHS.has(pathname)) {
+    return true;
+  }
+  if (pathname === "/api/test" && process.env.NODE_ENV !== "production") {
     return true;
   }
   return false;

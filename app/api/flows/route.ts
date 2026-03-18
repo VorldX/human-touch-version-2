@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import {
   FlowStatus,
   LogType,
+  MemoryTier,
   PersonnelStatus,
   type Prisma,
   SpendEventType,
@@ -27,7 +28,11 @@ import {
   ensureMainAgentProfile,
   resolveOrgExecutionMode
 } from "@/lib/agent/orchestration/runtime";
-import { linkFlowToDirection, updateDirection } from "@/lib/direction/directions";
+import {
+  linkFlowToDirection,
+  listDirectionFlowLinksByDirection,
+  updateDirection
+} from "@/lib/direction/directions";
 import {
   composioAllowlistedToolkits,
   inferRequestedToolkits
@@ -219,6 +224,111 @@ function normalizeDirectionKey(value: string) {
 function formatIdSnippet(ids: string[], limit = 3) {
   const head = ids.slice(0, limit);
   return head.join(", ");
+}
+
+function extractFlowIdFromPlanLink(input: { key: string; value: unknown }) {
+  const fromValue =
+    input.value && typeof input.value === "object" && !Array.isArray(input.value)
+      ? (input.value as { flowId?: unknown }).flowId
+      : null;
+  if (typeof fromValue === "string" && fromValue.trim().length > 0) {
+    return fromValue.trim();
+  }
+
+  const prefix = "plan.flow.";
+  if (!input.key.startsWith(prefix)) {
+    return "";
+  }
+  const keyParts = input.key.split(".");
+  return keyParts.length >= 4 ? keyParts[3]?.trim() ?? "" : "";
+}
+
+async function findReusableFlowForLaunch(input: {
+  orgId: string;
+  planId?: string;
+  directionId?: string;
+}) {
+  const reusableStatuses: FlowStatus[] = [
+    FlowStatus.DRAFT,
+    FlowStatus.QUEUED,
+    FlowStatus.ACTIVE,
+    FlowStatus.PAUSED
+  ];
+  const flowIds = new Set<string>();
+
+  if (input.planId) {
+    const linkedRows = await prisma.memoryEntry.findMany({
+      where: {
+        orgId: input.orgId,
+        tier: MemoryTier.ORG,
+        key: {
+          startsWith: `plan.flow.${input.planId}.`
+        },
+        redactedAt: null
+      },
+      orderBy: {
+        updatedAt: "desc"
+      },
+      take: 120,
+      select: {
+        key: true,
+        value: true
+      }
+    });
+
+    for (const row of linkedRows) {
+      const flowId = extractFlowIdFromPlanLink(row);
+      if (flowId) {
+        flowIds.add(flowId);
+      }
+    }
+  }
+
+  if (input.directionId) {
+    const directionLinks = await listDirectionFlowLinksByDirection(
+      input.orgId,
+      input.directionId
+    ).catch(() => []);
+    for (const link of directionLinks) {
+      if (link.flowId) {
+        flowIds.add(link.flowId);
+      }
+    }
+  }
+
+  if (flowIds.size === 0) {
+    return null;
+  }
+
+  const candidates = await prisma.flow.findMany({
+    where: {
+      orgId: input.orgId,
+      id: {
+        in: [...flowIds]
+      },
+      status: {
+        in: reusableStatuses
+      }
+    },
+    orderBy: {
+      updatedAt: "desc"
+    },
+    take: 6,
+    select: {
+      id: true,
+      status: true,
+      predictedBurn: true,
+      requiredSignatures: true,
+      updatedAt: true,
+      _count: {
+        select: {
+          tasks: true
+        }
+      }
+    }
+  });
+
+  return candidates[0] ?? null;
 }
 
 function parsePlanWorkflows(value: unknown): LaunchPlanWorkflowInput[] {
@@ -1132,6 +1242,47 @@ export async function POST(request: NextRequest) {
         if (item.status === "REJECTED") permissionRequestCounts.rejected += 1;
         if (item.status === "CANCELLED") permissionRequestCounts.cancelled += 1;
       }
+    }
+
+    const reusableFlow = await findReusableFlowForLaunch({
+      orgId,
+      ...(planId ? { planId } : {}),
+      ...(directionId ? { directionId } : {})
+    });
+    if (reusableFlow) {
+      await prisma.log.create({
+        data: {
+          orgId,
+          type: LogType.SYS,
+          actor: "FLOW_LAUNCH_GUARD",
+          message: `Launch deduplicated. Reusing flow ${reusableFlow.id} for plan=${planId ?? "n/a"} direction=${directionId ?? "n/a"}.`
+        }
+      });
+      return NextResponse.json(
+        {
+          ok: true,
+          reused: true,
+          flow: {
+            id: reusableFlow.id,
+            status: reusableFlow.status,
+            predictedBurn: reusableFlow.predictedBurn,
+            requiredSignatures: reusableFlow.requiredSignatures,
+            ...(directionId ? { directionId } : {}),
+            ...(planId ? { planId } : {}),
+            ...(fallbackPlanId ? { fallbackPlanId } : {}),
+            taskCount: reusableFlow._count.tasks,
+            planWorkflowCount: parsedPlanWorkflows.length,
+            planPathwayCount: parsedPlanPathway.length,
+            permissionRequestCount: permissionRequestCounts.total,
+            approvedPermissionRequestCount: permissionRequestCounts.approved,
+            executionMode: "MULTI_AGENT",
+            orgExecutionMode,
+            strictPipelineMode: pipelineSettings.mode
+          },
+          warning: `Existing flow ${reusableFlow.id} is already ${reusableFlow.status}. Reused instead of creating a duplicate workflow.`
+        },
+        { status: 200 }
+      );
     }
 
     const activeAgents = await prisma.personnel.findMany({

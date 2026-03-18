@@ -80,6 +80,16 @@ export interface AgentContextPack {
     key: string;
     tier: string;
     score: number;
+    similarity?: number;
+    timeDecayScore?: number;
+    hybridScore?: number;
+    rerankScore?: number;
+  }>;
+  graphHighlights: Array<{
+    id: number;
+    label: string;
+    score: number;
+    degree: number;
   }>;
   dnaHighlights: Array<{
     id: string;

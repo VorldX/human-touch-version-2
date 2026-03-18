@@ -35,7 +35,6 @@
     "**/*.ts",
     "**/*.tsx",
     ".next/types/**/*.ts",
-    "..\\..\\..\\AppData\\Local\\vorldx-next-cache\\d9cb28135424\\dist/types/**/*.ts",
     ".next-dev-fresh/types/**/*.ts"
   ],
   "exclude": [

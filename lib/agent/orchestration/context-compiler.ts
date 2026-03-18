@@ -8,6 +8,7 @@ import {
   listDirectionFlowLinksByFlow
 } from "@/lib/direction/directions";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
+import { listDnaProfiles } from "@/lib/dna/profiles";
 import {
   selectContextBlocksByPriority
 } from "@/lib/agent/orchestration/context-budget";
@@ -28,6 +29,13 @@ interface ContextCandidate {
   relevance: number;
   amnesiaProtected: boolean;
   content: string;
+}
+
+interface GraphHighlightCandidate {
+  id: number;
+  label: string;
+  degree: number;
+  score: number;
 }
 
 const MIN_SECTION_TOKENS = 48;
@@ -216,6 +224,28 @@ function buildMemorySection(
   );
 }
 
+function buildGraphSection(
+  entries: Array<{
+    id: number;
+    label: string;
+    degree: number;
+    score: number;
+  }>
+) {
+  return compact(
+    JSON.stringify(
+      entries.map((entry) => ({
+        id: entry.id,
+        label: entry.label,
+        degree: entry.degree,
+        score: entry.score
+      })),
+      null,
+      2
+    )
+  );
+}
+
 export async function buildAgentContextPack(input: {
   orgId: string;
   flowId: string;
@@ -275,7 +305,7 @@ export async function buildAgentContextPack(input: {
     ? await getDirection(input.orgId, directionLinks[0].directionId)
     : null;
 
-  const [memoryEntries, dnaFiles, priorRuns, parentRun] = await Promise.all([
+  const [memoryEntries, dnaFiles, dnaProfiles, priorRuns, parentRun, graphNodeRows] = await Promise.all([
     retrieveRelevantMemoryEntries({
       orgId: input.orgId,
       prompt: input.prompt,
@@ -290,6 +320,7 @@ export async function buildAgentContextPack(input: {
       prompt: input.prompt,
       limit: limits.dnaLimit
     }),
+    listDnaProfiles(input.orgId, "ORGANIZATION").catch(() => []),
     prisma.agentRun.findMany({
       where: {
         orgId: input.orgId,
@@ -315,7 +346,52 @@ export async function buildAgentContextPack(input: {
             decisionReason: true
           }
         })
-      : Promise.resolve(null)
+      : Promise.resolve(null),
+    input.userId
+      ? prisma.$queryRawUnsafe<
+          Array<{
+            id: number;
+            label: string;
+            propertiesJsonb: unknown;
+            degree: number;
+          }>
+        >(
+          `
+            WITH edge_counts AS (
+              SELECT source_id AS node_id, COUNT(*)::int AS degree
+              FROM dna_memory.edges
+              WHERE tenant_id = $1
+                AND user_id = $2
+              GROUP BY source_id
+              UNION ALL
+              SELECT target_id AS node_id, COUNT(*)::int AS degree
+              FROM dna_memory.edges
+              WHERE tenant_id = $1
+                AND user_id = $2
+              GROUP BY target_id
+            ),
+            totals AS (
+              SELECT node_id, SUM(degree)::int AS degree
+              FROM edge_counts
+              GROUP BY node_id
+            )
+            SELECT
+              n.id,
+              n.label,
+              n.properties_jsonb AS "propertiesJsonb",
+              COALESCE(t.degree, 0)::int AS degree
+            FROM dna_memory.nodes n
+            LEFT JOIN totals t
+              ON t.node_id = n.id
+            WHERE n.tenant_id = $1
+              AND n.user_id = $2
+            ORDER BY COALESCE(t.degree, 0) DESC, n.updated_at DESC
+            LIMIT 40
+          `,
+          input.orgId,
+          input.userId
+        )
+      : Promise.resolve([])
   ]);
 
   const prompt = task?.prompt ?? input.prompt;
@@ -342,6 +418,19 @@ export async function buildAgentContextPack(input: {
   const nonToolMemoryEntries = memoryEntries.filter(
     (entry) => !toolSignalEntries.some((toolEntry) => toolEntry.id === entry.id)
   );
+  const graphHighlights: GraphHighlightCandidate[] = graphNodeRows
+    .map((node) => {
+      const combined = `${node.label} ${stringifyPreview(node.propertiesJsonb, 180)}`;
+      const relevance = scoreRelevance(prompt, combined);
+      return {
+        id: node.id,
+        label: node.label,
+        degree: node.degree,
+        score: Number(Math.max(0.08, relevance + Math.min(0.2, node.degree * 0.01)).toFixed(4))
+      };
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 12);
 
   const priorRunSignals = compact(
     JSON.stringify(
@@ -450,6 +539,18 @@ export async function buildAgentContextPack(input: {
     });
   }
 
+  if (graphHighlights.length > 0) {
+    const graphSection = buildGraphSection(graphHighlights.slice(0, input.mode === "TURBO" ? 8 : 5));
+    candidates.push({
+      id: `graph:${input.taskId}`,
+      name: "Graph Nodes",
+      priority: 5,
+      relevance: Math.max(0.16, scoreRelevance(prompt, graphSection)),
+      amnesiaProtected: false,
+      content: graphSection
+    });
+  }
+
   if (org) {
     const orgSection = buildOrganizationSection({
       name: org.name,
@@ -481,6 +582,30 @@ export async function buildAgentContextPack(input: {
       amnesiaProtected: false,
       content: companyPreview
     });
+  }
+
+  if (dnaProfiles.length > 0) {
+    const profile = dnaProfiles[0];
+    const profileSection = compact(
+      [
+        `Title: ${profile.title}`,
+        profile.coreTraits.length > 0 ? `Traits: ${profile.coreTraits.slice(0, 8).join(", ")}` : "",
+        profile.summary ? `Summary: ${clampText(compact(profile.summary), 480)}` : "",
+        `Source assets: ${profile.sourceAssetIds.length}`
+      ]
+        .filter(Boolean)
+        .join(" | ")
+    );
+    if (profileSection) {
+      candidates.push({
+        id: `dna:profile:${profile.id}`,
+        name: "DNA Profile",
+        priority: 6,
+        relevance: Math.max(0.2, scoreRelevance(prompt, profileSection)),
+        amnesiaProtected: false,
+        content: profileSection
+      });
+    }
   }
 
   if (parentRun) {
@@ -543,8 +668,13 @@ export async function buildAgentContextPack(input: {
       id: entry.id,
       key: entry.key,
       tier: entry.tier,
-      score: entry.score
+      score: entry.score,
+      similarity: typeof entry.similarity === "number" ? entry.similarity : undefined,
+      timeDecayScore: typeof entry.timeDecayScore === "number" ? entry.timeDecayScore : undefined,
+      hybridScore: typeof entry.hybridScore === "number" ? entry.hybridScore : undefined,
+      rerankScore: typeof entry.rerankScore === "number" ? entry.rerankScore : undefined
     })),
+    graphHighlights,
     dnaHighlights: dnaFiles.map((dna) => ({
       id: dna.id,
       name: dna.name,

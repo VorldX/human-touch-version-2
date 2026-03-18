@@ -71,6 +71,9 @@ export interface AgentMemorySearchResult {
   similarity: number;
   recencyScore: number;
   importanceScore: number;
+  timeDecayScore: number;
+  hybridScore: number;
+  rerankScore?: number;
   score: number;
 }
 

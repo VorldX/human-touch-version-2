@@ -1,4 +1,5 @@
 import { inngest } from "@/lib/inngest/client";
+import { orchestratorInngestFunctions } from "@/src/inngest/functions";
 
 const syncProbe = inngest.createFunction(
   { id: "sync-probe" },
@@ -12,4 +13,4 @@ const syncProbe = inngest.createFunction(
   }
 );
 
-export const inngestFunctions = [syncProbe];
+export const inngestFunctions = [syncProbe, ...orchestratorInngestFunctions];

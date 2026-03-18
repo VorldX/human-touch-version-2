@@ -43,6 +43,10 @@ interface PlanConsoleProps {
     accentSoft?: string;
     border: string;
   };
+  dateFilter?: string | null;
+  planIdFilter?: string | null;
+  directionIdFilter?: string | null;
+  stringFilterLabel?: string | null;
 }
 
 function toPrettyJson(value: Record<string, unknown>) {
@@ -381,7 +385,37 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
   }
 }
 
-export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
+function toConsoleDateKey(value: string | number | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function matchesDateFilter(dateFilter: string | null, ...values: Array<string | number | Date | null | undefined>) {
+  if (!dateFilter) {
+    return true;
+  }
+  return values.some((value) => {
+    if (!value) {
+      return false;
+    }
+    return toConsoleDateKey(value) === dateFilter;
+  });
+}
+
+export function PlanConsole({
+  orgId,
+  themeStyle,
+  dateFilter = null,
+  planIdFilter = null,
+  directionIdFilter = null,
+  stringFilterLabel = null
+}: PlanConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
   const detailsFormRef = useRef<HTMLFormElement | null>(null);
 
@@ -402,9 +436,23 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const [planViewTab, setPlanViewTab] = useState<PlanViewTab>("primary");
   const [selectedWorkflowIndex, setSelectedWorkflowIndex] = useState(0);
 
+  const visiblePlans = useMemo(() => {
+    return plans.filter((item) => {
+      if (!matchesDateFilter(dateFilter, item.createdAt, item.updatedAt)) {
+        return false;
+      }
+      if (planIdFilter && item.id !== planIdFilter) {
+        return false;
+      }
+      if (!planIdFilter && directionIdFilter && item.directionId !== directionIdFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [dateFilter, directionIdFilter, planIdFilter, plans]);
   const selectedPlan = useMemo(
-    () => plans.find((item) => item.id === selectedPlanId) ?? null,
-    [plans, selectedPlanId]
+    () => visiblePlans.find((item) => item.id === selectedPlanId) ?? null,
+    [selectedPlanId, visiblePlans]
   );
   const parsedPrimaryDraft = useMemo(() => tryParseJsonObject(primaryPlanDraft), [primaryPlanDraft]);
   const parsedFallbackDraft = useMemo(() => tryParseJsonObject(fallbackPlanDraft), [fallbackPlanDraft]);
@@ -484,6 +532,13 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
     const interval = setInterval(() => void loadPlans(true), 15000);
     return () => clearInterval(interval);
   }, [loadPlans]);
+
+  useEffect(() => {
+    if (selectedPlanId && visiblePlans.some((item) => item.id === selectedPlanId)) {
+      return;
+    }
+    setSelectedPlanId(visiblePlans[0]?.id ?? null);
+  }, [selectedPlanId, visiblePlans]);
 
   useEffect(() => {
     if (!selectedPlan) return;
@@ -605,7 +660,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
   const activePathwayCount = activePlanView.pathway.length;
   const selectedUpdatedAt = selectedPlan ? new Date(selectedPlan.updatedAt).toLocaleString() : "No plan selected";
   const planInsightsById = useMemo(() => {
-    return plans.reduce<
+    return visiblePlans.reduce<
       Record<
         string,
         {
@@ -638,7 +693,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
       };
       return accumulator;
     }, {});
-  }, [plans]);
+  }, [visiblePlans]);
 
   const handlePlanSelect = useCallback((planId: string) => {
     setSelectedPlanId(planId);
@@ -669,6 +724,14 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
             <p className="mt-1 text-xs text-slate-400">
               Human + AI editable plan graph with execution visibility and approval checkpoints.
             </p>
+            {dateFilter ? (
+              <p className="mt-2 text-[11px] text-cyan-300">
+                Filtered to {new Date(`${dateFilter}T00:00:00`).toLocaleDateString()}
+              </p>
+            ) : null}
+            {stringFilterLabel ? (
+              <p className="mt-1 text-[11px] text-emerald-300">String: {stringFilterLabel}</p>
+            ) : null}
           </div>
           <div className="rounded-2xl border border-white/10 bg-black/25 px-4 py-3 text-right">
             <p className="text-[11px] uppercase tracking-wide text-slate-500">Latest update</p>
@@ -698,7 +761,7 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
               Plan history
             </p>
             <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-slate-400">
-              {plans.length}
+              {visiblePlans.length}
             </span>
           </div>
 
@@ -707,13 +770,17 @@ export function PlanConsole({ orgId, themeStyle }: PlanConsoleProps) {
               <Loader2 size={12} className="animate-spin" />
               Loading plans...
             </div>
-          ) : plans.length === 0 ? (
+          ) : visiblePlans.length === 0 ? (
             <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs text-slate-500">
-              No plans created yet. Generate from Control to Direction mode.
+              {planIdFilter || directionIdFilter
+                ? "No plans linked to the selected string."
+                : dateFilter
+                  ? "No plans found for the selected date."
+                  : "No plans created yet. Generate from Control to Direction mode."}
             </p>
           ) : (
             <div className="space-y-2">
-              {plans.map((item) => {
+              {visiblePlans.map((item) => {
                 const isSelected = selectedPlanId === item.id;
                 const insight = planInsightsById[item.id];
                 return (

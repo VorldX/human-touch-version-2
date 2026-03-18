@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  calculateExponentialTimeDecay,
   blendRankingScores,
   calculateRecencyScore,
+  calculateTimeWeightedHybridScore,
   dedupeMemoryResults
 } from "../lib/agent/memory/ranking.ts";
 import type { AgentMemorySearchResult } from "../lib/agent/memory/types.ts";
@@ -40,6 +42,8 @@ function buildResult(
     similarity: 0.8,
     recencyScore: 0.7,
     importanceScore: 0.7,
+    timeDecayScore: 0.7,
+    hybridScore: 0.77,
     score: 0.76
   };
 
@@ -69,6 +73,41 @@ test("calculateRecencyScore decays with age", () => {
   });
 
   assert.ok(fresh > stale);
+});
+
+test("calculateExponentialTimeDecay follows e^(-lambda*delta_t)", () => {
+  const now = Date.now();
+  const fresh = calculateExponentialTimeDecay({
+    timestamp: new Date(now - 60 * 60 * 1000),
+    lambdaPerHour: 0.08,
+    nowMs: now
+  });
+  const stale = calculateExponentialTimeDecay({
+    timestamp: new Date(now - 24 * 60 * 60 * 1000),
+    lambdaPerHour: 0.08,
+    nowMs: now
+  });
+
+  assert.ok(fresh > stale);
+  assert.ok(fresh <= 1 && fresh >= 0);
+  assert.ok(stale <= 1 && stale >= 0);
+});
+
+test("calculateTimeWeightedHybridScore blends semantic and time decay", () => {
+  const strong = calculateTimeWeightedHybridScore({
+    semanticSimilarity: 0.9,
+    timeDecayScore: 0.8,
+    alpha: 0.7,
+    beta: 0.3
+  });
+  const weak = calculateTimeWeightedHybridScore({
+    semanticSimilarity: 0.3,
+    timeDecayScore: 0.2,
+    alpha: 0.7,
+    beta: 0.3
+  });
+
+  assert.ok(strong > weak);
 });
 
 test("blendRankingScores respects weighted blend", () => {

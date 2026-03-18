@@ -209,6 +209,51 @@ function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isLlmCredentialFailure(message: string) {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("primary brain key is missing or invalid") ||
+    normalized.includes("brain key is missing or invalid") ||
+    normalized.includes("agent api key is not configured") ||
+    normalized.includes("api key") && normalized.includes("not configured") ||
+    normalized.includes("invalid api key") ||
+    normalized.includes("unauthorized")
+  );
+}
+
+function buildDeterministicPlanningOutput(input: {
+  direction: string;
+  humanPlan: string;
+  history: Array<{ role: string; content: string }>;
+  reason: string;
+}) {
+  const ownerHistory = input.history
+    .filter((entry) => entry.role === "owner")
+    .map((entry) => entry.content)
+    .slice(-4)
+    .join(" | ");
+
+  const analysis = [
+    "Deterministic planning fallback applied because no valid LLM key was available.",
+    `Reason: ${input.reason}.`,
+    `Direction: ${input.direction.slice(0, 220)}.`,
+    input.humanPlan
+      ? `Human plan hints: ${input.humanPlan.slice(0, 220)}.`
+      : "Human plan hints: none.",
+    ownerHistory ? `Owner history highlights: ${ownerHistory.slice(0, 260)}.` : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return JSON.stringify({
+    analysis,
+    directionGiven: input.direction,
+    primaryPlan: {},
+    fallbackPlan: {},
+    permissions: []
+  });
+}
+
 function clampText(value: string, maxChars: number) {
   if (value.length <= maxChars) {
     return value;
@@ -1173,6 +1218,7 @@ export async function POST(request: NextRequest) {
     | {
         orgId?: string;
         direction?: string;
+        threadId?: string;
         history?: unknown;
         humanPlan?: string;
         provider?: string;
@@ -1182,6 +1228,10 @@ export async function POST(request: NextRequest) {
 
   const orgId = cleanText(body?.orgId);
   const direction = clampText(cleanText(body?.direction), MAX_DIRECTION_CHARS);
+  const threadId = clampText(
+    cleanText(body?.threadId).replace(/[^a-zA-Z0-9:_-]/g, ""),
+    96
+  );
   const history = safeHistory(body?.history);
   const humanPlan = clampText(cleanText(body?.humanPlan), MAX_HUMAN_PLAN_CHARS);
   const provider = cleanText(body?.provider);
@@ -1304,7 +1354,22 @@ export async function POST(request: NextRequest) {
     maxOutputTokens: DIRECTION_PLAN_MAX_OUTPUT_TOKENS
   });
 
-  if (!planningGraphResult.ok || !planningGraphResult.modelOutput) {
+  const planningError = cleanText(planningGraphResult.error);
+  const deterministicFallback =
+    (!planningGraphResult.ok || !planningGraphResult.modelOutput) &&
+    isLlmCredentialFailure(planningError);
+  const modelOutput =
+    planningGraphResult.modelOutput ??
+    (deterministicFallback
+      ? buildDeterministicPlanningOutput({
+          direction,
+          humanPlan,
+          history,
+          reason: planningError || "missing_or_invalid_llm_key"
+        })
+      : null);
+
+  if (!modelOutput) {
     return NextResponse.json(
       {
         ok: false,
@@ -1318,12 +1383,12 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const parsed = parseModelPlan(planningGraphResult.modelOutput, direction);
+  const parsed = parseModelPlan(modelOutput, direction);
   const qualityIssues = hasPlannerQualityIssues({
     primaryPlan: parsed.primaryPlan,
     fallbackPlan: parsed.fallbackPlan
   });
-  if (qualityIssues.length > 0) {
+  if (qualityIssues.length > 0 && !deterministicFallback) {
     return NextResponse.json(
       {
         ok: false,
@@ -1534,6 +1599,44 @@ export async function POST(request: NextRequest) {
       tx
     );
 
+    if (threadId) {
+      const threadScopeKey = `command.thread.${access.actor.userId}.${threadId}`;
+      const threadScopeValue = {
+        threadId,
+        userId: access.actor.userId,
+        directionId: directionRecord.id,
+        planId: planRecord.id,
+        updatedAt: new Date().toISOString()
+      };
+      const existingScope = await tx.memoryEntry.findFirst({
+        where: {
+          orgId,
+          tier: "ORG",
+          key: threadScopeKey,
+          redactedAt: null
+        }
+      });
+      if (existingScope) {
+        await tx.memoryEntry.update({
+          where: {
+            id: existingScope.id
+          },
+          data: {
+            value: threadScopeValue
+          }
+        });
+      } else {
+        await tx.memoryEntry.create({
+          data: {
+            orgId,
+            tier: "ORG",
+            key: threadScopeKey,
+            value: threadScopeValue
+          }
+        });
+      }
+    }
+
     const permissionRequests = await createPermissionRequests({
       orgId,
       direction: directionGiven,
@@ -1555,7 +1658,7 @@ export async function POST(request: NextRequest) {
         orgId,
         type: LogType.USER,
         actor: "CONTROL",
-        message: `Direction plans generated by ${access.actor.email}. direction=${directionRecord.id}, plan=${planRecord.id}, permissionRequests=${permissionRequests.length}, requiredToolkits=${requiredToolkits.length}.`
+        message: `Direction plans generated by ${access.actor.email}. direction=${directionRecord.id}, plan=${planRecord.id}, permissionRequests=${permissionRequests.length}, requiredToolkits=${requiredToolkits.length}${threadId ? `, thread=${threadId}` : ""}.`
       }
     });
 
@@ -1593,16 +1696,28 @@ export async function POST(request: NextRequest) {
       directionRecord: persisted.directionRecord,
       planRecord: persisted.planRecord,
       model: {
-        provider: planningGraphResult.model?.provider ?? null,
-        name: planningGraphResult.model?.name ?? null,
-        source: planningGraphResult.model?.source ?? null
+        provider: deterministicFallback ? null : planningGraphResult.model?.provider ?? null,
+        name: deterministicFallback ? null : planningGraphResult.model?.name ?? null,
+        source: deterministicFallback
+          ? "deterministic-fallback"
+          : planningGraphResult.model?.source ?? null
       },
-      tokenUsage: planningGraphResult.tokenUsage ?? null,
-      billing: planningGraphResult.billing ?? null,
+      tokenUsage: deterministicFallback ? null : planningGraphResult.tokenUsage ?? null,
+      billing: deterministicFallback ? null : planningGraphResult.billing ?? null,
       contextSelection: planningGraphResult.contextSelection,
       planningGraph: {
         graphRunId: planningGraphResult.graphRunId,
-        warnings: planningGraphResult.warnings
+        warnings: deterministicFallback
+          ? [
+              ...(planningGraphResult.warnings ?? []),
+              planningError
+                ? `Deterministic fallback activated: ${planningError}`
+                : "Deterministic fallback activated because LLM key was unavailable."
+            ]
+          : planningGraphResult.warnings,
+        ...(deterministicFallback && qualityIssues.length > 0
+          ? { qualityIssues }
+          : {})
       }
     });
   } catch (error) {

@@ -101,6 +101,9 @@ interface MemoryConsoleProps {
     accentSoft: string;
     border: string;
   };
+  dateFilter?: string | null;
+  flowIdFilter?: string[] | null;
+  stringFilterLabel?: string | null;
 }
 
 interface AuditModalState {
@@ -116,7 +119,36 @@ function flowStatusStyle(status: FlowStatus) {
   return "border-white/20 bg-white/5 text-slate-300";
 }
 
-export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
+function toConsoleDateKey(value: string | number | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function matchesDateFilter(dateFilter: string | null, ...values: Array<string | number | Date | null | undefined>) {
+  if (!dateFilter) {
+    return true;
+  }
+  return values.some((value) => {
+    if (!value) {
+      return false;
+    }
+    return toConsoleDateKey(value) === dateFilter;
+  });
+}
+
+export function MemoryConsole({
+  orgId,
+  themeStyle,
+  dateFilter = null,
+  flowIdFilter = null,
+  stringFilterLabel = null
+}: MemoryConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -223,6 +255,50 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
     return () => clearInterval(interval);
   }, [loadLedger]);
 
+  const filteredMachineStream = useMemo(() => {
+    if (!dateFilter) {
+      return machineStream;
+    }
+    return machineStream.filter((event) => toConsoleDateKey(event.timestamp) === dateFilter);
+  }, [dateFilter, machineStream]);
+  const filteredCarbonStream = useMemo(() => {
+    if (!dateFilter) {
+      return carbonStream;
+    }
+    return carbonStream.filter((event) => toConsoleDateKey(event.timestamp) === dateFilter);
+  }, [carbonStream, dateFilter]);
+  const filteredArchivedFlows = useMemo(() => {
+    const normalizedFlowIds = new Set(
+      (flowIdFilter ?? []).map((item) => item.trim()).filter(Boolean)
+    );
+    return archivedFlows.filter((flow) => {
+      if (!matchesDateFilter(dateFilter, flow.createdAt, flow.updatedAt)) {
+        return false;
+      }
+      if (normalizedFlowIds.size > 0 && !normalizedFlowIds.has(flow.id)) {
+        return false;
+      }
+      return true;
+    });
+  }, [archivedFlows, dateFilter, flowIdFilter]);
+  const visibleMetrics = useMemo(() => {
+    if (!dateFilter) {
+      return metrics;
+    }
+    const combined = [...filteredMachineStream, ...filteredCarbonStream];
+    return {
+      machineEvents: filteredMachineStream.length,
+      carbonEvents: filteredCarbonStream.length,
+      hotSwapEvents: combined.filter((event) =>
+        /hot(?:\s|-|_)?swap/i.test(`${event.type} ${event.message}`)
+      ).length,
+      amnesiaWipes: combined.filter((event) =>
+        /amnesia|wipe/i.test(`${event.type} ${event.message}`)
+      ).length,
+      complianceHashes: combined.filter((event) => Boolean(event.complianceHash)).length
+    };
+  }, [dateFilter, filteredCarbonStream, filteredMachineStream, metrics]);
+
   const openAuditModal = useCallback(
     async (flowId: string) => {
       setAuditLoadingId(flowId);
@@ -291,10 +367,24 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
       complianceHash: null as string | null
     }));
 
-    return [...logEvents, ...complianceEvents, ...taskEvents].sort(
+    const combined = [...logEvents, ...complianceEvents, ...taskEvents].sort(
       (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
     );
-  }, [auditModal]);
+    if (!dateFilter) {
+      return combined;
+    }
+    return combined.filter((entry) => toConsoleDateKey(entry.timestamp) === dateFilter);
+  }, [auditModal, dateFilter]);
+
+  useEffect(() => {
+    if (!auditModal) {
+      return;
+    }
+    if (filteredArchivedFlows.some((flow) => flow.id === auditModal.flow.id)) {
+      return;
+    }
+    setAuditModal(null);
+  }, [auditModal, filteredArchivedFlows]);
 
   return (
     <div className="mx-auto max-w-[1280px] space-y-6">
@@ -304,6 +394,14 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             System Ledger + Archived Missions
           </p>
+          {dateFilter ? (
+            <p className="mt-2 text-[11px] text-cyan-300">
+              Filtered to {new Date(`${dateFilter}T00:00:00`).toLocaleDateString()}
+            </p>
+          ) : null}
+          {stringFilterLabel ? (
+            <p className="mt-1 text-[11px] text-emerald-300">String: {stringFilterLabel}</p>
+          ) : null}
         </div>
         <button
           onClick={() => void loadLedger(true)}
@@ -321,13 +419,13 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
       )}
 
       <div className="grid gap-4 md:grid-cols-5">
-        <MetricCard label="Machine Stream" value={String(metrics.machineEvents)} icon={Bot} />
-        <MetricCard label="Carbon Stream" value={String(metrics.carbonEvents)} icon={UserCircle2} />
-        <MetricCard label="Hot-Swap Events" value={String(metrics.hotSwapEvents)} icon={ArrowUpRight} />
-        <MetricCard label="Amnesia Wipes" value={String(metrics.amnesiaWipes)} icon={Archive} />
+        <MetricCard label="Machine Stream" value={String(visibleMetrics.machineEvents)} icon={Bot} />
+        <MetricCard label="Carbon Stream" value={String(visibleMetrics.carbonEvents)} icon={UserCircle2} />
+        <MetricCard label="Hot-Swap Events" value={String(visibleMetrics.hotSwapEvents)} icon={ArrowUpRight} />
+        <MetricCard label="Amnesia Wipes" value={String(visibleMetrics.amnesiaWipes)} icon={Archive} />
         <MetricCard
           label="Compliance Hashes"
-          value={String(metrics.complianceHashes)}
+          value={String(visibleMetrics.complianceHashes)}
           icon={Fingerprint}
         />
       </div>
@@ -336,14 +434,14 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
         <StreamPanel
           title="Machine Stream"
           subtitle="Autonomous runtime events"
-          events={machineStream}
+          events={filteredMachineStream}
           loading={loading}
           themeStyle={themeStyle}
         />
         <StreamPanel
           title="Carbon Stream"
           subtitle="Human interventions and approvals"
-          events={carbonStream}
+          events={filteredCarbonStream}
           loading={loading}
           themeStyle={themeStyle}
         />
@@ -360,7 +458,7 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
             </p>
           </div>
           <span className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}>
-            {archivedFlows.length}
+            {filteredArchivedFlows.length}
           </span>
         </div>
 
@@ -369,13 +467,17 @@ export function MemoryConsole({ orgId, themeStyle }: MemoryConsoleProps) {
             <Loader2 size={14} className="animate-spin" />
             Loading archives...
           </div>
-        ) : archivedFlows.length === 0 ? (
+        ) : filteredArchivedFlows.length === 0 ? (
           <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs uppercase tracking-[0.16em] text-slate-500">
-            No archived workflows found.
+            {flowIdFilter?.length
+              ? "No archived workflows linked to the selected string."
+              : dateFilter
+                ? "No archived workflows found for this date."
+                : "No archived workflows found."}
           </p>
         ) : (
           <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
-            {archivedFlows.map((flow) => (
+            {filteredArchivedFlows.map((flow) => (
               <div key={flow.id} className="rounded-2xl border border-white/10 bg-black/30 p-3">
                 <p className="line-clamp-2 text-sm text-slate-100">{flow.prompt}</p>
                 <div className="mt-2 flex flex-wrap items-center gap-2">

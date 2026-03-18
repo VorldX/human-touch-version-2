@@ -1,6 +1,7 @@
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
+import { OrgRole } from "@prisma/client";
 
 import { prisma } from "@/lib/db/prisma";
 import { hasValidInternalApiKey } from "@/lib/security/internal-api";
@@ -10,6 +11,8 @@ export interface OrgActor {
   email: string;
   orgId: string;
   isInternal?: boolean;
+  role?: OrgRole | "INTERNAL";
+  isAdmin?: boolean;
 }
 
 export async function requireOrgAccess(input: {
@@ -55,7 +58,9 @@ export async function requireOrgAccess(input: {
         userId: "internal-system",
         email: "internal@vorldx.local",
         orgId,
-        isInternal: true
+        isInternal: true,
+        role: "INTERNAL",
+        isAdmin: true
       } satisfies OrgActor
     };
   }
@@ -86,7 +91,7 @@ export async function requireOrgAccess(input: {
       email: true,
       orgMemberships: {
         where: { orgId },
-        select: { orgId: true },
+        select: { orgId: true, role: true },
         take: 1
       }
     }
@@ -105,12 +110,17 @@ export async function requireOrgAccess(input: {
     };
   }
 
+  const role = user.orgMemberships[0]?.role ?? OrgRole.EMPLOYEE;
+  const adminRoles: OrgRole[] = [OrgRole.FOUNDER, OrgRole.ADMIN];
+
   return {
     ok: true as const,
     actor: {
       userId: user.id,
       email: user.email,
-      orgId
+      orgId,
+      role,
+      isAdmin: adminRoles.includes(role)
     } satisfies OrgActor
   };
 }

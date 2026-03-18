@@ -8,10 +8,12 @@ import { toPgVectorLiteral } from "@/lib/ai/embeddings";
 import { agentMemoryConfig } from "@/lib/agent/memory/config";
 import { defaultMemoryEmbedder } from "@/lib/agent/memory/embeddings";
 import {
-  blendRankingScores,
+  calculateExponentialTimeDecay,
   calculateRecencyScore,
+  calculateTimeWeightedHybridScore,
   dedupeMemoryResults
 } from "@/lib/agent/memory/ranking";
+import { rerankMemoryResults } from "@/lib/agent/memory/reranker";
 import {
   summarizeMemoryContent,
   toPersistableMemory
@@ -387,6 +389,14 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
     }
 
     const limit = Math.max(1, topK ?? agentMemoryConfig.retrieval.defaultTopK);
+    const requestedTopK = Math.max(
+      limit,
+      agentMemoryConfig.retrieval.crossEncoderCandidatePool
+    );
+    const rerankTopK = Math.max(
+      1,
+      Math.min(limit, agentMemoryConfig.retrieval.crossEncoderTopK)
+    );
     const queryEmbedding = await this.embedder.embed(normalizedQuery);
 
     let vectorCandidates = [] as Awaited<ReturnType<MemoryVectorBackend["searchByVector"]>>;
@@ -394,7 +404,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
       vectorCandidates = await this.vectorBackend.searchByVector({
         queryEmbedding: queryEmbedding.embedding,
         filters,
-        topK: limit
+        topK: requestedTopK
       });
     } catch (error) {
       if (isAgentMemoryTableMissingError(error)) {
@@ -419,7 +429,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
               : {})
           },
           orderBy: [{ timestamp: "desc" }, { updatedAt: "desc" }],
-          take: Math.max(limit * 3, 8),
+          take: Math.max(requestedTopK * 3, 8),
           select: memorySelect
         });
 
@@ -439,32 +449,60 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
     const ranked = vectorCandidates
       .map((candidate) => {
         const similarity = clamp(1 - clamp(candidate.distance, 0, 1), 0, 1);
+        const timeDecayScore = calculateExponentialTimeDecay({
+          timestamp: candidate.memory.timestamp,
+          lambdaPerHour: agentMemoryConfig.retrieval.timeWeighted.lambdaPerHour
+        });
+        const hybridScore = calculateTimeWeightedHybridScore({
+          semanticSimilarity: similarity,
+          timeDecayScore,
+          alpha: agentMemoryConfig.retrieval.timeWeighted.alpha,
+          beta: agentMemoryConfig.retrieval.timeWeighted.beta
+        });
         const recencyScore = calculateRecencyScore({
           timestamp: candidate.memory.timestamp,
           recency: candidate.memory.recency,
           halfLifeHours: agentMemoryConfig.retrieval.recencyHalfLifeHours
         });
         const importanceScore = clamp(candidate.memory.importance, 0, 1);
-        const score = blendRankingScores({
-          similarity,
-          recency: recencyScore,
-          importance: importanceScore,
-          weights: agentMemoryConfig.retrieval.rankingWeights
-        });
+        const score = Number(
+          clamp(hybridScore * 0.85 + importanceScore * 0.1 + recencyScore * 0.05).toFixed(6)
+        );
 
         return {
           memory: candidate.memory,
           similarity,
           recencyScore,
           importanceScore,
+          timeDecayScore,
+          hybridScore,
           score
         } satisfies AgentMemorySearchResult;
       })
       .filter((item) => item.similarity >= agentMemoryConfig.retrieval.minSimilarity)
-      .sort((left, right) => right.score - left.score);
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        if (right.hybridScore !== left.hybridScore) {
+          return right.hybridScore - left.hybridScore;
+        }
+        return right.importanceScore - left.importanceScore;
+      });
 
     const deduped = dedupeMemoryResults(ranked, agentMemoryConfig.retrieval.dedupeThreshold);
-    return deduped.slice(0, limit);
+    const candidatePool = deduped.slice(0, requestedTopK);
+    const reranked = await rerankMemoryResults({
+      query: normalizedQuery,
+      candidates: candidatePool,
+      topK: rerankTopK
+    });
+
+    if (reranked.length === 0) {
+      return candidatePool.slice(0, rerankTopK);
+    }
+
+    return reranked;
   }
 
   async getRecentMemory(
@@ -545,6 +583,51 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         return null;
       }
       throw error;
+    }
+
+    const gcThreshold = agentMemoryConfig.retrieval.timeWeighted.gcThreshold;
+    const lowScoreMemoryIds = rows
+      .map((row) => {
+        const similarityProxy = clamp(row.importance, 0, 1);
+        const timeDecayScore = calculateExponentialTimeDecay({
+          timestamp: row.timestamp,
+          lambdaPerHour: agentMemoryConfig.retrieval.timeWeighted.lambdaPerHour
+        });
+        const hybrid = calculateTimeWeightedHybridScore({
+          semanticSimilarity: similarityProxy,
+          timeDecayScore,
+          alpha: agentMemoryConfig.retrieval.timeWeighted.alpha,
+          beta: agentMemoryConfig.retrieval.timeWeighted.beta
+        });
+        return {
+          id: row.id,
+          hybrid
+        };
+      })
+      .filter((item) => item.hybrid < gcThreshold)
+      .map((item) => item.id);
+
+    if (lowScoreMemoryIds.length > 0) {
+      try {
+        await prisma.agentMemory.updateMany({
+          where: {
+            id: { in: lowScoreMemoryIds },
+            orgId: scope.orgId,
+            archivedAt: null
+          },
+          data: {
+            archivedAt: new Date()
+          }
+        });
+
+        rows = rows.filter((row) => !lowScoreMemoryIds.includes(row.id));
+      } catch (error) {
+        if (isAgentMemoryTableMissingError(error)) {
+          markAgentMemoryTableMissing();
+          return null;
+        }
+        throw error;
+      }
     }
 
     if (rows.length < Math.max(2, agentMemoryConfig.summarization.triggerCount)) {

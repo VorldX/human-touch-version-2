@@ -30,6 +30,7 @@ interface FlowListItem {
   progress: number;
   predictedBurn: number;
   humanTouchRequired: boolean;
+  createdAt?: string;
   updatedAt: string;
   taskCounts: { total: number; paused: number };
 }
@@ -79,6 +80,9 @@ interface WorkflowConsoleProps {
     accentSoft: string;
     border: string;
   };
+  dateFilter?: string | null;
+  flowIdFilter?: string[] | null;
+  stringFilterLabel?: string | null;
   onTaskNeedsInput?: (input: {
     taskId: string;
     flowId: string | null;
@@ -294,6 +298,29 @@ function resolveHumanInputReason(task: FlowTask) {
   return "This task requires additional human input before resume.";
 }
 
+function toConsoleDateKey(value: string | number | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function matchesDateFilter(dateFilter: string | null, ...values: Array<string | number | Date | null | undefined>) {
+  if (!dateFilter) {
+    return true;
+  }
+  return values.some((value) => {
+    if (!value) {
+      return false;
+    }
+    return toConsoleDateKey(value) === dateFilter;
+  });
+}
+
 function buildAutopsy(task?: FlowTask | null) {
   if (!task) return { nodes: [] as Node[], edges: [] as Edge[] };
   const runtime = parseAgentRuntime(task.executionTrace);
@@ -362,7 +389,14 @@ function buildAutopsy(task?: FlowTask | null) {
   return { nodes, edges };
 }
 
-export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: WorkflowConsoleProps) {
+export function WorkflowConsole({
+  orgId,
+  themeStyle,
+  dateFilter = null,
+  flowIdFilter = null,
+  stringFilterLabel = null,
+  onTaskNeedsInput
+}: WorkflowConsoleProps) {
   const notify = useVorldXStore((s) => s.pushNotification);
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const surfacedInputTasksRef = useRef<Set<string>>(new Set());
@@ -449,6 +483,33 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
     const interval = setInterval(() => void loadDetail(flowId, true), 7000);
     return () => clearInterval(interval);
   }, [flowId, loadDetail]);
+
+  const visibleFlows = useMemo(() => {
+    const normalizedFlowIds = new Set(
+      (flowIdFilter ?? []).map((item) => item.trim()).filter(Boolean)
+    );
+    return flows.filter((flow) => {
+      if (!matchesDateFilter(dateFilter, flow.createdAt, flow.updatedAt)) {
+        return false;
+      }
+      if (normalizedFlowIds.size > 0 && !normalizedFlowIds.has(flow.id)) {
+        return false;
+      }
+      return true;
+    });
+  }, [dateFilter, flowIdFilter, flows]);
+
+  useEffect(() => {
+    if (!flowId) {
+      return;
+    }
+    if (visibleFlows.some((flow) => flow.id === flowId)) {
+      return;
+    }
+    setFlowId(null);
+    setDetail(null);
+    setLogs([]);
+  }, [flowId, visibleFlows]);
 
   useEffect(() => {
     if (!detail) {
@@ -596,7 +657,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
     const active: FlowListItem[] = [];
     const completed: FlowListItem[] = [];
     const human: FlowListItem[] = [];
-    flows.forEach((flow) => {
+    visibleFlows.forEach((flow) => {
       if (flow.humanTouchRequired || flow.status === "PAUSED") human.push(flow);
       else if (flow.status === "ACTIVE") active.push(flow);
       else if (flow.status === "COMPLETED" || flow.status === "FAILED" || flow.status === "ABORTED")
@@ -609,7 +670,7 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
       { id: "completed", title: "Completed", flows: completed },
       { id: "human", title: "Human Intervention Required", flows: human }
     ];
-  }, [flows]);
+  }, [visibleFlows]);
 
   const selectedTask = detail?.tasks.find((t) => t.id === taskId) ?? detail?.tasks[0] ?? null;
   const autopsy = useMemo(() => buildAutopsy(selectedTask), [selectedTask]);
@@ -777,6 +838,14 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
         <div>
           <h2 className="font-display text-3xl font-black tracking-tight md:text-4xl">Workflow</h2>
           <p className="text-xs text-slate-500">Kanban + deep dive console</p>
+          {dateFilter ? (
+            <p className="mt-1 text-[11px] text-cyan-300">
+              Filtered to {new Date(`${dateFilter}T00:00:00`).toLocaleDateString()}
+            </p>
+          ) : null}
+          {stringFilterLabel ? (
+            <p className="mt-1 text-[11px] text-emerald-300">String: {stringFilterLabel}</p>
+          ) : null}
         </div>
         <button
           onClick={() => void loadFlows()}
@@ -804,7 +873,13 @@ export function WorkflowConsole({ orgId, themeStyle, onTaskNeedsInput }: Workflo
                   <Loader2 size={14} className="animate-spin" /> Loading...
                 </div>
               ) : lane.flows.length === 0 ? (
-                <p className="text-xs text-slate-500">Empty lane</p>
+                <p className="text-xs text-slate-500">
+                  {flowIdFilter?.length
+                    ? "No workflows linked to the selected string."
+                    : dateFilter
+                      ? "No workflows for selected date."
+                      : "Empty lane"}
+                </p>
               ) : (
                 lane.flows.map((flow) => (
                   <button

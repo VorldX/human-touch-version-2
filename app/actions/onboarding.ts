@@ -15,6 +15,7 @@ import {
 import { cookies } from "next/headers";
 
 import { prisma } from "@/lib/db/prisma";
+import { bootstrapOrganizationDnaContext } from "@/lib/dna/bootstrap";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
 import { hashSovereignIdentity } from "@/lib/security/identity";
 import { encryptAccessToken, encryptBrainKey } from "@/lib/security/crypto";
@@ -303,6 +304,10 @@ export async function completeOnboardingAction(
       await ensureCompanyDataFile(org.id, { db: tx });
 
       return org;
+    });
+
+    await bootstrapOrganizationDnaContext(createdOrg.id).catch((error) => {
+      console.error("[onboarding] DNA bootstrap failed", error);
     });
 
     return {

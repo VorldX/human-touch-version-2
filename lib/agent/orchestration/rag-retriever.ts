@@ -7,8 +7,23 @@ import {
   toPgVectorLiteral
 } from "@/lib/ai/embeddings";
 import { searchAgentMemory } from "@/lib/agent/memory";
+import { featureFlags } from "@/lib/config/feature-flags";
 import { prisma } from "@/lib/db/prisma";
+import { listPeripheralFallbackLogs } from "@/lib/dna/phase3/fallback";
 import { readLocalUploadByUrl, toPreviewText } from "@/lib/hub/storage";
+import { memoryService } from "@/lib/memory";
+
+export interface RetrievedMemoryEntry {
+  id: string;
+  key: string;
+  tier: string;
+  value: unknown;
+  score: number;
+  similarity?: number;
+  timeDecayScore?: number;
+  hybridScore?: number;
+  rerankScore?: number;
+}
 
 function tokenize(input: string) {
   return input
@@ -46,10 +61,44 @@ export async function retrieveRelevantMemoryEntries(input: {
   agentId?: string | null;
   userId?: string | null;
   limit: number;
-}) {
-  const semanticLimit = Math.max(1, input.limit);
+}): Promise<RetrievedMemoryEntry[]> {
+  if (featureFlags.useNewMemoryService && input.userId) {
+    const unified = await memoryService
+      .retrieveRelevant({
+        orgId: input.orgId,
+        userId: input.userId,
+        query: input.prompt,
+        topK: Math.max(1, input.limit),
+        includeStructured: true
+      })
+      .catch(() => []);
+
+    if (unified.length > 0) {
+      return unified.slice(0, Math.max(1, input.limit)).map((item) => ({
+        id: item.id,
+        key: item.source,
+        tier: "UNIFIED",
+        value: item.content,
+        score: item.score
+      }));
+    }
+  }
+
+  const semanticLimit = Math.max(3, input.limit);
+  const absoluteTopK = Math.max(1, Math.min(input.limit, 3));
+  let centralMemoryFailed = false;
+
+  const safeSearch = async (...args: Parameters<typeof searchAgentMemory>) => {
+    try {
+      return await searchAgentMemory(...args);
+    } catch {
+      centralMemoryFailed = true;
+      return [];
+    }
+  };
+
   const [agentScopedSemantic, flowSharedSemantic, hubSharedSemantic] = await Promise.all([
-    searchAgentMemory({
+    safeSearch({
       orgId: input.orgId,
       query: input.prompt,
       topK: semanticLimit,
@@ -61,8 +110,8 @@ export async function retrieveRelevantMemoryEntries(input: {
         includeShared: true,
         includePrivate: false
       }
-    }).catch(() => []),
-    searchAgentMemory({
+    }),
+    safeSearch({
       orgId: input.orgId,
       query: input.prompt,
       topK: Math.max(2, Math.ceil(semanticLimit / 2)),
@@ -73,8 +122,8 @@ export async function retrieveRelevantMemoryEntries(input: {
         includeShared: true,
         includePrivate: false
       }
-    }).catch(() => []),
-    searchAgentMemory({
+    }),
+    safeSearch({
       orgId: input.orgId,
       query: input.prompt,
       topK: Math.max(2, Math.ceil(semanticLimit / 2)),
@@ -83,7 +132,7 @@ export async function retrieveRelevantMemoryEntries(input: {
         includePrivate: false,
         sources: ["dna_chunk"]
       }
-    }).catch(() => [])
+    })
   ]);
 
   const semantic = [...agentScopedSemantic, ...flowSharedSemantic, ...hubSharedSemantic]
@@ -91,13 +140,7 @@ export async function retrieveRelevantMemoryEntries(input: {
     .filter((item, index, all) => all.findIndex((candidate) => candidate.memory.id === item.memory.id) === index)
     .slice(0, semanticLimit * 2);
 
-  const semanticRows: Array<{
-    id: string;
-    key: string;
-    tier: string;
-    value: unknown;
-    score: number;
-  }> = semantic.map((item) => ({
+  const semanticRows: RetrievedMemoryEntry[] = semantic.map((item) => ({
     id: item.memory.id,
     key: `${item.memory.memoryType.toLowerCase()}.${item.memory.source}`,
     tier: item.memory.memoryType,
@@ -109,11 +152,36 @@ export async function retrieveRelevantMemoryEntries(input: {
       timestamp: item.memory.timestamp.toISOString(),
       visibility: item.memory.visibility
     },
-    score: item.score
+    score: item.score,
+    similarity: item.similarity,
+    timeDecayScore: item.timeDecayScore,
+    hybridScore: item.hybridScore,
+    rerankScore: item.rerankScore
   }));
 
-  if (semanticRows.length >= input.limit) {
-    return semanticRows.slice(0, input.limit);
+  if (semanticRows.length >= absoluteTopK) {
+    return semanticRows.slice(0, absoluteTopK);
+  }
+
+  if (centralMemoryFailed) {
+    const fallbackLogs = await listPeripheralFallbackLogs({
+      orgId: input.orgId,
+      limit: 5
+    });
+
+    if (fallbackLogs.length > 0) {
+      const fallbackRows: RetrievedMemoryEntry[] = fallbackLogs.map((entry) => ({
+        ...entry,
+        similarity: undefined,
+        timeDecayScore: undefined,
+        hybridScore: undefined,
+        rerankScore: undefined
+      }));
+      const mergedFallback: RetrievedMemoryEntry[] = [...semanticRows, ...fallbackRows].filter(
+        (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index
+      );
+      return mergedFallback.slice(0, Math.max(5, absoluteTopK));
+    }
   }
 
   const rows = await prisma.memoryEntry.findMany({
@@ -152,13 +220,7 @@ export async function retrieveRelevantMemoryEntries(input: {
     .filter((row) => row.score > 0.08)
     .sort((a, b) => b.score - a.score);
 
-  const merged: Array<{
-    id: string;
-    key: string;
-    tier: string;
-    value: unknown;
-    score: number;
-  }> = [...semanticRows];
+  const merged: RetrievedMemoryEntry[] = [...semanticRows];
   for (const candidate of ranked) {
     if (merged.some((existing) => existing.id === candidate.id)) {
       continue;
@@ -170,12 +232,12 @@ export async function retrieveRelevantMemoryEntries(input: {
       value: candidate.value,
       score: candidate.score
     });
-    if (merged.length >= input.limit) {
+    if (merged.length >= absoluteTopK) {
       break;
     }
   }
 
-  return merged.slice(0, input.limit);
+  return merged.slice(0, absoluteTopK);
 }
 
 export async function retrieveRelevantDnaFiles(input: {

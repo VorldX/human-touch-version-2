@@ -46,6 +46,35 @@ export function calculateRecencyScore(input: {
   return clamp(decay * Math.min(1.2, recencyWeight), 0, 1);
 }
 
+export function calculateExponentialTimeDecay(input: {
+  timestamp: Date;
+  lambdaPerHour: number;
+  nowMs?: number;
+}) {
+  const nowMs = input.nowMs ?? Date.now();
+  const ageMs = Math.max(0, nowMs - input.timestamp.getTime());
+  const ageHours = ageMs / (1000 * 60 * 60);
+  const lambda = Math.max(0.0001, input.lambdaPerHour);
+  return clamp(Math.exp(-lambda * ageHours), 0, 1);
+}
+
+export function calculateTimeWeightedHybridScore(input: {
+  semanticSimilarity: number;
+  timeDecayScore: number;
+  alpha: number;
+  beta: number;
+}) {
+  const alpha = clamp(input.alpha, 0, 1);
+  const beta = clamp(input.beta, 0, 1);
+  const denom = alpha + beta;
+  const normalizedAlpha = denom > 0 ? alpha / denom : 0.5;
+  const normalizedBeta = denom > 0 ? beta / denom : 0.5;
+  const score =
+    normalizedAlpha * clamp(input.semanticSimilarity, 0, 1) +
+    normalizedBeta * clamp(input.timeDecayScore, 0, 1);
+  return Number(clamp(score, 0, 1).toFixed(6));
+}
+
 export function blendRankingScores(input: {
   similarity: number;
   recency: number;

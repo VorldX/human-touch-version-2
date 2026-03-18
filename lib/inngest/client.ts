@@ -1,6 +1,3 @@
-import { Inngest } from "inngest";
+import { inngest } from "@/src/inngest/client";
 
-export const inngest = new Inngest({
-  id: "human-touch",
-  name: "Human Touch"
-});
+export { inngest };

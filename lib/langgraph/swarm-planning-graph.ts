@@ -2,15 +2,14 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 
-import { retrieveRelevantDnaFiles } from "@/lib/agent/orchestration/rag-retriever";
 import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
-import { selectCompanyContext, type SelectedContextTrace } from "@/lib/ai/context-selector";
+import { type SelectedContextTrace } from "@/lib/ai/context-selector";
+import { buildOrganizationContextPack } from "@/lib/ai/organization-context-pack";
 import {
   executeSwarmAgent,
   type AgentExecutionInput,
   type AgentExecutionResult
 } from "@/lib/ai/swarm-runtime";
-import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
 import type { OrganizationGraphAdapters } from "@/lib/langgraph/adapters/contracts";
 
 interface PlanningHistoryEntry {
@@ -49,17 +48,6 @@ export interface SwarmPlanningGraphResult {
   billing: AgentExecutionResult["billing"] | null;
   warnings: string[];
   error?: string;
-}
-
-function compactText(value: string) {
-  return value.replace(/\s+/g, " ").trim();
-}
-
-function clampText(value: string, maxChars: number) {
-  if (value.length <= maxChars) {
-    return value;
-  }
-  return `${value.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
 function extractJsonObject(raw: string) {
@@ -142,47 +130,6 @@ function looksGenericFallback(raw: string) {
   );
 }
 
-function buildDnaContextSection(input: {
-  dnaPreviews: Array<{
-    id: string;
-    name: string;
-    preview: string;
-    score: number;
-  }>;
-  maxChars: number;
-}) {
-  if (input.dnaPreviews.length === 0) {
-    return "";
-  }
-  const section = input.dnaPreviews
-    .slice(0, 3)
-    .map(
-      (item, index) =>
-        `DNA ${index + 1}: ${item.name} (relevance=${item.score.toFixed(2)})\n${item.preview}`
-    )
-    .join("\n\n---\n\n");
-  return clampText(section, input.maxChars);
-}
-
-function safeParseCompanyIdentity(companyDataText: string) {
-  try {
-    const parsed = JSON.parse(companyDataText) as Record<string, unknown>;
-    const company = asRecord(parsed.company);
-    const name = typeof company.name === "string" ? company.name.trim() : "";
-    const description =
-      typeof company.description === "string" ? company.description.trim() : "";
-    return {
-      name,
-      description
-    };
-  } catch {
-    return {
-      name: "",
-      description: ""
-    };
-  }
-}
-
 function composePlanningPrompt(input: {
   direction: string;
   humanPlan: string;
@@ -254,27 +201,6 @@ function composePlanningPrompt(input: {
   ].join("\n");
 }
 
-function buildContextBlocks(input: { companyContext: string; dnaContext: string }) {
-  const blocks: AgentExecutionInput["contextBlocks"] = [];
-  if (input.companyContext.trim()) {
-    blocks.push({
-      id: "company-data",
-      name: "Company Data",
-      content: input.companyContext,
-      amnesiaProtected: false
-    });
-  }
-  if (input.dnaContext.trim()) {
-    blocks.push({
-      id: "dna-context",
-      name: "DNA Context",
-      content: input.dnaContext,
-      amnesiaProtected: false
-    });
-  }
-  return blocks;
-}
-
 function resolveRetryTokens(value: number) {
   const proposed = Math.floor(value * 1.55);
   return Math.max(value + 180, Math.min(1400, proposed));
@@ -321,58 +247,29 @@ export class SwarmPlanningGraph {
         "\n"
       );
 
-      const companyData = await this.stage({
+      const contextPack = await this.stage({
         orgId: input.orgId,
         graphRunId,
         traceId,
-        stage: "load_org_context",
-        run: async () => ensureCompanyDataFile(input.orgId)
-      });
-
-      const selected = await this.stage({
-        orgId: input.orgId,
-        graphRunId,
-        traceId,
-        stage: "select_company_context",
+        stage: "build_context_pack",
         run: async () =>
-          selectCompanyContext({
+          buildOrganizationContextPack({
+            orgId: input.orgId,
             mode: "direction-plan",
-            companyDataText: companyData.content,
             primaryText,
             history: input.history,
-            maxSelectedChars: input.maxSelectedContextChars,
-            maxChunkChars: input.maxContextChunkChars
+            maxSelectedContextChars: input.maxSelectedContextChars,
+            maxContextChunkChars: input.maxContextChunkChars,
+            dnaFileLimit: 3,
+            dnaProfileMaxChars: 620,
+            dnaFileMaxChars: 1280
           })
       });
 
-      let companyContext = selected.contextText;
-      const contextSelection = selected.trace;
-      if (!companyContext) {
-        companyContext = companyData.content.slice(0, input.maxSelectedContextChars);
-      }
-
-      const dnaPreviews = await this.stage({
-        orgId: input.orgId,
-        graphRunId,
-        traceId,
-        stage: "retrieve_dna_context",
-        run: async () =>
-          retrieveRelevantDnaFiles({
-            orgId: input.orgId,
-            prompt: primaryText,
-            limit: 3
-          }).catch(() => [])
-      });
-
-      const dnaContext = buildDnaContextSection({
-        dnaPreviews,
-        maxChars: 1400
-      });
-
-      const orgIdentity = safeParseCompanyIdentity(companyData.content);
-      const orgIdentityDescription = compactText(
-        [orgIdentity.name, orgIdentity.description].filter(Boolean).join(" | ")
-      );
+      const companyContext = contextPack.companyContext;
+      const dnaContext = contextPack.dnaContext;
+      const contextSelection = contextPack.contextSelection;
+      const orgIdentityDescription = contextPack.orgIdentityDescription;
 
       const runPlanner = async (retryMode: boolean, maxOutputTokens: number) => {
         const userPrompt = composePlanningPrompt({
@@ -392,10 +289,7 @@ export class SwarmPlanningGraph {
           flowId: "direction-plan",
           prompt: input.direction,
           agent: input.mainAgent,
-          contextBlocks: buildContextBlocks({
-            companyContext,
-            dnaContext
-          }),
+          contextBlocks: contextPack.contextBlocks,
           organizationRuntime: input.organizationRuntime,
           ...(input.provider || input.model
             ? {
@@ -409,7 +303,7 @@ export class SwarmPlanningGraph {
             buildOrganizationMainAgentPrompt({
               orgName: input.orgName,
               mode: "planning",
-              contextAvailable: Boolean(companyContext || dnaContext)
+              contextAvailable: contextPack.contextBlocks.length > 0
             }),
             "",
             "You are running inside LangGraph planning orchestration stage.",

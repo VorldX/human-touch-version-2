@@ -4,7 +4,8 @@ import { randomInt, randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 
-import { selectCompanyContext } from "@/lib/ai/context-selector";
+import type { SelectedContextTrace } from "@/lib/ai/context-selector";
+import { buildOrganizationContextPack } from "@/lib/ai/organization-context-pack";
 import { executeSwarmAgent } from "@/lib/ai/swarm-runtime";
 import { getOrgLlmRuntime } from "@/lib/ai/org-llm-settings";
 import { buildOrganizationMainAgentPrompt } from "@/lib/agent/prompts/organizationMain";
@@ -23,13 +24,13 @@ import {
   fillDraftDetails,
   type ActiveDraft
 } from "@/lib/agent/run/email-request-parser";
-import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
 import { maybeRunSwarmOrganizationGraph } from "@/lib/langgraph/swarm-organization-entry";
 import { isOrganizationGraphEnabledForActor } from "@/lib/langgraph/utils/feature-gating";
 import {
   composioAllowlistedToolkits,
   isConnectedIntegrationStatus
 } from "@/lib/integrations/composio/service";
+import { registerSessionActivity } from "@/lib/dna/phase2";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
 interface DirectionMessageInput {
@@ -653,6 +654,18 @@ function statusFromExecutionError(message: string) {
   return code;
 }
 
+function isLlmCredentialFailure(message: string) {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("primary brain key is missing or invalid") ||
+    normalized.includes("brain key is missing or invalid") ||
+    normalized.includes("agent api key is not configured") ||
+    (normalized.includes("api key") && normalized.includes("not configured")) ||
+    normalized.includes("invalid api key") ||
+    normalized.includes("unauthorized")
+  );
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json().catch(() => null)) as
@@ -685,6 +698,14 @@ export async function POST(request: NextRequest) {
     if (!access.ok) {
       return access.response;
     }
+    const directionSessionId = `direction-chat:${orgId}:${access.actor.userId}`;
+    void registerSessionActivity({
+      tenantId: orgId,
+      userId: access.actor.userId,
+      sessionId: directionSessionId
+    }).catch((error) => {
+      console.warn("[direction-chat] phase2 session activity tracking failed", error);
+    });
 
     const org = await prisma.organization.findUnique({
       where: { id: orgId },
@@ -758,7 +779,7 @@ export async function POST(request: NextRequest) {
     const organizationGraphResult = await maybeRunSwarmOrganizationGraph({
       orgId,
       userId: access.actor.userId,
-      sessionId: `direction-chat:${orgId}:${access.actor.userId}`,
+      sessionId: directionSessionId,
       userRequest: message
     });
     if (organizationGraphResult.handled) {
@@ -1113,25 +1134,32 @@ export async function POST(request: NextRequest) {
       }));
 
     let companyContext = "";
-    let contextSelection: ReturnType<typeof selectCompanyContext>["trace"] | null = null;
+    let dnaContext = "";
+    let contextSelection: SelectedContextTrace | null = null;
+    let contextBlocks: Array<{
+      id: string;
+      name: string;
+      content: string;
+      amnesiaProtected: boolean;
+    }> = [];
     try {
-      const companyData = await ensureCompanyDataFile(orgId);
-      const selected = selectCompanyContext({
+      const contextPack = await buildOrganizationContextPack({
+        orgId,
         mode: "direction-chat",
-        companyDataText: companyData.content,
         primaryText: [message, ...history.map((entry) => entry.content)].join("\n"),
         history,
-        maxSelectedChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
-        maxChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS
+        maxSelectedContextChars: MAX_PROMPT_COMPANY_CONTEXT_CHARS,
+        maxContextChunkChars: MAX_CONTEXT_SELECTOR_CHUNK_CHARS
       });
-      companyContext = selected.contextText;
-      contextSelection = selected.trace;
-      if (!companyContext) {
-        companyContext = companyData.content.slice(0, MAX_PROMPT_COMPANY_CONTEXT_CHARS);
-      }
+      companyContext = contextPack.companyContext;
+      dnaContext = contextPack.dnaContext;
+      contextSelection = contextPack.contextSelection;
+      contextBlocks = contextPack.contextBlocks;
     } catch {
       companyContext = "";
+      dnaContext = "";
       contextSelection = null;
+      contextBlocks = [];
     }
 
     const preIntentRouting = inferIntentRouting({
@@ -1148,6 +1176,7 @@ export async function POST(request: NextRequest) {
       `Owner: ${message}`,
       "",
       companyContext ? `Company context excerpt:\n${companyContext}` : "Company context: unavailable.",
+      dnaContext ? `DNA context excerpt:\n${dnaContext}` : "DNA context: unavailable.",
       "",
       preIntentRouting.route === "PLAN_REQUIRED"
         ? "Reply concisely and end with a `Direction:` section with executable wording."
@@ -1175,16 +1204,7 @@ export async function POST(request: NextRequest) {
           fallbackBrainKeyAuthTag: null,
           fallbackBrainKeyKeyVer: null
         },
-      contextBlocks: companyContext
-        ? [
-            {
-              id: "company-data",
-              name: "Company Data",
-              content: companyContext,
-              amnesiaProtected: false
-            }
-          ]
-        : [],
+      contextBlocks,
       organizationRuntime,
       ...(provider || model
         ? {
@@ -1197,7 +1217,7 @@ export async function POST(request: NextRequest) {
       systemPromptOverride: buildOrganizationMainAgentPrompt({
         orgName: org.name,
         mode: "chat",
-        contextAvailable: Boolean(companyContext),
+        contextAvailable: contextBlocks.length > 0,
         includeDirectionSection: preIntentRouting.route === "PLAN_REQUIRED"
       }),
       userPromptOverride: userPrompt,
@@ -1205,13 +1225,44 @@ export async function POST(request: NextRequest) {
     });
 
     if (!execution.ok || !execution.outputText) {
-      const message = execution.error ?? "Direction chat failed.";
+      const failureMessage = execution.error ?? "Direction chat failed.";
+      if (isLlmCredentialFailure(failureMessage)) {
+        const deterministicReply =
+          preIntentRouting.route === "PLAN_REQUIRED"
+            ? [
+                "I understood your command and routed it to planning mode.",
+                "LLM credentials are unavailable, so this reply used deterministic routing.",
+                "If you want richer natural-language planning output, configure a valid model key in Settings > Identity/LLM."
+              ].join("\n")
+            : [
+                "I received your message, but LLM credentials are unavailable right now.",
+                "I can still run deterministic actions (tool calls, approvals, and plan routing).",
+                "Configure a valid model key in Settings > Identity/LLM for full conversational reasoning."
+              ].join("\n");
+
+        return NextResponse.json({
+          ok: true,
+          reply: deterministicReply,
+          directionCandidate:
+            preIntentRouting.route === "PLAN_REQUIRED" ? extractDirectionCandidate(message) : "",
+          intentRouting: preIntentRouting,
+          model: {
+            provider: null,
+            name: null,
+            source: "deterministic-fallback"
+          },
+          tokenUsage: null,
+          billing: null,
+          contextSelection
+        });
+      }
+
       return NextResponse.json(
         {
           ok: false,
-          message
+          message: failureMessage
         },
-        { status: statusFromExecutionError(message) }
+        { status: statusFromExecutionError(failureMessage) }
       );
     }
 

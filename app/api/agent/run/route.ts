@@ -19,6 +19,7 @@ import {
   type GmailPlannerOutput
 } from "@/lib/agent/prompts/gmailPlanner";
 import { prisma } from "@/lib/db/prisma";
+import { registerSessionActivity } from "@/lib/dna/phase2";
 
 type RunBody = {
   prompt?: string;
@@ -610,6 +611,14 @@ export async function POST(request: NextRequest) {
     const runId = loadedSession?.runId || requestedRunId || `run_${randomUUID().slice(0, 12)}`;
     const runTurn = (loadedSession?.turn ?? 0) + 1;
     const sessionDraft = loadedSession?.activeDraft ?? null;
+    const phase2SessionId = `agent-run:${actorResult.actor.orgId}:${actorResult.actor.userId}:${runId}`;
+    void registerSessionActivity({
+      tenantId: actorResult.actor.orgId,
+      userId: actorResult.actor.userId,
+      sessionId: phase2SessionId
+    }).catch((error) => {
+      console.warn("[agent-run] phase2 session activity tracking failed", error);
+    });
 
     const runGuardKey = `${actorResult.actor.orgId}:${actorResult.actor.userId}`;
     const guardResult = acquireActorRunGuard(runGuardKey);
