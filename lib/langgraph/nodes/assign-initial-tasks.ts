@@ -48,7 +48,7 @@ export function assignInitialTasksNode(state: SwarmOrganizationState): SwarmOrga
   const runId = state.durableRunId ?? `r_${state.graphRunId.replace(/^lg-run-/, "")}`;
   const objectives = splitRequestIntoObjectives(state.userRequest);
   const usedFallback = objectives.length === 0;
-  const pendingTasks = state.createdAgents.flatMap((agent, agentIndex) => {
+  const pendingTasks = state.createdAgents.flatMap((agent) => {
     const roleObjectives =
       objectives.length > 0
         ? objectives.map((objective, objectiveIndex) => ({

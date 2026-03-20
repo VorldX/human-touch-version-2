@@ -124,7 +124,6 @@ export async function processRlhfDiff(input: {
     throw new Error("Unable to persist RLHF diff event.");
   }
 
-  const memoryTier = resolvedAs === "AUTO_APPROVED" ? "LONG_TERM" : "STAGING";
   const documentId =
     resolvedAs === "AUTO_APPROVED"
       ? `rlhf.personal.rule.${input.userId}`

@@ -708,7 +708,7 @@ export function PlanConsole({
   }, []);
 
   return (
-    <div className="mx-auto max-w-[1500px] space-y-5">
+    <div className="mx-auto w-full max-w-[min(100%,1500px)] space-y-5 2xl:max-w-[min(95vw,1800px)] [@media(min-width:1920px)]:max-w-[min(94vw,2100px)]">
       <section className={`vx-panel relative overflow-hidden rounded-3xl p-5 ${themeStyle.border}`}>
         <div className="pointer-events-none absolute -top-24 right-0 h-52 w-52 rounded-full bg-cyan-500/15 blur-3xl" />
         <div className="pointer-events-none absolute -bottom-24 left-24 h-48 w-48 rounded-full bg-emerald-500/10 blur-3xl" />
@@ -753,8 +753,10 @@ export function PlanConsole({
         </div>
       )}
 
-      <div className="grid gap-4 2xl:grid-cols-[340px_minmax(0,1fr)]">
-        <aside className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+      <div className="grid gap-4 xl:items-start xl:grid-cols-[300px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)]">
+        <aside
+          className={`vx-panel flex min-h-0 flex-col space-y-3 rounded-3xl p-4 xl:sticky xl:top-3 xl:max-h-[calc(100dvh-11.5rem)] ${themeStyle.border}`}
+        >
           <div className="flex items-center justify-between">
             <p className="inline-flex items-center gap-2 text-sm font-semibold text-slate-200">
               <WorkflowIcon size={15} className="text-cyan-300" />
@@ -779,7 +781,7 @@ export function PlanConsole({
                   : "No plans created yet. Generate from Control to Direction mode."}
             </p>
           ) : (
-            <div className="space-y-2">
+            <div className="vx-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
               {visiblePlans.map((item) => {
                 const isSelected = selectedPlanId === item.id;
                 const insight = planInsightsById[item.id];

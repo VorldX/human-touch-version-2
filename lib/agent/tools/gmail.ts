@@ -22,13 +22,6 @@ function asText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function asRecord(value: unknown) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {};
-  }
-  return value as Record<string, unknown>;
-}
-
 function asObjectArray(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) return [];
   return value

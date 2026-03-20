@@ -10,7 +10,6 @@ import {
   MemoryTier,
   PersonnelStatus,
   PersonnelType,
-  TaskStatus,
   type Prisma
 } from "@prisma/client";
 
@@ -89,12 +88,6 @@ function normalizeDateIso(value?: string) {
 
 function normalizeTaskStateForStorage(state: PersistedTaskSchema["state"]) {
   return state;
-}
-
-function executionTraceTaskId(trace: unknown) {
-  const record = asRecord(trace);
-  const normalizedTask = asRecord(record.normalizedTask);
-  return typeof normalizedTask.task_id === "string" ? normalizedTask.task_id.trim() : "";
 }
 
 function parseTaskIdFromReceiptKey(input: { runId: string; key: string }) {
@@ -725,8 +718,6 @@ async function persistDurableTasks(input: {
   runId: string;
   tasks: PersistedTaskSchema[];
 }): Promise<DurableTaskSnapshot[]> {
-  const snapshots: DurableTaskSnapshot[] = [];
-
   for (const task of input.tasks) {
     const existing = await prisma.task.findFirst({
       where: {

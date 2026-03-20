@@ -171,7 +171,6 @@ const OPERATION_TAB_IDS = [
   "direction",
   "blueprint",
   "calendar",
-  "squad",
   "memory",
   "settings"
 ] as const;
@@ -237,7 +236,6 @@ const DIRECTION_MODELS = [
 
 const REQUESTS_POLL_INTERVAL_MS = 30000;
 const PIPELINE_POLICY_POLL_INTERVAL_MS = 30000;
-const MISSION_SCHEDULES_POLL_INTERVAL_MS = 45000;
 
 function initials(name: string) {
   return name
@@ -295,30 +293,6 @@ interface DirectionTurn {
   content: string;
   modelLabel?: string;
   meta?: AssistantMessageMeta;
-}
-
-type MissionCadence = "DAILY" | "WEEKLY" | "MONTHLY" | "CUSTOM";
-
-interface MissionSchedule {
-  id: string;
-  title: string;
-  direction: string;
-  cadence: MissionCadence;
-  nextRunAt: string;
-  timezone: string;
-  swarmDensity: number;
-  requiredSignatures: number;
-  predictedBurn: number;
-  enabled: boolean;
-  createdAt: string;
-  updatedAt: string;
-  lastRunAt?: string;
-}
-
-interface MissionScheduleDraft {
-  title: string;
-  cadence: MissionCadence;
-  nextRunAt: string;
 }
 
 type SetupPanel = "closed" | "chooser" | "onboarding" | "request-access";
@@ -883,27 +857,6 @@ interface OrchestrationPipelineEffectivePolicy {
   enabledRuleTypes: string[];
 }
 
-function toDatetimeLocalValue(iso: string) {
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) {
-    return "";
-  }
-  const year = parsed.getFullYear();
-  const month = String(parsed.getMonth() + 1).padStart(2, "0");
-  const day = String(parsed.getDate()).padStart(2, "0");
-  const hours = String(parsed.getHours()).padStart(2, "0");
-  const minutes = String(parsed.getMinutes()).padStart(2, "0");
-  return `${year}-${month}-${day}T${hours}:${minutes}`;
-}
-
-function toIsoFromDatetimeLocal(value: string) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return new Date().toISOString();
-  }
-  return parsed.toISOString();
-}
-
 function isGmailDirectionPrompt(value: string) {
   const prompt = value.toLowerCase();
   const hasEmailDomain = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/.test(prompt);
@@ -1285,18 +1238,7 @@ export function VorldXShell() {
   const [directionModelId, setDirectionModelId] =
     useState<(typeof DIRECTION_MODELS)[number]["id"]>("gemini:gemini-2.5-flash");
   const [directionChatInFlight, setDirectionChatInFlight] = useState(false);
-  const [missionSchedules, setMissionSchedules] = useState<MissionSchedule[]>([]);
-  const [schedulesLoading, setSchedulesLoading] = useState(false);
-  const [schedulesRefreshing, setSchedulesRefreshing] = useState(false);
-  const [scheduleActionInFlight, setScheduleActionInFlight] = useState(false);
-  const [scheduleRunInFlightId, setScheduleRunInFlightId] = useState<string | null>(null);
-  const [scheduleTickInFlight, setScheduleTickInFlight] = useState(false);
-  const [scheduleDraft, setScheduleDraft] = useState<MissionScheduleDraft>(() => ({
-    title: "",
-    cadence: "DAILY",
-    nextRunAt: toDatetimeLocalValue(new Date().toISOString())
-  }));
-  const [swarmDensity, setSwarmDensity] = useState(24);
+  const swarmDensity = 24;
   const [setupPanel, setSetupPanel] = useState<SetupPanel>("closed");
   const [joinOrgIdentifier, setJoinOrgIdentifier] = useState("");
   const [joinRequestRole, setJoinRequestRole] = useState<"EMPLOYEE" | "ADMIN">("EMPLOYEE");
@@ -1333,7 +1275,6 @@ export function VorldXShell() {
   const [signatureApprovals, setSignatureApprovals] = useState(1);
   const [isRecordingIntent, setIsRecordingIntent] = useState(false);
   const [launchInFlight, setLaunchInFlight] = useState(false);
-  const [killSwitchInFlight, setKillSwitchInFlight] = useState(false);
   const [signOutInFlight, setSignOutInFlight] = useState(false);
   const [pendingChatPlanRoute, setPendingChatPlanRoute] = useState<PendingChatPlanRoute | null>(
     null
@@ -1371,7 +1312,6 @@ export function VorldXShell() {
   const approvalCheckpointsFetchSeqRef = useRef(0);
   const approvalCheckpointsInFlightRef = useRef(false);
   const pipelinePolicyInFlightRef = useRef(false);
-  const missionSchedulesInFlightRef = useRef(false);
   const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
   const workflowSnapshotTimersRef = useRef<Map<string, number>>(new Map());
   const workflowEventThrottleRef = useRef<Map<string, number>>(new Map());
@@ -1586,6 +1526,11 @@ export function VorldXShell() {
       }
 
       if (tab === "control") {
+        setWorkspaceMode("COMPASS");
+        return;
+      }
+
+      if (tab === "squad") {
         setWorkspaceMode("COMPASS");
         return;
       }
@@ -2110,7 +2055,6 @@ export function VorldXShell() {
     approvalCheckpointsFetchSeqRef.current += 1;
     approvalCheckpointsInFlightRef.current = false;
     pipelinePolicyInFlightRef.current = false;
-    missionSchedulesInFlightRef.current = false;
     setDirectionTurns([]);
     setDirectionPrompt("");
     setIntent("");
@@ -2135,12 +2079,6 @@ export function VorldXShell() {
     setApprovalCheckpointActionId(null);
     setClearPermissionRequestsInFlight(false);
     setControlScopedFlowIds([]);
-    setMissionSchedules([]);
-    setScheduleDraft({
-      title: "",
-      cadence: "DAILY",
-      nextRunAt: toDatetimeLocalValue(new Date().toISOString())
-    });
     setAgentRunResult(null);
     setAgentRunId("");
     setAgentRunInputValues({});
@@ -3308,70 +3246,6 @@ export function VorldXShell() {
     [handleOperationTabChange, handleTabChange, operationsTab]
   );
 
-  const loadMissionSchedules = useCallback(
-    async (silent?: boolean, force?: boolean) => {
-      if (!resolvedOrg?.id) {
-        return;
-      }
-      if (!force && missionSchedulesInFlightRef.current) {
-        return;
-      }
-      missionSchedulesInFlightRef.current = true;
-      if (silent) {
-        setSchedulesRefreshing(true);
-      } else {
-        setSchedulesLoading(true);
-      }
-
-      try {
-        const response = await fetch(
-          `/api/schedules/missions?orgId=${encodeURIComponent(resolvedOrg.id)}`,
-          { cache: "no-store" }
-        );
-        const { payload, rawText } = await parseJsonBody<{
-          ok?: boolean;
-          message?: string;
-          schedules?: MissionSchedule[];
-        }>(response);
-
-        if (!response.ok || !payload?.ok) {
-          throw new Error(
-            payload?.message ??
-              (rawText
-                ? `Failed loading mission schedules (${response.status}): ${rawText.slice(0, 180)}`
-                : "Failed loading mission schedules.")
-          );
-        }
-
-        setMissionSchedules(payload?.schedules ?? []);
-      } catch (error) {
-        setControlMessage({
-          tone: "error",
-          text: error instanceof Error ? error.message : "Failed loading mission schedules."
-        });
-      } finally {
-        setSchedulesLoading(false);
-        setSchedulesRefreshing(false);
-        missionSchedulesInFlightRef.current = false;
-      }
-    },
-    [resolvedOrg?.id]
-  );
-
-  useEffect(() => {
-    if (!resolvedOrg?.id) {
-      return;
-    }
-    void loadMissionSchedules();
-    const interval = setInterval(() => {
-      if (typeof document !== "undefined" && document.hidden) {
-        return;
-      }
-      void loadMissionSchedules(true);
-    }, MISSION_SCHEDULES_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [loadMissionSchedules, resolvedOrg?.id]);
-
   const uploadHumanInputToHub = useCallback(
     async (input: { file?: File; sourceUrl?: string; name?: string }) => {
       if (!resolvedOrg?.id) {
@@ -4165,286 +4039,6 @@ export function VorldXShell() {
       setClearPermissionRequestsInFlight(false);
     }
   }, [clearPermissionRequestsInFlight, loadPermissionRequests, resolvedOrg?.id]);
-
-  const handleCreateSchedule = useCallback(async () => {
-    if (!resolvedOrg?.id) {
-      return;
-    }
-    const direction = intent.trim();
-    if (!direction) {
-      setControlMessage({
-        tone: "warning",
-        text: "Add a direction before creating a schedule."
-      });
-      return;
-    }
-
-    setScheduleActionInFlight(true);
-    setControlMessage(null);
-
-    try {
-      const response = await fetch("/api/schedules/missions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          orgId: resolvedOrg.id,
-          title: scheduleDraft.title.trim() || "Scheduled Direction",
-          direction,
-          cadence: scheduleDraft.cadence,
-          nextRunAt: toIsoFromDatetimeLocal(scheduleDraft.nextRunAt),
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-          swarmDensity,
-          requiredSignatures,
-          predictedBurn,
-          enabled: true
-        })
-      });
-
-      const { payload, rawText } = await parseJsonBody<{
-        ok?: boolean;
-        message?: string;
-        schedule?: MissionSchedule;
-      }>(response);
-
-      if (!response.ok || !payload?.ok || !payload.schedule) {
-        throw new Error(
-          payload?.message ??
-            (rawText
-              ? `Failed creating schedule (${response.status}): ${rawText.slice(0, 180)}`
-              : "Failed creating schedule.")
-        );
-      }
-
-      setMissionSchedules((prev) => [payload.schedule!, ...prev]);
-      setScheduleDraft((prev) => ({
-        ...prev,
-        title: ""
-      }));
-      setControlMessage({
-        tone: "success",
-        text: "Direction schedule created."
-      });
-    } catch (error) {
-      setControlMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Failed creating schedule."
-      });
-    } finally {
-      setScheduleActionInFlight(false);
-    }
-  }, [intent, predictedBurn, requiredSignatures, resolvedOrg?.id, scheduleDraft, swarmDensity]);
-
-  const handleRunSchedule = useCallback(
-    async (scheduleId: string) => {
-      if (!resolvedOrg?.id) {
-        return;
-      }
-
-      setScheduleRunInFlightId(scheduleId);
-      setControlMessage(null);
-
-      try {
-        const response = await fetch(`/api/schedules/missions/${scheduleId}/run`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            orgId: resolvedOrg.id
-          })
-        });
-
-        const { payload, rawText } = await parseJsonBody<{
-          ok?: boolean;
-          message?: string;
-          warning?: string;
-          schedule?: MissionSchedule;
-          flow?: { id: string; status: string };
-        }>(response);
-
-        if (!response.ok || !payload?.ok || !payload.flow || !payload.schedule) {
-          throw new Error(
-            payload?.message ??
-              (rawText
-                ? `Failed running schedule (${response.status}): ${rawText.slice(0, 180)}`
-                : "Failed running schedule.")
-          );
-        }
-
-        setMissionSchedules((prev) =>
-          prev.map((item) => (item.id === payload.schedule!.id ? payload.schedule! : item))
-        );
-        setControlMessage({
-          tone: payload.warning ? "warning" : "success",
-          text: payload.warning
-            ? `Schedule launched flow ${payload.flow.id} with warning: ${payload.warning}`
-            : `Schedule launched flow ${payload.flow.id}.`
-        });
-      } catch (error) {
-        setControlMessage({
-          tone: "error",
-          text: error instanceof Error ? error.message : "Failed running schedule."
-        });
-      } finally {
-        setScheduleRunInFlightId(null);
-      }
-    },
-    [resolvedOrg?.id]
-  );
-
-  const handleRunDueSchedules = useCallback(async () => {
-    if (!resolvedOrg?.id) {
-      return;
-    }
-
-    setScheduleTickInFlight(true);
-    setControlMessage(null);
-    try {
-      const response = await fetch("/api/schedules/tick", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          orgId: resolvedOrg.id,
-          limit: 25
-        })
-      });
-
-      const { payload, rawText } = await parseJsonBody<{
-        ok?: boolean;
-        message?: string;
-        launchedCount?: number;
-        failedCount?: number;
-      }>(response);
-
-      if (!response.ok || !payload?.ok) {
-        throw new Error(
-          payload?.message ??
-            (rawText
-              ? `Failed running due schedules (${response.status}): ${rawText.slice(0, 180)}`
-              : "Failed running due schedules.")
-        );
-      }
-
-      await loadMissionSchedules(true, true);
-      const launchedCount = payload.launchedCount ?? 0;
-      const failedCount = payload.failedCount ?? 0;
-      setControlMessage({
-        tone: failedCount > 0 ? "warning" : "success",
-        text:
-          failedCount > 0
-            ? `Due schedules processed. Launched: ${launchedCount}, failed: ${failedCount}.`
-            : `Due schedules processed. Launched: ${launchedCount}.`
-      });
-      if (launchedCount > 0) {
-        handleTabChange("flow");
-      }
-    } catch (error) {
-      setControlMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Failed running due schedules."
-      });
-    } finally {
-      setScheduleTickInFlight(false);
-    }
-  }, [handleTabChange, loadMissionSchedules, resolvedOrg?.id]);
-
-  const handleToggleSchedule = useCallback(
-    async (schedule: MissionSchedule) => {
-      if (!resolvedOrg?.id) {
-        return;
-      }
-
-      setScheduleActionInFlight(true);
-      try {
-        const response = await fetch(`/api/schedules/missions/${schedule.id}`, {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            orgId: resolvedOrg.id,
-            enabled: !schedule.enabled
-          })
-        });
-
-        const { payload, rawText } = await parseJsonBody<{
-          ok?: boolean;
-          message?: string;
-          schedule?: MissionSchedule;
-        }>(response);
-
-        if (!response.ok || !payload?.ok || !payload.schedule) {
-          throw new Error(
-            payload?.message ??
-              (rawText
-                ? `Failed updating schedule (${response.status}): ${rawText.slice(0, 180)}`
-                : "Failed updating schedule.")
-          );
-        }
-
-        setMissionSchedules((prev) =>
-          prev.map((item) => (item.id === payload.schedule!.id ? payload.schedule! : item))
-        );
-      } catch (error) {
-        setControlMessage({
-          tone: "error",
-          text: error instanceof Error ? error.message : "Failed updating schedule."
-        });
-      } finally {
-        setScheduleActionInFlight(false);
-      }
-    },
-    [resolvedOrg?.id]
-  );
-
-  const handleDeleteSchedule = useCallback(
-    async (scheduleId: string) => {
-      if (!resolvedOrg?.id) {
-        return;
-      }
-
-      if (typeof window !== "undefined") {
-        const confirmed = window.confirm("Delete this schedule?");
-        if (!confirmed) {
-          return;
-        }
-      }
-
-      setScheduleActionInFlight(true);
-      try {
-        const response = await fetch(
-          `/api/schedules/missions/${scheduleId}?orgId=${encodeURIComponent(resolvedOrg.id)}`,
-          {
-            method: "DELETE"
-          }
-        );
-        const { payload, rawText } = await parseJsonBody<{ ok?: boolean; message?: string }>(
-          response
-        );
-        if (!response.ok || !payload?.ok) {
-          throw new Error(
-            payload?.message ??
-              (rawText
-                ? `Failed deleting schedule (${response.status}): ${rawText.slice(0, 180)}`
-                : "Failed deleting schedule.")
-          );
-        }
-        setMissionSchedules((prev) => prev.filter((item) => item.id !== scheduleId));
-      } catch (error) {
-        setControlMessage({
-          tone: "error",
-          text: error instanceof Error ? error.message : "Failed deleting schedule."
-        });
-      } finally {
-        setScheduleActionInFlight(false);
-      }
-    },
-    [resolvedOrg?.id]
-  );
 
   const getConnectedToolkits = useCallback(async () => {
     if (!resolvedOrg?.id) {
@@ -5383,76 +4977,11 @@ export function VorldXShell() {
     pendingAutoLaunchPrompt
   ]);
 
-  const handleGlobalKillSwitch = useCallback(async () => {
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(
-        "Abort all active and queued missions for this organization?"
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
-
-    setKillSwitchInFlight(true);
-    setControlMessage(null);
-
-    try {
-      const response = await fetch("/api/kill-switch", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          orgId: resolvedOrg?.id
-        })
-      });
-
-      const { payload, rawText } = await parseJsonBody<{
-        ok?: boolean;
-        warning?: string;
-        message?: string;
-        result?: { flowsAborted: number; tasksAborted: number };
-      }>(response);
-
-      if (!payload) {
-        throw new Error(
-          rawText
-            ? `Kill switch failed (${response.status}): ${rawText.slice(0, 200)}`
-            : `Kill switch failed (${response.status}).`
-        );
-      }
-
-      if (!response.ok || !payload.ok) {
-        setControlMessage({
-          tone: "error",
-          text: payload.message ?? "Kill switch failed."
-        });
-        return;
-      }
-
-      setControlMessage({
-        tone: payload.warning ? "warning" : "success",
-        text: payload.warning
-          ? `${payload.message ?? "Kill switch executed"} Warning: ${payload.warning}`
-          : payload.message ??
-            `Global kill switch executed. Flows: ${payload.result?.flowsAborted ?? 0}, Tasks: ${payload.result?.tasksAborted ?? 0}.`
-      });
-    } catch (error) {
-      setControlMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Unexpected kill switch error."
-      });
-    } finally {
-      setKillSwitchInFlight(false);
-    }
-  }, [resolvedOrg?.id]);
-
   return (
-    <div className="vx-shell relative h-[100dvh] overflow-hidden bg-vx-bg text-slate-100 transition-all duration-500">
-      <div className="flex h-full overflow-hidden">
+    <div className="vx-shell relative h-[100dvh] overflow-x-hidden overflow-y-hidden bg-vx-bg text-slate-100 transition-all duration-500">
+      <div className="flex h-full min-w-0 overflow-hidden">
         <main className="relative flex h-full min-w-0 flex-1 flex-col overflow-hidden">
-          <header className="relative z-30 flex min-h-24 shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#05070a]/50 px-4 py-3 backdrop-blur-xl md:h-24 md:flex-nowrap md:px-10 md:py-0">
+          <header className="relative z-30 flex min-h-[4.5rem] shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#05070a]/50 px-4 py-3 backdrop-blur-xl md:h-[4.75rem] md:min-h-[4.75rem] md:flex-nowrap md:px-6 md:py-0 lg:h-20 lg:min-h-20 lg:px-8 xl:px-10">
             <div
               className="group flex cursor-pointer items-center gap-3"
               onClick={() => {
@@ -5471,7 +5000,7 @@ export function VorldXShell() {
               </div>
             </div>
 
-            <div className="relative mx-4 hidden max-w-xl flex-1 md:flex">
+            <div className="relative mx-4 hidden max-w-xl flex-1 md:flex lg:max-w-2xl 2xl:max-w-3xl">
               <div className="flex w-full items-center rounded-full border border-white/10 bg-white/5 px-4 py-2">
                 <Command size={14} className="mr-2 text-slate-500" />
                 <Search size={16} className="mr-2 text-slate-500" />
@@ -5548,7 +5077,7 @@ export function VorldXShell() {
               )}
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto sm:gap-3">
               {orgBootstrapStatus === "ready" && !resolvedOrg ? (
                 <button
                   onClick={() => {
@@ -5586,6 +5115,25 @@ export function VorldXShell() {
                 </button>
               ) : null}
 
+              {resolvedOrg ? (
+                <button
+                  onClick={() => {
+                    handleTabChange("squad");
+                    setShowRequestCenter(false);
+                    setShowOrgSwitcher(false);
+                    setShowUtilityMenu(false);
+                  }}
+                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                    activeTab === "squad"
+                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                      : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                  }`}
+                >
+                  <Users size={14} />
+                  <span className="hidden sm:inline">Squad</span>
+                </button>
+              ) : null}
+
               <button
                 onClick={() => {
                   setShowUtilityMenu((prev) => !prev);
@@ -5600,7 +5148,7 @@ export function VorldXShell() {
             </div>
 
             {showUtilityMenu ? (
-              <div className="absolute right-4 top-24 z-50 w-[320px] rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10 md:top-20">
+              <div className="vx-scrollbar absolute right-2 top-[calc(100%+0.5rem)] z-50 w-[min(20rem,calc(100vw-1rem))] max-h-[70vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10 md:top-20 md:w-[320px] md:max-h-[75vh]">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <p className="text-xs font-medium text-slate-500">Utilities</p>
                   <button
@@ -5674,7 +5222,7 @@ export function VorldXShell() {
             ) : null}
 
             {showOrgSwitcher && (
-              <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-10 md:right-auto md:top-20 md:w-72">
+              <div className="vx-scrollbar absolute left-2 right-2 top-[calc(100%+0.5rem)] z-50 w-auto max-h-[70vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-10 md:right-auto md:top-20 md:w-72 md:max-h-[75vh]">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <p className="text-xs font-medium text-slate-500">Organizations</p>
                   <button
@@ -5719,7 +5267,7 @@ export function VorldXShell() {
             )}
 
             {showRequestCenter && resolvedOrg && (
-              <div className="absolute left-4 right-4 top-24 z-50 w-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-auto md:right-10 md:top-20 md:w-[420px]">
+              <div className="vx-scrollbar absolute left-2 right-2 top-[calc(100%+0.5rem)] z-50 w-auto max-h-[80vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-auto md:right-10 md:top-20 md:w-[420px] md:max-h-[75vh]">
                 <div className="mb-2 flex items-center justify-between px-2 py-1">
                   <div>
                     <p className="text-xs font-medium text-slate-500">Request center</p>
@@ -5898,11 +5446,11 @@ export function VorldXShell() {
           </header>
 
           <section
-            className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-4 py-6 pb-28 md:px-10 md:py-10 md:pb-32 ${
+            className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-3 py-4 pb-24 sm:px-4 md:px-6 md:py-6 md:pb-28 lg:px-8 xl:px-10 2xl:px-12 ${
               resolvedOrg && activeTab === "control"
-                ? "min-h-0 overflow-hidden py-4 pb-44 md:py-6 md:pb-48"
+                ? "min-h-0 overflow-hidden py-3 pb-36 md:py-5 md:pb-40"
                 : resolvedOrg && workspaceMode === "FLOW"
-                  ? "min-h-0 overflow-hidden py-4 pb-24 md:py-6 md:pb-28"
+                  ? "min-h-0 overflow-hidden py-2 pb-4 md:py-3 md:pb-5"
                 : "overflow-y-auto"
             }`}
           >
@@ -6240,7 +5788,7 @@ export function VorldXShell() {
                 }}
               />
             ) : resolvedOrg && workspaceMode === "FLOW" ? (
-              <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[280px_minmax(0,1fr)] 2xl:grid-cols-[292px_minmax(0,1fr)]">
+              <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[clamp(240px,22vw,320px)_minmax(0,1fr)] [@media(min-width:1920px)]:grid-cols-[clamp(260px,18vw,360px)_minmax(0,1fr)]">
                 <FlowSidebarRail
                   themeStyle={{
                     accent: themeStyle.accent,
@@ -6377,16 +5925,6 @@ export function VorldXShell() {
                           border: themeStyle.border
                         }}
                       />
-                    ) : activeTab === "squad" ? (
-                      <SquadConsole
-                        key={`squad-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
-                        orgId={resolvedOrg.id}
-                        themeStyle={{
-                          accent: themeStyle.accent,
-                          accentSoft: themeStyle.accentSoft,
-                          border: themeStyle.border
-                        }}
-                      />
                     ) : activeTab === "memory" ? (
                       <MemoryConsole
                         key={`memory-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
@@ -6483,12 +6021,12 @@ export function VorldXShell() {
         </main>
       </div>
 
-      <div className="pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4">
-        <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-white/15 bg-[#060b13]/92 p-1 shadow-[0_18px_50px_rgba(0,0,0,0.55)] backdrop-blur-xl">
+      <div className="pointer-events-none fixed inset-x-0 bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-3 sm:px-4">
+        <div className="pointer-events-auto inline-flex max-w-full items-center gap-1 overflow-x-auto rounded-full border border-white/15 bg-[#060b13]/92 p-1 shadow-[0_18px_50px_rgba(0,0,0,0.55)] backdrop-blur-xl">
           <button
             type="button"
             onClick={() => handleWorkspaceModeSwitch("COMPASS")}
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
               workspaceMode === "COMPASS"
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
@@ -6500,7 +6038,7 @@ export function VorldXShell() {
           <button
             type="button"
             onClick={() => handleWorkspaceModeSwitch("FLOW")}
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
               workspaceMode === "FLOW"
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
@@ -6512,7 +6050,7 @@ export function VorldXShell() {
           <button
             type="button"
             onClick={() => handleWorkspaceModeSwitch("HUB")}
-            className={`inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
               workspaceMode === "HUB"
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
@@ -6648,7 +6186,7 @@ export function VorldXShell() {
 
       {setupPanel === "chooser" && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-xl rounded-[30px] border border-white/15 bg-[#0d1117] p-6">
+          <div className="vx-scrollbar max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-[30px] border border-white/15 bg-[#0d1117] p-5 sm:p-6">
             <div className="mb-4 flex items-center justify-between">
               <div>
                 <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
@@ -6928,17 +6466,17 @@ function FlowSidebarRail({
     : "All dates";
 
   return (
-    <aside className="flex h-full min-h-0 flex-col xl:max-w-[272px]">
+    <aside className="flex h-auto min-h-0 flex-col xl:h-full xl:w-[clamp(240px,22vw,320px)] xl:self-stretch [@media(min-width:1920px)]:w-[clamp(260px,18vw,360px)]">
       <div
-        className={`vx-panel flex h-full min-h-0 flex-col overflow-hidden rounded-[26px] p-2 ${themeStyle.border}`}
+        className={`vx-panel flex h-auto min-h-0 flex-col overflow-hidden rounded-[26px] p-2 xl:h-full ${themeStyle.border}`}
       >
-        <div className="shrink-0 rounded-[20px] border border-white/10 bg-[linear-gradient(180deg,rgba(13,18,28,0.92),rgba(8,12,19,0.86))] p-1.5">
+        <div className="mx-auto w-full max-w-[300px] shrink-0 rounded-[20px] border border-white/10 bg-[linear-gradient(180deg,rgba(13,18,28,0.92),rgba(8,12,19,0.86))] p-1.5 xl:max-w-[284px] [@media(min-width:1920px)]:max-w-[272px]">
           <div className="flex items-start justify-between gap-2">
             <div>
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
                 Calendar
               </p>
-              <p className="mt-1 text-[13px] font-medium text-slate-100">
+              <p className="mt-1 text-[13px] font-medium text-slate-100 xl:text-[12px]">
                 {monthCursor.toLocaleDateString(undefined, { month: "long", year: "numeric" })}
               </p>
               <p className="mt-1 text-[8px] text-slate-400">Filters Flow.</p>
@@ -6994,7 +6532,7 @@ function FlowSidebarRail({
                   key={`${dayKey}-${day.getTime()}`}
                   type="button"
                   onClick={() => onSelectedDateChange(selectedDate === dayKey ? null : dayKey)}
-                  className={`flex h-7 flex-col items-center justify-center rounded-md border text-[9px] transition ${
+                  className={`flex h-7 flex-col items-center justify-center rounded-md border text-[9px] transition xl:h-[1.625rem] [@media(min-width:1920px)]:h-6 ${
                     isSelected
                       ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100 shadow-[0_0_0_1px_rgba(34,211,238,0.12)]"
                       : isCurrentMonth
@@ -7014,7 +6552,7 @@ function FlowSidebarRail({
           </div>
         </div>
 
-        <div className="mt-2 flex min-h-0 flex-1 flex-col rounded-[20px] border border-white/10 bg-[#050910]/72 p-2">
+        <div className="mt-2.5 flex min-h-0 flex-1 flex-col rounded-[20px] border border-white/10 bg-[#050910]/72 p-2.5">
           <div className="flex items-center justify-between gap-2">
             <div>
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500">
@@ -7027,7 +6565,7 @@ function FlowSidebarRail({
             </span>
           </div>
 
-          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
             {(["FOCUS", "EXECUTION", "GOVERNANCE"] as const).map((scope) => (
               <span
                 key={scope}
@@ -7039,15 +6577,15 @@ function FlowSidebarRail({
             ))}
           </div>
 
-          <div className="mt-2 min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-black/20 p-2">
+          <div className="mt-3 min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-black/20 p-2.5">
             {visibleStrings.length === 0 ? (
               <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 text-center text-sm text-slate-500">
                 {selectedDate ? "No strings for this date." : "No strings yet."}
               </div>
             ) : (
-              <div className="vx-scrollbar relative h-full overflow-y-auto overscroll-contain pr-1">
+              <div className="vx-scrollbar relative h-full overflow-y-auto overscroll-contain pr-1.5">
                 <div className="absolute bottom-3 left-[15px] top-3 w-[2px] bg-gradient-to-b from-emerald-400/80 via-cyan-400/55 to-cyan-500/10 shadow-[0_0_18px_rgba(34,211,238,0.25)]" />
-                <div className="space-y-3 pl-10">
+                <div className="space-y-3.5 pl-10">
                   {visibleStrings.map((item) => (
                     <button
                       key={item.id}
@@ -7535,8 +7073,8 @@ function ControlDeckSurface({
 
   return (
     <div
-      className={`mx-auto flex min-h-0 w-full max-w-6xl flex-col gap-3 sm:gap-4 ${
-        isStringsView ? "h-[calc(100%+6rem)] md:h-[calc(100%+7rem)]" : "h-full"
+      className={`mx-auto flex min-h-0 w-full max-w-6xl flex-col gap-3 sm:gap-4 2xl:max-w-[min(92vw,1700px)] ${
+        isStringsView ? "h-[calc(100%+3.5rem)] sm:h-[calc(100%+6rem)] md:h-[calc(100%+7rem)]" : "h-full"
       }`}
     >
       <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between">
@@ -8022,7 +7560,7 @@ function ControlDeckSurface({
       </div>
 
       {!isStringsView ? (
-        <div className="pointer-events-none fixed inset-x-0 bottom-[4.7rem] z-30 flex justify-center px-4">
+        <div className="pointer-events-none fixed inset-x-0 bottom-[calc(4.7rem+env(safe-area-inset-bottom))] z-30 flex justify-center px-3 sm:px-4">
           <div className="pointer-events-auto w-full max-w-4xl">{composerBar}</div>
         </div>
       ) : null}
