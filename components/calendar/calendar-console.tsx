@@ -17,6 +17,7 @@ import { getRealtimeClient } from "@/lib/realtime/client";
 type CalendarScope = "ORG" | "USER";
 type CalendarActorFilter = "ALL" | "HUMAN" | "AI";
 type CalendarTemporalFilter = "ALL" | "PAST" | "FUTURE";
+type CalendarStringMode = "discussion" | "direction";
 
 interface CalendarPathwayStepRef {
   stepId: string;
@@ -83,6 +84,13 @@ interface CalendarApiPayload {
   summary?: CalendarTimelineSummary;
 }
 
+interface CalendarStringItem {
+  id: string;
+  title: string;
+  updatedAt: string;
+  mode: CalendarStringMode;
+}
+
 interface CalendarConsoleProps {
   orgId: string;
   themeStyle: {
@@ -90,6 +98,14 @@ interface CalendarConsoleProps {
     accentSoft: string;
     border: string;
   };
+  dateFilter?: string | null;
+  onDateFilterChange?: (value: string | null) => void;
+  selectedStringId?: string | null;
+  stringFilterLabel?: string | null;
+  planIdFilter?: string | null;
+  directionIdFilter?: string | null;
+  flowIdFilter?: string[] | null;
+  stringItems?: CalendarStringItem[];
 }
 
 function toMonthKey(date: Date) {
@@ -131,9 +147,94 @@ function actorBadge(actor: "HUMAN" | "AI") {
     : "border-cyan-500/35 bg-cyan-500/10 text-cyan-200";
 }
 
-export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
+function normalizeDateKey(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
+}
+
+function referencesMatchFilters(
+  event: CalendarTimelineEvent,
+  input: {
+    planIdFilter?: string | null;
+    directionIdFilter?: string | null;
+    flowIdFilter?: string[] | null;
+  }
+) {
+  const planId = input.planIdFilter?.trim() ?? "";
+  const directionId = input.directionIdFilter?.trim() ?? "";
+  const flowIds = new Set((input.flowIdFilter ?? []).map((item) => item.trim()).filter(Boolean));
+
+  if (!planId && !directionId && flowIds.size === 0) {
+    return true;
+  }
+
+  const refs = event.references;
+  const matchesPlan = planId.length > 0 && refs.planId === planId;
+  const matchesDirection = directionId.length > 0 && refs.directionId === directionId;
+  const matchesFlow = flowIds.size > 0 && refs.flowId ? flowIds.has(refs.flowId) : false;
+
+  if (matchesPlan || matchesDirection || matchesFlow) {
+    return true;
+  }
+
+  return false;
+}
+
+function summarizeTimelineEvents(events: CalendarTimelineEvent[]): CalendarTimelineSummary {
+  const nowMs = Date.now();
+  const summary: CalendarTimelineSummary = {
+    total: events.length,
+    live: 0,
+    human: 0,
+    ai: 0,
+    past: 0,
+    future: 0
+  };
+
+  for (const event of events) {
+    if (event.actorType === "HUMAN") {
+      summary.human += 1;
+    } else {
+      summary.ai += 1;
+    }
+    const startMs = new Date(event.startsAt).getTime();
+    const endMs = event.endsAt ? new Date(event.endsAt).getTime() : startMs;
+    const isLive = event.live || (startMs <= nowMs && endMs >= nowMs);
+    if (isLive) {
+      summary.live += 1;
+    } else if (endMs < nowMs) {
+      summary.past += 1;
+    } else {
+      summary.future += 1;
+    }
+  }
+
+  return summary;
+}
+
+function toStringModeBadge(mode: CalendarStringMode) {
+  return mode === "direction"
+    ? "border-cyan-500/35 bg-cyan-500/10 text-cyan-100"
+    : "border-emerald-500/35 bg-emerald-500/10 text-emerald-100";
+}
+
+export function CalendarConsole({
+  orgId,
+  themeStyle,
+  dateFilter,
+  onDateFilterChange,
+  selectedStringId,
+  stringFilterLabel,
+  planIdFilter,
+  directionIdFilter,
+  flowIdFilter,
+  stringItems = []
+}: CalendarConsoleProps) {
   const [monthCursor, setMonthCursor] = useState(() => new Date());
-  const [selectedDate, setSelectedDate] = useState(todayDateKey());
+  const [selectedDateState, setSelectedDateState] = useState(todayDateKey());
   const [scope, setScope] = useState<CalendarScope>("ORG");
   const [actorFilter, setActorFilter] = useState<CalendarActorFilter>("ALL");
   const [temporalFilter, setTemporalFilter] = useState<CalendarTemporalFilter>("ALL");
@@ -161,14 +262,57 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
   const [deleteInFlightEventId, setDeleteInFlightEventId] = useState<string | null>(null);
 
   const monthKey = useMemo(() => toMonthKey(monthCursor), [monthCursor]);
+  const controlledDateKey = useMemo(() => normalizeDateKey(dateFilter), [dateFilter]);
+  const selectedDate = controlledDateKey ?? selectedDateState;
+  const isDateControlled = controlledDateKey !== null;
+  const stringsByDay = useMemo(() => {
+    const map = new Map<string, CalendarStringItem[]>();
+    for (const item of stringItems) {
+      const dayKey = normalizeDateKey(toDateKey(item.updatedAt));
+      if (!dayKey) {
+        continue;
+      }
+      const list = map.get(dayKey) ?? [];
+      list.push(item);
+      map.set(dayKey, list);
+    }
+    for (const list of map.values()) {
+      list.sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+    }
+    return map;
+  }, [stringItems]);
+  const selectedString = useMemo(
+    () => stringItems.find((item) => item.id === selectedStringId) ?? null,
+    [selectedStringId, stringItems]
+  );
 
   useEffect(() => {
+    if (isDateControlled) {
+      return;
+    }
     if (selectedDate.startsWith(monthKey)) {
       return;
     }
     const today = todayDateKey();
-    setSelectedDate(today.startsWith(monthKey) ? today : `${monthKey}-01`);
-  }, [monthKey, selectedDate]);
+    setSelectedDateState(today.startsWith(monthKey) ? today : `${monthKey}-01`);
+  }, [isDateControlled, monthKey, selectedDate]);
+
+  useEffect(() => {
+    if (!selectedDate) {
+      return;
+    }
+    const day = new Date(`${selectedDate}T00:00:00`);
+    if (Number.isNaN(day.getTime())) {
+      return;
+    }
+    const nextMonthCursor = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), 1));
+    if (
+      monthCursor.getUTCFullYear() !== nextMonthCursor.getUTCFullYear() ||
+      monthCursor.getUTCMonth() !== nextMonthCursor.getUTCMonth()
+    ) {
+      setMonthCursor(nextMonthCursor);
+    }
+  }, [monthCursor, selectedDate]);
 
   const loadEvents = useCallback(
     async (silent?: boolean) => {
@@ -179,8 +323,16 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
       }
       setError(null);
       try {
+        const query = new URLSearchParams({
+          orgId,
+          month: monthKey,
+          scope,
+          actor: actorFilter,
+          temporal: temporalFilter,
+          live: liveOnly ? "1" : "0"
+        });
         const response = await fetch(
-          `/api/calendar/events?orgId=${encodeURIComponent(orgId)}&month=${encodeURIComponent(monthKey)}&scope=${scope}&actor=${actorFilter}&temporal=${temporalFilter}&live=${liveOnly ? "1" : "0"}`,
+          `/api/calendar/events?${query.toString()}`,
           { cache: "no-store" }
         );
         const { payload, rawText } = await parseJsonResponse<CalendarApiPayload>(response);
@@ -247,21 +399,38 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
     };
   }, [loadEvents]);
 
+  const visibleEvents = useMemo(
+    () =>
+      events
+        .filter((event) => referencesMatchFilters(event, { planIdFilter, directionIdFilter, flowIdFilter }))
+        .sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime()),
+    [directionIdFilter, events, flowIdFilter, planIdFilter]
+  );
+
   const eventsByDay = useMemo(() => {
     const map = new Map<string, number>();
-    for (const event of events) {
+    for (const event of visibleEvents) {
       const key = toDateKey(event.startsAt);
       map.set(key, (map.get(key) ?? 0) + 1);
     }
     return map;
-  }, [events]);
+  }, [visibleEvents]);
+
+  const visibleSummary = useMemo(
+    () => (visibleEvents.length === events.length ? summary : summarizeTimelineEvents(visibleEvents)),
+    [events.length, summary, visibleEvents]
+  );
 
   const selectedDayEvents = useMemo(
     () =>
-      events
+      visibleEvents
         .filter((event) => toDateKey(event.startsAt) === selectedDate)
         .sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime()),
-    [events, selectedDate]
+    [selectedDate, visibleEvents]
+  );
+  const selectedDayStrings = useMemo(
+    () => stringsByDay.get(selectedDate) ?? [],
+    [selectedDate, stringsByDay]
   );
 
   const monthGridDays = useMemo(() => {
@@ -319,6 +488,16 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
     }
   }, [draftDetail, draftScope, draftStartsAt, draftTitle, loadEvents, orgId]);
 
+  const handleSelectedDateChange = useCallback(
+    (value: string | null) => {
+      if (!isDateControlled) {
+        setSelectedDateState(value ?? todayDateKey());
+      }
+      onDateFilterChange?.(value);
+    },
+    [isDateControlled, onDateFilterChange]
+  );
+
   const deleteManualEvent = useCallback(
     async (event: CalendarTimelineEvent) => {
       if (event.sourceKind !== "manual" || !event.sourceId) {
@@ -364,6 +543,11 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
           <p className="mt-1 text-xs text-slate-400">
             Human + AI history, live activity, and scheduled execution windows.
           </p>
+          {stringFilterLabel || selectedString ? (
+            <p className="mt-1 text-xs text-emerald-300">
+              String scope: {stringFilterLabel || selectedString?.title}
+            </p>
+          ) : null}
         </div>
         <button
           type="button"
@@ -427,7 +611,7 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
           </div>
 
           <div className="mb-3 rounded-xl border border-white/10 bg-black/35 p-2.5 text-xs text-slate-300">
-            Total {summary.total} | Live {summary.live} | Human {summary.human} | AI {summary.ai}
+            Total {visibleSummary.total} | Live {visibleSummary.live} | Human {visibleSummary.human} | AI {visibleSummary.ai}
           </div>
 
           <div className="rounded-xl border border-white/10 bg-black/30 p-2">
@@ -463,19 +647,22 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
                 const isCurrentMonth = day.getUTCMonth() === monthCursor.getUTCMonth();
                 const isSelected = selectedDate === dayKey;
                 const count = eventsByDay.get(dayKey) ?? 0;
+                const stringCount = stringsByDay.get(dayKey)?.length ?? 0;
                 return (
                   <button
                     key={dayIso}
                     type="button"
-                    onClick={() => setSelectedDate(dayKey)}
+                    onClick={() => handleSelectedDateChange(dayKey)}
                     className={`rounded-lg border px-1 py-1.5 text-xs transition ${isSelected ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100" : isCurrentMonth ? "border-white/10 text-slate-200 hover:bg-white/10" : "border-transparent text-slate-500 hover:bg-white/5"}`}
                   >
                     <div>{day.getUTCDate()}</div>
-                    {count > 0 ? (
-                      <div className="mt-1 text-[10px] text-cyan-300">{count}</div>
-                    ) : (
-                      <div className="mt-1 text-[10px] text-transparent">0</div>
-                    )}
+                    <div className="mt-1 flex items-center justify-center gap-1">
+                      {count > 0 ? <span className="h-1 w-1 rounded-full bg-cyan-300" /> : null}
+                      {stringCount > 0 ? <span className="h-1 w-1 rounded-full bg-violet-300" /> : null}
+                      {count === 0 && stringCount === 0 ? (
+                        <span className="text-[10px] text-transparent">0</span>
+                      ) : null}
+                    </div>
                   </button>
                 );
               })}
@@ -529,82 +716,121 @@ export function CalendarConsole({ orgId, themeStyle }: CalendarConsoleProps) {
           </div>
 
           <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
-            <p className="mb-2 text-xs uppercase tracking-[0.16em] text-slate-500">
-              Timeline: {selectedDate}
-            </p>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs uppercase tracking-[0.16em] text-slate-500">
+                Timeline: {selectedDate}
+              </p>
+              {selectedDayStrings.length > 0 ? (
+                <p className="text-[11px] uppercase tracking-[0.14em] text-violet-300">
+                  {selectedDayStrings.length} string{selectedDayStrings.length === 1 ? "" : "s"}
+                </p>
+              ) : null}
+            </div>
 
             {loading ? (
               <div className="flex h-52 items-center justify-center text-slate-400">
                 <Loader2 size={18} className="mr-2 animate-spin" />
                 Loading timeline...
               </div>
-            ) : selectedDayEvents.length === 0 ? (
-              <div className="rounded-xl border border-white/10 bg-black/25 p-4 text-sm text-slate-400">
-                No events on this date.
-              </div>
             ) : (
-              <div className="space-y-2">
-                {selectedDayEvents.map((event) => (
-                  <div key={event.id} className="rounded-xl border border-white/10 bg-black/30 p-3">
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold text-slate-100">{event.title}</p>
-                        <p className="mt-0.5 text-xs text-slate-400">
-                          {formatTimeLabel(event.startsAt)} | {event.sourceLabel}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${actorBadge(event.actorType)}`}>
-                          {event.actorType}
-                        </span>
-                        {event.live ? (
-                          <span className="rounded-full border border-cyan-500/35 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-200">
-                            LIVE
-                          </span>
-                        ) : null}
-                        {event.sourceKind === "manual" ? (
-                          <button
-                            type="button"
-                            onClick={() => void deleteManualEvent(event)}
-                            disabled={deleteInFlightEventId === event.id}
-                            className="rounded-full border border-red-500/35 bg-red-500/10 p-1 text-red-200 transition hover:bg-red-500/20 disabled:opacity-60"
-                            title="Delete event"
-                          >
-                            {deleteInFlightEventId === event.id ? (
-                              <Loader2 size={12} className="animate-spin" />
-                            ) : (
-                              <Trash2 size={12} />
-                            )}
-                          </button>
-                        ) : null}
-                      </div>
+              <div className="space-y-3">
+                {selectedDayStrings.length > 0 ? (
+                  <div className="rounded-xl border border-violet-500/20 bg-violet-500/8 p-3">
+                    <p className="text-[11px] uppercase tracking-[0.14em] text-violet-300">
+                      Strings on this date
+                    </p>
+                    <div className="mt-2 space-y-2">
+                      {selectedDayStrings.map((item) => (
+                        <div
+                          key={item.id}
+                          className={`rounded-lg border px-2.5 py-2 text-xs ${
+                            item.id === selectedStringId
+                              ? "border-violet-400/45 bg-violet-500/15 text-violet-50"
+                              : "border-white/10 bg-black/20 text-slate-200"
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="font-semibold text-slate-100">{item.title}</p>
+                            <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${toStringModeBadge(item.mode)}`}>
+                              {item.mode}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            {new Date(item.updatedAt).toLocaleString()}
+                          </p>
+                        </div>
+                      ))}
                     </div>
-
-                    {event.detail ? (
-                      <p className="mt-2 whitespace-pre-wrap text-sm text-slate-200">{event.detail}</p>
-                    ) : null}
-
-                    {event.pathway ? (
-                      <div className="mt-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-2 text-xs text-cyan-100">
-                        Pathway L{event.pathway.line} | {event.pathway.workflowTitle}{" -> "}
-                        {event.pathway.taskTitle} | Owner {event.pathway.ownerRole}
-                      </div>
-                    ) : null}
-
-                    {event.tags.length > 0 ? (
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {event.tags.slice(0, 6).map((tag) => (
-                          <span
-                            key={`${event.id}-${tag}`}
-                            className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300"
-                          >
-                            {tag}
-                          </span>
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
-                ))}
+                ) : null}
+
+                {selectedDayEvents.length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-black/25 p-4 text-sm text-slate-400">
+                    No events on this date.
+                  </div>
+                ) : (
+                  selectedDayEvents.map((event) => (
+                    <div key={event.id} className="rounded-xl border border-white/10 bg-black/30 p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-slate-100">{event.title}</p>
+                          <p className="mt-0.5 text-xs text-slate-400">
+                            {formatTimeLabel(event.startsAt)} | {event.sourceLabel}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${actorBadge(event.actorType)}`}>
+                            {event.actorType}
+                          </span>
+                          {event.live ? (
+                            <span className="rounded-full border border-cyan-500/35 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-200">
+                              LIVE
+                            </span>
+                          ) : null}
+                          {event.sourceKind === "manual" ? (
+                            <button
+                              type="button"
+                              onClick={() => void deleteManualEvent(event)}
+                              disabled={deleteInFlightEventId === event.id}
+                              className="rounded-full border border-red-500/35 bg-red-500/10 p-1 text-red-200 transition hover:bg-red-500/20 disabled:opacity-60"
+                              title="Delete event"
+                            >
+                              {deleteInFlightEventId === event.id ? (
+                                <Loader2 size={12} className="animate-spin" />
+                              ) : (
+                                <Trash2 size={12} />
+                              )}
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      {event.detail ? (
+                        <p className="mt-2 whitespace-pre-wrap text-sm text-slate-200">{event.detail}</p>
+                      ) : null}
+
+                      {event.pathway ? (
+                        <div className="mt-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-2 text-xs text-cyan-100">
+                          Pathway L{event.pathway.line} | {event.pathway.workflowTitle}{" -> "}
+                          {event.pathway.taskTitle} | Owner {event.pathway.ownerRole}
+                        </div>
+                      ) : null}
+
+                      {event.tags.length > 0 ? (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {event.tags.slice(0, 6).map((tag) => (
+                            <span
+                              key={`${event.id}-${tag}`}
+                              className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300"
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))
+                )}
               </div>
             )}
           </div>

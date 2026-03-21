@@ -70,7 +70,7 @@ interface DirectionConsoleProps {
 }
 
 type HistoryFilter = "ALL" | DirectionStatus;
-type DirectionDetailTab = "overview" | "links" | "workflows" | "graph";
+type DirectionDetailTab = "overview" | "links" | "workflows" | "graph" | "scoring";
 
 function buildCircularGraph(autopsy: DirectionAutopsy | null) {
   if (!autopsy) {
@@ -298,6 +298,39 @@ export function DirectionConsole({
       return true;
     });
   }, [dateFilter, flowIdFilter, workflows]);
+  const scoring = useMemo(() => {
+    const workflowCount = filteredWorkflows.length;
+    const averageWorkflowProgress =
+      workflowCount > 0
+        ? Math.round(
+            filteredWorkflows.reduce(
+              (sum, workflow) => sum + Math.max(0, Math.min(100, workflow.progress)),
+              0
+            ) / workflowCount
+          )
+        : 0;
+    const blockedLinks = links.filter((item) => item.relation === "BLOCKS").length;
+    const dependencyLinks = links.filter((item) => item.relation === "DEPENDS_ON").length;
+    const relationQuality = Math.max(0, 100 - blockedLinks * 22 - dependencyLinks * 6);
+    const directionCoverage =
+      (selectedDirection?.summary?.trim().length ? 1 : 0) +
+      (selectedDirection?.direction?.trim().length ? 1 : 0) +
+      (workflowCount > 0 ? 1 : 0) +
+      ((autopsy?.nodes.length ?? 0) > 0 ? 1 : 0);
+    const coverageScore = Math.round((directionCoverage / 4) * 100);
+    const totalScore = Math.round(
+      averageWorkflowProgress * 0.5 + relationQuality * 0.25 + coverageScore * 0.25
+    );
+
+    return {
+      totalScore,
+      averageWorkflowProgress,
+      relationQuality,
+      coverageScore,
+      blockedLinks,
+      dependencyLinks
+    };
+  }, [autopsy?.nodes.length, filteredWorkflows, links, selectedDirection?.direction, selectedDirection?.summary]);
 
   const loadDirections = useCallback(
     async (silent?: boolean) => {
@@ -322,12 +355,6 @@ export function DirectionConsole({
         }
         const loadedDirections = payload.directions;
         setDirections(loadedDirections);
-        const hasSelected = Boolean(
-          selectedDirectionId && loadedDirections.some((item) => item.id === selectedDirectionId)
-        );
-        if (!hasSelected) {
-          setSelectedDirectionId(loadedDirections[0]?.id ?? null);
-        }
       } catch (error) {
         notify({
           title: "Direction",
@@ -339,7 +366,7 @@ export function DirectionConsole({
         setRefreshing(false);
       }
     },
-    [notify, orgId, selectedDirectionId]
+    [notify, orgId]
   );
 
   const loadDirectionDetail = useCallback(
@@ -708,7 +735,8 @@ export function DirectionConsole({
                   { id: "overview", label: "Overview" },
                   { id: "links", label: "Links" },
                   { id: "workflows", label: "Workflows" },
-                  { id: "graph", label: "Graph" }
+                  { id: "graph", label: "Graph" },
+                  { id: "scoring", label: "Scoring" }
                 ] as Array<{ id: DirectionDetailTab; label: string }>).map((tab) => (
                   <button
                     key={tab.id}
@@ -851,6 +879,64 @@ export function DirectionConsole({
                   edges={graph.edges}
                   className="h-[520px]"
                 />
+              ) : null}
+
+              {detailTab === "scoring" ? (
+                <div className="space-y-3">
+                  <div className="grid gap-3 md:grid-cols-4">
+                    <div className="rounded-2xl border border-cyan-500/35 bg-cyan-500/12 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-cyan-200">Overall</p>
+                      <p className="mt-1 text-2xl font-black text-cyan-100">{scoring.totalScore}</p>
+                    </div>
+                    <div className="rounded-2xl border border-emerald-500/35 bg-emerald-500/12 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-emerald-200">Workflow Progress</p>
+                      <p className="mt-1 text-2xl font-black text-emerald-100">
+                        {scoring.averageWorkflowProgress}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl border border-violet-500/35 bg-violet-500/12 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-violet-200">Relation Quality</p>
+                      <p className="mt-1 text-2xl font-black text-violet-100">{scoring.relationQuality}</p>
+                    </div>
+                    <div className="rounded-2xl border border-amber-500/35 bg-amber-500/12 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.14em] text-amber-200">Coverage</p>
+                      <p className="mt-1 text-2xl font-black text-amber-100">{scoring.coverageScore}</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                    <p className="text-xs font-medium text-slate-500">Workflow score breakdown</p>
+                    {filteredWorkflows.length === 0 ? (
+                      <p className="mt-2 text-xs text-slate-500">No workflows available for scoring.</p>
+                    ) : (
+                      <div className="mt-2 space-y-2">
+                        {filteredWorkflows.map((workflow) => (
+                          <div
+                            key={workflow.id}
+                            className="rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-200"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="line-clamp-1">{workflow.prompt}</span>
+                              <span className="rounded-full border border-white/15 bg-black/30 px-2 py-0.5 text-[11px] text-cyan-200">
+                                {Math.max(0, Math.min(100, workflow.progress))}%
+                              </span>
+                            </div>
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Status: {workflow.status} | Tasks: {workflow.taskCount} | Burn:{" "}
+                              {workflow.predictedBurn.toLocaleString()}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/25 p-3 text-xs text-slate-300">
+                    <p>
+                      Link penalties: {scoring.blockedLinks} blocking link(s), {scoring.dependencyLinks} dependency link(s).
+                    </p>
+                  </div>
+                </div>
               ) : null}
             </>
           )}

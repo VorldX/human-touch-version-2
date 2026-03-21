@@ -78,7 +78,8 @@ export async function POST(request: NextRequest) {
     },
     select: {
       id: true,
-      email: true
+      email: true,
+      username: true
     }
   });
 
@@ -92,7 +93,8 @@ export async function POST(request: NextRequest) {
     ok: true,
     user: {
       uid: user.id,
-      email: user.email
+      email: user.email,
+      username: user.username
     }
   });
 

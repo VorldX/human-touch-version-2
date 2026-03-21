@@ -12,6 +12,7 @@ import {
 interface AuthUser {
   uid: string;
   email: string;
+  username?: string;
 }
 
 interface FirebaseAuthContextValue {
@@ -68,7 +69,8 @@ export function FirebaseAuthProvider({
         if (response.ok && payload?.ok && payload.user) {
           setUser({
             uid: payload.user.uid,
-            email: payload.user.email
+            email: payload.user.email,
+            username: payload.user.username
           });
         } else {
           setUser(null);
@@ -116,7 +118,8 @@ export function FirebaseAuthProvider({
 
     setUser({
       uid: payload.user.uid,
-      email: payload.user.email
+      email: payload.user.email,
+      username: payload.user.username
     });
   }, []);
 

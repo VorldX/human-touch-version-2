@@ -10,6 +10,7 @@ import {
   PlayCircle,
   RefreshCw,
   ShieldAlert,
+  Sparkles,
   TerminalSquare,
   X
 } from "lucide-react";
@@ -406,7 +407,7 @@ export function WorkflowConsole({
   const [flowId, setFlowId] = useState<string | null>(null);
   const [detail, setDetail] = useState<FlowDetail | null>(null);
   const [logs, setLogs] = useState<FlowLog[]>([]);
-  const [detailTab, setDetailTab] = useState<"agent" | "human" | "autopsy">("agent");
+  const [detailTab, setDetailTab] = useState<"agent" | "human" | "autopsy" | "scoring">("agent");
   const [taskId, setTaskId] = useState<string>("");
   const [fileUrl, setFileUrl] = useState("");
   const [overridePrompt, setOverridePrompt] = useState("");
@@ -678,6 +679,38 @@ export function WorkflowConsole({
     () => parseIntegrationError(selectedTask?.executionTrace),
     [selectedTask?.executionTrace]
   );
+  const detailScoring = useMemo(() => {
+    const tasks = detail?.tasks ?? [];
+    const totalTasks = tasks.length;
+    const completedTasks = tasks.filter((task) => task.status === "COMPLETED").length;
+    const failedTasks = tasks.filter((task) => task.status === "FAILED" || task.status === "ABORTED").length;
+    const pausedTasks = tasks.filter((task) => task.status === "PAUSED" || task.isPausedForInput).length;
+    const completionScore =
+      totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+    const reliabilityScore =
+      totalTasks > 0 ? Math.max(0, Math.round(100 - (failedTasks / totalTasks) * 100)) : 100;
+    const interventionScore =
+      totalTasks > 0 ? Math.max(0, Math.round(100 - (pausedTasks / totalTasks) * 100)) : 100;
+    const progressScore = detail?.progress ?? 0;
+    const totalScore = Math.round(
+      completionScore * 0.35 +
+      reliabilityScore * 0.25 +
+      interventionScore * 0.2 +
+      progressScore * 0.2
+    );
+
+    return {
+      totalScore,
+      completionScore,
+      reliabilityScore,
+      interventionScore,
+      progressScore,
+      totalTasks,
+      completedTasks,
+      failedTasks,
+      pausedTasks
+    };
+  }, [detail]);
 
   const openIntegrationSetup = useCallback((integrationError: IntegrationErrorTrace) => {
     const target =
@@ -917,10 +950,10 @@ export function WorkflowConsole({
             </div>
 
             <div className="flex items-center gap-2 border-b border-white/10 px-6 py-3">
-              {[{ id: "agent", label: "Agent", icon: Bot }, { id: "human", label: "Human", icon: TerminalSquare }, { id: "autopsy", label: "Autopsy", icon: GitBranchPlus }].map((tab) => (
+              {[{ id: "agent", label: "Agent", icon: Bot }, { id: "human", label: "Human", icon: TerminalSquare }, { id: "autopsy", label: "Autopsy", icon: GitBranchPlus }, { id: "scoring", label: "Scoring", icon: Sparkles }].map((tab) => (
                 <button
                   key={tab.id}
-                  onClick={() => setDetailTab(tab.id as "agent" | "human" | "autopsy")}
+                  onClick={() => setDetailTab(tab.id as "agent" | "human" | "autopsy" | "scoring")}
                   className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold ${
                     detailTab === tab.id
                       ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
@@ -1193,6 +1226,85 @@ export function WorkflowConsole({
                             </div>
                           ))
                         )}
+                      </div>
+                    </div>
+                  )}
+
+                  {detailTab === "scoring" && (
+                    <div className="space-y-3">
+                      <div className="grid gap-3 md:grid-cols-5">
+                        <Stat label="Overall" value={`${detailScoring.totalScore}`} className="text-cyan-200" />
+                        <Stat label="Completion" value={`${detailScoring.completionScore}`} className="text-emerald-200" />
+                        <Stat label="Reliability" value={`${detailScoring.reliabilityScore}`} className="text-violet-200" />
+                        <Stat label="Intervention" value={`${detailScoring.interventionScore}`} className="text-amber-200" />
+                        <Stat label="Progress" value={`${detailScoring.progressScore}`} className="text-sky-200" />
+                      </div>
+
+                      <div className="grid gap-3 md:grid-cols-4">
+                        <div className="rounded-xl border border-white/10 bg-black/25 p-3">
+                          <p className="text-xs text-slate-500">Tasks total</p>
+                          <p className="mt-1 text-lg font-bold text-slate-100">{detailScoring.totalTasks}</p>
+                        </div>
+                        <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3">
+                          <p className="text-xs text-emerald-200">Completed</p>
+                          <p className="mt-1 text-lg font-bold text-emerald-100">{detailScoring.completedTasks}</p>
+                        </div>
+                        <div className="rounded-xl border border-red-500/35 bg-red-500/10 p-3">
+                          <p className="text-xs text-red-200">Failed/aborted</p>
+                          <p className="mt-1 text-lg font-bold text-red-100">{detailScoring.failedTasks}</p>
+                        </div>
+                        <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3">
+                          <p className="text-xs text-amber-200">Paused / human touch</p>
+                          <p className="mt-1 text-lg font-bold text-amber-100">{detailScoring.pausedTasks}</p>
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                        <p className="text-xs font-medium text-slate-500">Task scoring detail</p>
+                        <div className="mt-2 space-y-2">
+                          {detail.tasks.map((task) => {
+                            const integrationError = parseIntegrationError(task.executionTrace);
+                            const runtime = parseAgentRuntime(task.executionTrace);
+                            const taskScoreBase =
+                              task.status === "COMPLETED"
+                                ? 100
+                                : task.status === "RUNNING"
+                                  ? 70
+                                  : task.status === "QUEUED"
+                                    ? 45
+                                    : task.status === "PAUSED"
+                                      ? 35
+                                      : 15;
+                            const taskScore = Math.max(
+                              0,
+                              Math.min(
+                                100,
+                                taskScoreBase -
+                                  (task.isPausedForInput ? 10 : 0) -
+                                  (integrationError ? 20 : 0)
+                              )
+                            );
+                            return (
+                              <div
+                                key={task.id}
+                                className="rounded-xl border border-white/10 bg-black/25 px-3 py-2"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <p className="text-xs text-slate-100">{task.prompt}</p>
+                                  <span className="rounded-full border border-cyan-500/35 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-semibold text-cyan-200">
+                                    Score {taskScore}
+                                  </span>
+                                </div>
+                                <p className="mt-1 text-[11px] text-slate-500">
+                                  Status: {task.status}
+                                  {runtime?.logicalRole ? ` | Role: ${runtime.logicalRole}` : ""}
+                                  {task.isPausedForInput ? " | Human input pending" : ""}
+                                  {integrationError ? ` | ${integrationError.toolkit} not connected` : ""}
+                                </p>
+                              </div>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   )}

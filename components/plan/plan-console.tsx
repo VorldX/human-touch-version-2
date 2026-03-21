@@ -174,7 +174,7 @@ interface ExecutionPlanView {
   detailScore: number;
 }
 
-interface PlanStepView extends PlanTaskView {
+interface PlanTaskDetailView extends PlanTaskView {
   workflowTitle: string;
 }
 
@@ -364,7 +364,7 @@ function normalizeExecutionPlan(value: Record<string, unknown> | null): Executio
   };
 }
 
-function flattenPlanSteps(plan: ExecutionPlanView): PlanStepView[] {
+function flattenPlanTasks(plan: ExecutionPlanView): PlanTaskDetailView[] {
   return plan.workflows.flatMap((workflow) =>
     workflow.tasks.map((task) => ({
       ...task,
@@ -470,23 +470,13 @@ export function PlanConsole({
       ),
     [parsedFallbackDraft, selectedPlan]
   );
-  const primarySteps = useMemo(() => flattenPlanSteps(primaryPlanView), [primaryPlanView]);
-  const fallbackSteps = useMemo(() => flattenPlanSteps(fallbackPlanView), [fallbackPlanView]);
+  const primaryTasks = useMemo(() => flattenPlanTasks(primaryPlanView), [primaryPlanView]);
+  const fallbackTasks = useMemo(() => flattenPlanTasks(fallbackPlanView), [fallbackPlanView]);
   const activePlanView = planViewTab === "primary" ? primaryPlanView : fallbackPlanView;
-  const activeSteps = planViewTab === "primary" ? primarySteps : fallbackSteps;
+  const activeTasks = planViewTab === "primary" ? primaryTasks : fallbackTasks;
   const activeWorkflow =
     activePlanView.workflows[Math.max(0, Math.min(selectedWorkflowIndex, activePlanView.workflows.length - 1))] ??
     null;
-  const focusedSteps = useMemo(
-    () =>
-      activeWorkflow
-        ? activeWorkflow.tasks.map((task) => ({
-            ...task,
-            workflowTitle: activeWorkflow.title
-          }))
-        : activeSteps,
-    [activeSteps, activeWorkflow]
-  );
 
   const loadPlans = useCallback(
     async (silent?: boolean) => {
@@ -628,18 +618,18 @@ export function PlanConsole({
   );
 
   const primaryApprovalCount = useMemo(
-    () => primarySteps.filter((step) => step.requiresApproval).length,
-    [primarySteps]
+    () => primaryTasks.filter((task) => task.requiresApproval).length,
+    [primaryTasks]
   );
   const fallbackApprovalCount = useMemo(
-    () => fallbackSteps.filter((step) => step.requiresApproval).length,
-    [fallbackSteps]
+    () => fallbackTasks.filter((task) => task.requiresApproval).length,
+    [fallbackTasks]
   );
   const activeApprovalCount = planViewTab === "primary" ? primaryApprovalCount : fallbackApprovalCount;
   const activeToolCount = useMemo(() => {
     const tools = new Set<string>();
-    activeSteps.forEach((step) => {
-      step.tools.forEach((tool) => {
+    activeTasks.forEach((task) => {
+      task.tools.forEach((tool) => {
         if (tool.trim()) tools.add(tool.trim().toLowerCase());
       });
     });
@@ -649,7 +639,7 @@ export function PlanConsole({
       });
     });
     return tools.size;
-  }, [activePlanView.workflows, activeSteps]);
+  }, [activePlanView.workflows, activeTasks]);
   const activeWorkflowCount = activePlanView.workflows.length;
   const activeRiskCount = activePlanView.risks.length;
   const activeMetricCount = activePlanView.successMetrics.length;
@@ -665,12 +655,12 @@ export function PlanConsole({
         string,
         {
           primaryWorkflowCount: number;
-          primaryStepCount: number;
+          primaryTaskCount: number;
           primaryApprovalCount: number;
           primaryDetailScore: number;
           primaryPathwayCount: number;
           fallbackWorkflowCount: number;
-          fallbackStepCount: number;
+          fallbackTaskCount: number;
           fallbackDetailScore: number;
           fallbackPathwayCount: number;
         }
@@ -678,16 +668,16 @@ export function PlanConsole({
     >((accumulator, item) => {
       const primary = normalizeExecutionPlan(item.primaryPlan as Record<string, unknown>);
       const fallback = normalizeExecutionPlan(item.fallbackPlan as Record<string, unknown>);
-      const primaryPlanSteps = flattenPlanSteps(primary);
-      const fallbackPlanSteps = flattenPlanSteps(fallback);
+      const primaryPlanTasks = flattenPlanTasks(primary);
+      const fallbackPlanTasks = flattenPlanTasks(fallback);
       accumulator[item.id] = {
         primaryWorkflowCount: primary.workflows.length,
-        primaryStepCount: primaryPlanSteps.length,
-        primaryApprovalCount: primaryPlanSteps.filter((step) => step.requiresApproval).length,
+        primaryTaskCount: primaryPlanTasks.length,
+        primaryApprovalCount: primaryPlanTasks.filter((task) => task.requiresApproval).length,
         primaryDetailScore: primary.detailScore,
         primaryPathwayCount: primary.pathway.length,
         fallbackWorkflowCount: fallback.workflows.length,
-        fallbackStepCount: fallbackPlanSteps.length,
+        fallbackTaskCount: fallbackPlanTasks.length,
         fallbackDetailScore: fallback.detailScore,
         fallbackPathwayCount: fallback.pathway.length
       };
@@ -822,14 +812,14 @@ export function PlanConsole({
                         </p>
                         <div className="grid grid-cols-2 gap-1 text-[10px]">
                           <span className="rounded-lg border border-cyan-500/35 bg-cyan-500/12 px-1.5 py-1 text-cyan-100">
-                            Primary: {insight.primaryWorkflowCount} wf / {insight.primaryStepCount} steps
+                            Primary: {insight.primaryWorkflowCount} wf / {insight.primaryTaskCount} tasks
                           </span>
                           <span className="rounded-lg border border-amber-500/35 bg-amber-500/12 px-1.5 py-1 text-amber-100">
-                            Fallback: {insight.fallbackWorkflowCount} wf / {insight.fallbackStepCount} steps
+                            Fallback: {insight.fallbackWorkflowCount} wf / {insight.fallbackTaskCount} tasks
                           </span>
                         </div>
                         <p className="text-[10px] text-slate-400">
-                          Pathway steps:{" "}
+                          Pathway:{" "}
                           <span className="font-semibold text-cyan-100">{insight.primaryPathwayCount}</span>
                           {" / "}
                           <span className="font-semibold text-amber-100">{insight.fallbackPathwayCount}</span>
@@ -963,9 +953,9 @@ export function PlanConsole({
                 <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-3">
                   <p className="inline-flex items-center gap-2 text-[11px] text-emerald-200">
                     <WorkflowIcon size={12} />
-                    Steps
+                    Tasks
                   </p>
-                  <p className="mt-2 text-2xl font-black text-emerald-100">{activeSteps.length}</p>
+                  <p className="mt-2 text-2xl font-black text-emerald-100">{activeTasks.length}</p>
                 </div>
                 <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-3">
                   <p className="inline-flex items-center gap-2 text-[11px] text-amber-200">
@@ -1015,7 +1005,7 @@ export function PlanConsole({
                         : "text-slate-300 hover:bg-white/10"
                     }`}
                   >
-                    Primary ({primarySteps.length})
+                    Primary ({primaryTasks.length})
                   </button>
                   <button
                     type="button"
@@ -1026,7 +1016,7 @@ export function PlanConsole({
                         : "text-slate-300 hover:bg-white/10"
                     }`}
                   >
-                    Fallback ({fallbackSteps.length})
+                    Fallback ({fallbackTasks.length})
                   </button>
                 </div>
 
@@ -1047,7 +1037,7 @@ export function PlanConsole({
                         {planViewTab === "primary" ? "Primary execution plan" : "Fallback execution plan"}
                       </p>
                       <p className="text-[11px] text-slate-400">
-                        {activeWorkflowCount} workflows, {activeSteps.length} total steps, {activeToolCount} tool tags
+                        {activeWorkflowCount} workflows, {activeTasks.length} total tasks, {activeToolCount} tool tags
                       </p>
                     </div>
                     <span
@@ -1057,7 +1047,7 @@ export function PlanConsole({
                           : "border border-amber-500/35 bg-amber-500/12 text-amber-100"
                       }`}
                     >
-                      {focusedSteps.length} shown
+                      {activeWorkflow ? `${activeWorkflow.tasks.length} tasks in focus` : `${activeTasks.length} tasks in view`}
                     </span>
                   </div>
 
@@ -1173,7 +1163,7 @@ export function PlanConsole({
 
                   <div className="rounded-xl border border-white/10 bg-black/30 p-3">
                     <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
-                      Pathway Sequence ({activePathwayCount})
+                    Pathway ({activePathwayCount})
                     </p>
                     {activePlanView.pathway.length > 0 ? (
                       <ol className="mt-2 space-y-2">
@@ -1203,7 +1193,7 @@ export function PlanConsole({
                       </ol>
                     ) : (
                       <p className="mt-2 text-xs text-slate-500">
-                        No pathway sequence available in this plan view.
+                        No pathway mapped for this plan view.
                       </p>
                     )}
                   </div>
@@ -1282,73 +1272,48 @@ export function PlanConsole({
                               Tools: {activeWorkflow.tools.join(", ")}
                             </p>
                           ) : null}
+                          {activeWorkflow.tasks.length > 0 ? (
+                            <div className="mt-3 rounded-lg border border-white/10 bg-black/25 p-2">
+                              <p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">
+                                Tasks ({activeWorkflow.tasks.length})
+                              </p>
+                              <ul className="mt-2 space-y-2">
+                                {activeWorkflow.tasks.map((task, taskIndex) => (
+                                  <li
+                                    key={`${planViewTab}-workflow-${selectedWorkflowIndex}-task-${taskIndex}`}
+                                    className="rounded-lg border border-white/10 bg-black/20 p-2"
+                                  >
+                                    <div className="flex flex-wrap items-start justify-between gap-2">
+                                      <p className="text-sm font-semibold text-white">{task.title}</p>
+                                      <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
+                                        {task.ownerRole}
+                                      </span>
+                                    </div>
+                                    {task.subtasks.length > 0 ? (
+                                      <p className="mt-1 text-[11px] text-slate-400">
+                                        Subtasks: {task.subtasks.join(" | ")}
+                                      </p>
+                                    ) : null}
+                                    {task.tools.length > 0 ? (
+                                      <p className="mt-1 text-[11px] text-slate-500">
+                                        Tools: {task.tools.join(", ")}
+                                      </p>
+                                    ) : null}
+                                    {task.requiresApproval ? (
+                                      <p className="mt-1 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-100">
+                                        Approval: {task.approvalRole}
+                                        {task.approvalReason ? ` | ${task.approvalReason}` : ""}
+                                      </p>
+                                    ) : null}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          ) : null}
                         </div>
                       ) : null}
                     </div>
                   ) : null}
-
-                  {focusedSteps.length === 0 ? (
-                    <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-400">
-                      {planViewTab === "primary"
-                        ? "No ordered steps available in primary plan JSON."
-                        : "No ordered fallback steps available."}
-                    </p>
-                  ) : (
-                    <ol className="space-y-3">
-                      {focusedSteps.map((step, index) => (
-                        <li
-                          key={`${planViewTab}-step-${index}`}
-                          className="rounded-2xl border border-white/10 bg-black/25 p-3"
-                        >
-                          <div className="flex flex-wrap items-start justify-between gap-2">
-                            <p className="inline-flex items-center gap-2 text-[11px] text-slate-500">
-                              <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-white/15 bg-black/30 text-[10px] font-semibold text-slate-300">
-                                {index + 1}
-                              </span>
-                              {step.workflowTitle}
-                            </p>
-                            <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
-                              Agent: {step.ownerRole}
-                            </span>
-                          </div>
-
-                          <p className="mt-2 text-sm font-semibold text-white">{step.title}</p>
-
-                          {step.subtasks.length > 0 ? (
-                            <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-slate-300">
-                              {step.subtasks.map((subtask, subtaskIndex) => (
-                                <li key={`${planViewTab}-step-${index}-subtask-${subtaskIndex}`}>{subtask}</li>
-                              ))}
-                            </ul>
-                          ) : null}
-
-                          {step.tools.length > 0 ? (
-                            <div className="mt-2 flex flex-wrap gap-1.5">
-                              {step.tools.map((tool, toolIndex) => (
-                                <span
-                                  key={`${planViewTab}-step-${index}-tool-${toolIndex}`}
-                                  className={`rounded-full border px-2 py-0.5 text-[11px] ${
-                                    planViewTab === "primary"
-                                      ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-100"
-                                      : "border-amber-500/30 bg-amber-500/10 text-amber-100"
-                                  }`}
-                                >
-                                  {tool}
-                                </span>
-                              ))}
-                            </div>
-                          ) : null}
-
-                          {step.requiresApproval ? (
-                            <p className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-100">
-                              Approval: {step.approvalRole}
-                              {step.approvalReason ? ` | ${step.approvalReason}` : ""}
-                            </p>
-                          ) : null}
-                        </li>
-                      ))}
-                    </ol>
-                  )}
 
                   {activeRiskCount > 0 ? (
                     <div className="rounded-xl border border-red-500/25 bg-red-500/8 p-3">

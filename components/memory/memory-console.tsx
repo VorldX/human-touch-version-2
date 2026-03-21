@@ -390,7 +390,9 @@ export function MemoryConsole({
     <div className="mx-auto max-w-[1280px] space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
         <div>
-          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">Memory</h2>
+          <h2 className="font-display text-3xl font-black uppercase tracking-tight md:text-4xl">
+            Audit Ledger
+          </h2>
           <p className="text-[10px] uppercase tracking-[0.3em] text-slate-500">
             System Ledger + Archived Missions
           </p>
