@@ -31,6 +31,7 @@ import {
   type EarthProfileRole,
   useVorldXStore
 } from "@/lib/store/vorldx-store";
+import { ControlCollaborationPanel } from "@/components/vorldx-shell/surfaces/control-collaboration-panel";
 
 type PersonnelType = "HUMAN" | "AI";
 type PersonnelStatus = "IDLE" | "ACTIVE" | "PAUSED" | "DISABLED" | "RENTED";
@@ -755,6 +756,10 @@ export function SquadConsole({
     pricingFloor: "0.002"
   });
   const isEarthWorkspace = !orgId;
+  const currentOrgContext = useMemo(
+    () => (orgId ? orgs.find((item) => item.id === orgId) ?? null : null),
+    [orgId, orgs]
+  );
   const isAiRecruit = form.type === "AI";
   const earthProfileDraftControlLevel = normalizeEarthControlLevel(earthProfileDraft.aiControlLevel);
   const earthProfileDraftType = earthProfileTypeFromControlLevel(earthProfileDraftControlLevel);
@@ -2208,103 +2213,6 @@ export function SquadConsole({
         </div>
       )}
 
-      {orgId && canReviewJoinRequests && (
-        <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
-              Organization Join Requests
-            </p>
-            <span
-              className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}
-            >
-              {joinRequests.length} Pending
-            </span>
-          </div>
-
-          {joinRequestsError && (
-            <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-              {joinRequestsError}
-            </div>
-          )}
-
-          {joinRequests.length === 0 ? (
-            <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-xs text-slate-500">
-              No pending requests right now.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {joinRequests.map((item) => (
-                <div
-                  key={item.id}
-                  className="rounded-2xl border border-white/10 bg-black/25 p-3"
-                >
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <p className="text-sm font-semibold text-slate-100">
-                        {item.requesterName || item.requesterEmail}
-                      </p>
-                      <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">
-                        {item.requesterEmail} | Requested {item.requestedRole} |{" "}
-                        {new Date(item.createdAt).toLocaleString()}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={requestRoleDrafts[item.id] ?? item.requestedRole}
-                        onChange={(event) =>
-                          setRequestRoleDrafts((prev) => ({
-                            ...prev,
-                            [item.id]: event.target.value as JoinRequestRole
-                          }))
-                        }
-                        className="rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-xs text-slate-100 outline-none"
-                      >
-                        <option value="EMPLOYEE">EMPLOYEE</option>
-                        <option value="ADMIN">ADMIN</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {item.message ? (
-                    <p className="mt-2 text-xs text-slate-300">{item.message}</p>
-                  ) : (
-                    <p className="mt-2 text-xs text-slate-500">No message provided.</p>
-                  )}
-
-                  <div className="mt-2 grid gap-2 md:grid-cols-[1fr_auto_auto]">
-                    <input
-                      value={requestNoteDrafts[item.id] ?? ""}
-                      onChange={(event) =>
-                        setRequestNoteDrafts((prev) => ({
-                          ...prev,
-                          [item.id]: event.target.value
-                        }))
-                      }
-                      placeholder="Optional decision note"
-                      className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs text-slate-100 outline-none"
-                    />
-                    <button
-                      onClick={() => void handleJoinRequestDecision(item, "APPROVE")}
-                      disabled={actingRequestId === item.id}
-                      className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
-                    >
-                      {actingRequestId === item.id ? "Working..." : "Approve"}
-                    </button>
-                    <button
-                      onClick={() => void handleJoinRequestDecision(item, "REJECT")}
-                      disabled={actingRequestId === item.id}
-                      className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-black/20 p-2">
         {([
           { id: "ROSTER", label: "Roster", icon: ShieldCheck },
@@ -2371,137 +2279,146 @@ export function SquadConsole({
             "Monitor which Earth profiles are live, what levels they were hired into, and where they are currently deployed."
           )
         ) : (
-        <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
-          <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
-                Team Builder
-              </p>
-              <span className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}>
-                Workforce + AI
-              </span>
-            </div>
-            <div className="grid gap-3 md:grid-cols-2">
-              <label className="space-y-1">
-                <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Team Name</span>
-                <input
-                  value={teamNameDraft}
-                  onChange={(event) => setTeamNameDraft(event.target.value)}
-                  placeholder="Execution pod alpha"
-                  className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Objective</span>
-                <input
-                  value={teamObjectiveDraft}
-                  onChange={(event) => setTeamObjectiveDraft(event.target.value)}
-                  placeholder="Ship onboarding automation"
-                  className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                />
-              </label>
-            </div>
+          <div className="space-y-4">
+            <ControlCollaborationPanel
+              orgId={orgId}
+              orgName={currentOrgContext?.name ?? "Organization"}
+              orgRoleLabel={currentOrgContext?.role ?? "Member"}
+              showStringSections={false}
+            />
 
-            <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
-              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Select Members</p>
-              {personnel.length === 0 ? (
-                <p className="mt-2 text-xs text-slate-500">No workforce members available yet.</p>
-              ) : (
-                <div className="mt-2 grid gap-2 md:grid-cols-2">
-                  {personnel.map((member) => {
-                    const selected = teamMemberDraftIds.includes(member.id);
-                    return (
-                      <button
-                        key={member.id}
-                        type="button"
-                        onClick={() => toggleTeamMemberDraft(member.id)}
-                        className={`rounded-xl border px-3 py-2 text-left transition ${
-                          selected
-                            ? "border-emerald-500/40 bg-emerald-500/12"
-                            : "border-white/10 bg-black/35 hover:bg-white/5"
-                        }`}
-                      >
-                        <p className="text-xs font-semibold text-slate-100">{member.name}</p>
-                        <p className="text-[10px] uppercase tracking-[0.12em] text-slate-500">
-                          {member.type} | {member.role}
-                        </p>
-                      </button>
-                    );
-                  })}
+            <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+              <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                    Team Builder
+                  </p>
+                  <span className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}>
+                    Workforce + AI
+                  </span>
                 </div>
-              )}
-            </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Team Name</span>
+                    <input
+                      value={teamNameDraft}
+                      onChange={(event) => setTeamNameDraft(event.target.value)}
+                      placeholder="Execution pod alpha"
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Objective</span>
+                    <input
+                      value={teamObjectiveDraft}
+                      onChange={(event) => setTeamObjectiveDraft(event.target.value)}
+                      placeholder="Ship onboarding automation"
+                      className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
+                    />
+                  </label>
+                </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-[11px] text-slate-400">
-                {teamMemberDraftIds.length} member{teamMemberDraftIds.length === 1 ? "" : "s"} selected
-              </p>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={resetTeamDraft}
-                  className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-200"
-                >
-                  Reset
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCreateTeam}
-                  className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-emerald-200 transition hover:bg-emerald-500/25"
-                >
-                  <PlusCircle size={12} />
-                  Create Team
-                </button>
-              </div>
-            </div>
-          </div>
+                <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Select Members</p>
+                  {personnel.length === 0 ? (
+                    <p className="mt-2 text-xs text-slate-500">No workforce members available yet.</p>
+                  ) : (
+                    <div className="mt-2 grid gap-2 md:grid-cols-2">
+                      {personnel.map((member) => {
+                        const selected = teamMemberDraftIds.includes(member.id);
+                        return (
+                          <button
+                            key={member.id}
+                            type="button"
+                            onClick={() => toggleTeamMemberDraft(member.id)}
+                            className={`rounded-xl border px-3 py-2 text-left transition ${
+                              selected
+                                ? "border-emerald-500/40 bg-emerald-500/12"
+                                : "border-white/10 bg-black/35 hover:bg-white/5"
+                            }`}
+                          >
+                            <p className="text-xs font-semibold text-slate-100">{member.name}</p>
+                            <p className="text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                              {member.type} | {member.role}
+                            </p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
 
-          <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-            <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
-              Active Teams
-            </p>
-            {teams.length === 0 ? (
-              <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs text-slate-500">
-                No teams created yet. Start with Team Builder.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {teams.map((team) => (
-                  <div key={team.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-100">{team.name}</p>
-                        <p className="text-[10px] uppercase tracking-[0.12em] text-slate-500">
-                          {new Date(team.createdAt).toLocaleString()}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveTeam(team.id)}
-                        className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
-                      >
-                        Remove
-                      </button>
-                    </div>
-                    {team.objective ? (
-                      <p className="mt-2 text-xs text-slate-300">{team.objective}</p>
-                    ) : null}
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {team.memberIds.map((memberId) => (
-                        <span
-                          key={`${team.id}-${memberId}`}
-                          className="rounded-full border border-white/20 bg-white/5 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-slate-200"
-                        >
-                          {memberLabelById.get(memberId) ?? memberId}
-                        </span>
-                      ))}
-                    </div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-[11px] text-slate-400">
+                    {teamMemberDraftIds.length} member{teamMemberDraftIds.length === 1 ? "" : "s"} selected
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={resetTeamDraft}
+                      className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-200"
+                    >
+                      Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCreateTeam}
+                      className="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-emerald-200 transition hover:bg-emerald-500/25"
+                    >
+                      <PlusCircle size={12} />
+                      Create Team
+                    </button>
                   </div>
-                ))}
+                </div>
               </div>
-            )}
+
+              <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                  Active Teams
+                </p>
+                {teams.length === 0 ? (
+                  <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs text-slate-500">
+                    No teams created yet. Start with Team Builder.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {teams.map((team) => (
+                      <div key={team.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-100">{team.name}</p>
+                            <p className="text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                              {new Date(team.createdAt).toLocaleString()}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveTeam(team.id)}
+                            className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                        {team.objective ? (
+                          <p className="mt-2 text-xs text-slate-300">{team.objective}</p>
+                        ) : null}
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {team.memberIds.map((memberId) => (
+                            <span
+                              key={`${team.id}-${memberId}`}
+                              className="rounded-full border border-white/20 bg-white/5 px-2 py-1 text-[10px] uppercase tracking-[0.12em] text-slate-200"
+                            >
+                              {memberLabelById.get(memberId) ?? memberId}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
-        </div>
         )
       ) : null}
 

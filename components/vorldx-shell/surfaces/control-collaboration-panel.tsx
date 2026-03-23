@@ -232,64 +232,72 @@ function sortedUnique(items: string[]) {
   return [...new Set(items.filter(Boolean))].sort((left, right) => left.localeCompare(right));
 }
 
+function noop() {}
+
+function noopSelectThread(_threadId: string) {}
+
+function noopDecision(_id: string, _decision: "APPROVE" | "REJECT") {}
+
 export function ControlCollaborationPanel({
   orgId,
   orgName,
   orgRoleLabel,
-  stringItem,
-  isActiveStringThread,
-  isApprovalBusy,
-  permissionRequests,
-  approvalCheckpoints,
-  activeStringPermissionRequests,
-  activeStringApprovalCheckpoints,
-  activeStringResourcePlan,
-  activeStringAutoSquad,
-  permissionRequestActionId,
-  approvalCheckpointActionId,
-  onSelectThread,
-  onApprovePlanLaunch,
-  onRejectPlanLaunch,
-  onApproveEmailDraft,
-  onRejectEmailDraft,
-  onApproveToolkitAccess,
-  onRejectToolkitAccess,
-  onPermissionRequestDecision,
-  onApprovalCheckpointDecision
+  showStringSections = true,
+  stringItem = null,
+  isActiveStringThread = true,
+  isApprovalBusy = false,
+  permissionRequests = [],
+  approvalCheckpoints = [],
+  activeStringPermissionRequests = [],
+  activeStringApprovalCheckpoints = [],
+  activeStringResourcePlan = [],
+  activeStringAutoSquad = null,
+  permissionRequestActionId = null,
+  approvalCheckpointActionId = null,
+  onSelectThread = noopSelectThread,
+  onApprovePlanLaunch = noop,
+  onRejectPlanLaunch = noop,
+  onApproveEmailDraft = noop,
+  onRejectEmailDraft = noop,
+  onApproveToolkitAccess = noop,
+  onRejectToolkitAccess = noop,
+  onPermissionRequestDecision = noopDecision,
+  onApprovalCheckpointDecision = noopDecision
 }: {
   orgId: string | null;
   orgName: string;
   orgRoleLabel: string;
-  stringItem: ControlThreadHistoryItem;
-  isActiveStringThread: boolean;
-  isApprovalBusy: boolean;
-  permissionRequests: PermissionRequestItem[];
-  approvalCheckpoints: ApprovalCheckpointItem[];
-  activeStringPermissionRequests: PermissionRequestItem[];
-  activeStringApprovalCheckpoints: ApprovalCheckpointItem[];
-  activeStringResourcePlan: Array<{
+  showStringSections?: boolean;
+  stringItem?: ControlThreadHistoryItem | null;
+  isActiveStringThread?: boolean;
+  isApprovalBusy?: boolean;
+  permissionRequests?: PermissionRequestItem[];
+  approvalCheckpoints?: ApprovalCheckpointItem[];
+  activeStringPermissionRequests?: PermissionRequestItem[];
+  activeStringApprovalCheckpoints?: ApprovalCheckpointItem[];
+  activeStringResourcePlan?: Array<{
     workforceType: "HUMAN" | "AGENT" | "HYBRID";
     role: string;
     responsibility: string;
     capacityPct: number;
     tools: string[];
   }>;
-  activeStringAutoSquad: {
+  activeStringAutoSquad?: {
     triggered?: boolean;
     requestedRoles?: string[];
     created?: Array<{ id: string; name: string; role: string }>;
   } | null;
-  permissionRequestActionId: string | null;
-  approvalCheckpointActionId: string | null;
-  onSelectThread: (threadId: string) => void;
-  onApprovePlanLaunch: () => void;
-  onRejectPlanLaunch: () => void;
-  onApproveEmailDraft: () => void;
-  onRejectEmailDraft: () => void;
-  onApproveToolkitAccess: () => void;
-  onRejectToolkitAccess: () => void;
-  onPermissionRequestDecision: (requestId: string, decision: "APPROVE" | "REJECT") => void;
-  onApprovalCheckpointDecision: (
+  permissionRequestActionId?: string | null;
+  approvalCheckpointActionId?: string | null;
+  onSelectThread?: (threadId: string) => void;
+  onApprovePlanLaunch?: () => void;
+  onRejectPlanLaunch?: () => void;
+  onApproveEmailDraft?: () => void;
+  onRejectEmailDraft?: () => void;
+  onApproveToolkitAccess?: () => void;
+  onRejectToolkitAccess?: () => void;
+  onPermissionRequestDecision?: (requestId: string, decision: "APPROVE" | "REJECT") => void;
+  onApprovalCheckpointDecision?: (
     checkpointId: string,
     decision: "APPROVE" | "REJECT"
   ) => void;
@@ -326,12 +334,18 @@ export function ControlCollaborationPanel({
   const canManageMembers = actor?.isAdmin ?? false;
   const pendingJoinRequests = joinRequests.filter((request) => request.status === "PENDING");
   const orgPendingPermissionCount = useMemo(
-    () => permissionRequests.filter((request) => request.status === "PENDING").length,
-    [permissionRequests]
+    () =>
+      showStringSections
+        ? permissionRequests.filter((request) => request.status === "PENDING").length
+        : 0,
+    [permissionRequests, showStringSections]
   );
   const orgPendingCheckpointCount = useMemo(
-    () => approvalCheckpoints.filter((checkpoint) => checkpoint.status === "PENDING").length,
-    [approvalCheckpoints]
+    () =>
+      showStringSections
+        ? approvalCheckpoints.filter((checkpoint) => checkpoint.status === "PENDING").length
+        : 0,
+    [approvalCheckpoints, showStringSections]
   );
   const actorMembership = useMemo(
     () => members.find((member) => member.userId === actor?.userId) ?? null,
@@ -349,9 +363,11 @@ export function ControlCollaborationPanel({
     [activeTeamDraft, actor?.activeTeamId, teams]
   );
   const pendingStringCards =
-    Number(Boolean(stringItem.pendingPlanLaunchApproval)) +
-    Number(Boolean(stringItem.pendingToolkitApproval)) +
-    Number(Boolean(stringItem.pendingEmailApproval));
+    showStringSections && stringItem
+      ? Number(Boolean(stringItem.pendingPlanLaunchApproval)) +
+        Number(Boolean(stringItem.pendingToolkitApproval)) +
+        Number(Boolean(stringItem.pendingEmailApproval))
+      : 0;
 
   const loadCollaboration = useCallback(
     async (silent?: boolean) => {
@@ -803,7 +819,7 @@ export function ControlCollaborationPanel({
 
   return (
     <div className="space-y-3">
-      {!isActiveStringThread ? (
+      {showStringSections && stringItem && !isActiveStringThread ? (
         <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-2">
           <p className="text-xs text-amber-200">
             This string is in read-only monitor mode. Make it active to approve or reject
@@ -853,7 +869,11 @@ export function ControlCollaborationPanel({
         </button>
       </div>
 
-      <div className="grid gap-2 md:grid-cols-6">
+      <div
+        className={`grid gap-2 ${
+          showStringSections ? "md:grid-cols-6" : "md:grid-cols-5"
+        }`}
+      >
         <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
           <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Organization</p>
           <p className="mt-1 text-sm font-semibold text-slate-100">{orgName}</p>
@@ -888,115 +908,121 @@ export function ControlCollaborationPanel({
             {pendingJoinRequests.length + orgPendingPermissionCount + orgPendingCheckpointCount}
           </p>
           <p className="mt-1 text-[11px] text-slate-500">
-            {pendingJoinRequests.length} join | {orgPendingPermissionCount} request
+            {showStringSections
+              ? `${pendingJoinRequests.length} join | ${orgPendingPermissionCount} request`
+              : `${pendingJoinRequests.length} join request(s)`}
           </p>
         </article>
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">String Queue</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">{pendingStringCards}</p>
-          <p className="mt-1 text-[11px] text-slate-500">
-            {activeStringPermissionRequests.length} request |{" "}
-            {activeStringApprovalCheckpoints.length} checkpoint
-          </p>
-        </article>
+        {showStringSections ? (
+          <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
+            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">String Queue</p>
+            <p className="mt-1 text-sm font-semibold text-slate-100">{pendingStringCards}</p>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {activeStringPermissionRequests.length} request |{" "}
+              {activeStringApprovalCheckpoints.length} checkpoint
+            </p>
+          </article>
+        ) : null}
       </div>
 
       <div className="grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
         <div className="space-y-3">
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                String Action Queue
-              </p>
-              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
-                {pendingStringCards} pending
-              </span>
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              {stringItem.pendingPlanLaunchApproval ? (
-                <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 text-[11px] text-cyan-100">
-                  Plan Launch Pending
-                </div>
-              ) : null}
-              {stringItem.pendingToolkitApproval ? (
-                <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-100">
-                  Toolkit Access Pending
-                </div>
-              ) : null}
-              {stringItem.pendingEmailApproval ? (
-                <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] text-emerald-100">
-                  Email Approval Pending
-                </div>
-              ) : null}
-              {pendingStringCards === 0 ? (
-                <p className="text-xs text-slate-500">No pending approval cards.</p>
-              ) : null}
-            </div>
-            {isActiveStringThread ? (
-              <div className="mt-3 flex flex-wrap items-center gap-2">
+          {showStringSections && stringItem ? (
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  String Action Queue
+                </p>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
+                  {pendingStringCards} pending
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
                 {stringItem.pendingPlanLaunchApproval ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={onApprovePlanLaunch}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
-                    >
-                      Approve Plan Launch
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onRejectPlanLaunch}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
-                    >
-                      Reject Plan Launch
-                    </button>
-                  </>
+                  <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1 text-[11px] text-cyan-100">
+                    Plan Launch Pending
+                  </div>
                 ) : null}
                 {stringItem.pendingToolkitApproval ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={onApproveToolkitAccess}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
-                    >
-                      Approve Toolkit
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onRejectToolkitAccess}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
-                    >
-                      Reject Toolkit
-                    </button>
-                  </>
+                  <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-100">
+                    Toolkit Access Pending
+                  </div>
                 ) : null}
                 {stringItem.pendingEmailApproval ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={onApproveEmailDraft}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
-                    >
-                      Approve Email
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onRejectEmailDraft}
-                      disabled={isApprovalBusy}
-                      className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
-                    >
-                      Reject Email
-                    </button>
-                  </>
+                  <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] text-emerald-100">
+                    Email Approval Pending
+                  </div>
+                ) : null}
+                {pendingStringCards === 0 ? (
+                  <p className="text-xs text-slate-500">No pending approval cards.</p>
                 ) : null}
               </div>
-            ) : null}
-          </div>
+              {isActiveStringThread ? (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {stringItem.pendingPlanLaunchApproval ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onApprovePlanLaunch}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
+                      >
+                        Approve Plan Launch
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectPlanLaunch}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
+                      >
+                        Reject Plan Launch
+                      </button>
+                    </>
+                  ) : null}
+                  {stringItem.pendingToolkitApproval ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onApproveToolkitAccess}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
+                      >
+                        Approve Toolkit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectToolkitAccess}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
+                      >
+                        Reject Toolkit
+                      </button>
+                    </>
+                  ) : null}
+                  {stringItem.pendingEmailApproval ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onApproveEmailDraft}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
+                      >
+                        Approve Email
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onRejectEmailDraft}
+                        disabled={isApprovalBusy}
+                        className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
+                      >
+                        Reject Email
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
             <div className="flex items-center justify-between gap-2">
@@ -1090,144 +1116,152 @@ export function ControlCollaborationPanel({
             )}
           </div>
 
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-              Workforce Context ({activeStringResourcePlan.length})
-            </p>
-            {activeStringResourcePlan.length === 0 ? (
-              <p className="mt-2 text-xs text-slate-500">No workforce plan linked yet.</p>
-            ) : (
-              <div className="mt-2 space-y-2">
-                {activeStringResourcePlan.map((resource, index) => (
-                  <div
-                    key={`${resource.role}-${index}`}
-                    className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-xs font-semibold text-slate-100">{resource.role}</p>
-                      <span className="rounded-full border border-white/15 bg-black/30 px-2 py-0.5 text-[10px] text-slate-300">
-                        {resource.workforceType} | {resource.capacityPct}%
-                      </span>
-                    </div>
-                    <p className="mt-1 text-[11px] text-slate-400">{resource.responsibility}</p>
-                    {resource.tools.length > 0 ? (
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        Tools: {resource.tools.join(" | ")}
-                      </p>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            )}
-            {activeStringAutoSquad ? (
-              <div className="mt-3 rounded-xl border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-2 text-[11px] text-cyan-100">
-                Auto-WorkForce {activeStringAutoSquad.triggered ? "triggered" : "not triggered"}.
-                {(activeStringAutoSquad.created?.length ?? 0) > 0
-                  ? ` Created ${activeStringAutoSquad.created?.length} agent(s).`
-                  : ""}
-                {(activeStringAutoSquad.requestedRoles?.length ?? 0) > 0
-                  ? ` Roles: ${activeStringAutoSquad.requestedRoles?.join(" | ")}.`
-                  : ""}
-              </div>
-            ) : null}
-          </div>
-
-          <div className="grid gap-3 lg:grid-cols-2">
-            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                Permission Requests ({activeStringPermissionRequests.length})
-              </p>
-              {activeStringPermissionRequests.length === 0 ? (
-                <p className="mt-2 text-xs text-slate-500">No permission requests for this string.</p>
-              ) : (
-                <div className="mt-2 space-y-2">
-                  {activeStringPermissionRequests.map((request) => (
-                    <div
-                      key={request.id}
-                      className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
-                    >
-                      <p className="text-xs text-slate-200">
-                        {request.status} | {request.area} | {request.workflowTitle}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-400">{request.reason}</p>
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        {request.requestedByEmail} | {new Date(request.createdAt).toLocaleString()}
-                      </p>
-                      {request.status === "PENDING" && isActiveStringThread ? (
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => onPermissionRequestDecision(request.id, "APPROVE")}
-                            disabled={permissionRequestActionId === request.id}
-                            className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
-                          >
-                            Approve
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onPermissionRequestDecision(request.id, "REJECT")}
-                            disabled={permissionRequestActionId === request.id}
-                            className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
-                          >
-                            Reject
-                          </button>
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                Approval Checkpoints ({activeStringApprovalCheckpoints.length})
-              </p>
-              {activeStringApprovalCheckpoints.length === 0 ? (
-                <p className="mt-2 text-xs text-slate-500">
-                  No approval checkpoints for this string.
+          {showStringSections ? (
+            <>
+              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  Workforce Context ({activeStringResourcePlan.length})
                 </p>
-              ) : (
-                <div className="mt-2 space-y-2">
-                  {activeStringApprovalCheckpoints.map((checkpoint) => (
-                    <div
-                      key={checkpoint.id}
-                      className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
-                    >
-                      <p className="text-xs text-slate-200">
-                        {checkpoint.status} | Flow {checkpoint.flowId?.slice(0, 8) ?? "N/A"}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-400">{checkpoint.reason}</p>
-                      {checkpoint.status === "PENDING" && isActiveStringThread ? (
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onApprovalCheckpointDecision(checkpoint.id, "APPROVE")
-                            }
-                            disabled={approvalCheckpointActionId === checkpoint.id}
-                            className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
-                          >
-                            Approve
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onApprovalCheckpointDecision(checkpoint.id, "REJECT")
-                            }
-                            disabled={approvalCheckpointActionId === checkpoint.id}
-                            className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
-                          >
-                            Reject
-                          </button>
+                {activeStringResourcePlan.length === 0 ? (
+                  <p className="mt-2 text-xs text-slate-500">No workforce plan linked yet.</p>
+                ) : (
+                  <div className="mt-2 space-y-2">
+                    {activeStringResourcePlan.map((resource, index) => (
+                      <div
+                        key={`${resource.role}-${index}`}
+                        className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-xs font-semibold text-slate-100">{resource.role}</p>
+                          <span className="rounded-full border border-white/15 bg-black/30 px-2 py-0.5 text-[10px] text-slate-300">
+                            {resource.workforceType} | {resource.capacityPct}%
+                          </span>
                         </div>
-                      ) : null}
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          {resource.responsibility}
+                        </p>
+                        {resource.tools.length > 0 ? (
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            Tools: {resource.tools.join(" | ")}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {activeStringAutoSquad ? (
+                  <div className="mt-3 rounded-xl border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-2 text-[11px] text-cyan-100">
+                    Auto-WorkForce {activeStringAutoSquad.triggered ? "triggered" : "not triggered"}.
+                    {(activeStringAutoSquad.created?.length ?? 0) > 0
+                      ? ` Created ${activeStringAutoSquad.created?.length} agent(s).`
+                      : ""}
+                    {(activeStringAutoSquad.requestedRoles?.length ?? 0) > 0
+                      ? ` Roles: ${activeStringAutoSquad.requestedRoles?.join(" | ")}.`
+                      : ""}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="grid gap-3 lg:grid-cols-2">
+                <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    Permission Requests ({activeStringPermissionRequests.length})
+                  </p>
+                  {activeStringPermissionRequests.length === 0 ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      No permission requests for this string.
+                    </p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {activeStringPermissionRequests.map((request) => (
+                        <div
+                          key={request.id}
+                          className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
+                        >
+                          <p className="text-xs text-slate-200">
+                            {request.status} | {request.area} | {request.workflowTitle}
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-400">{request.reason}</p>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            {request.requestedByEmail} | {new Date(request.createdAt).toLocaleString()}
+                          </p>
+                          {request.status === "PENDING" && isActiveStringThread ? (
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => onPermissionRequestDecision(request.id, "APPROVE")}
+                                disabled={permissionRequestActionId === request.id}
+                                className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
+                              >
+                                Approve
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onPermissionRequestDecision(request.id, "REJECT")}
+                                disabled={permissionRequestActionId === request.id}
+                                className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
                 </div>
-              )}
-            </div>
-          </div>
+
+                <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                    Approval Checkpoints ({activeStringApprovalCheckpoints.length})
+                  </p>
+                  {activeStringApprovalCheckpoints.length === 0 ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      No approval checkpoints for this string.
+                    </p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {activeStringApprovalCheckpoints.map((checkpoint) => (
+                        <div
+                          key={checkpoint.id}
+                          className="rounded-xl border border-white/10 bg-black/25 px-2.5 py-2"
+                        >
+                          <p className="text-xs text-slate-200">
+                            {checkpoint.status} | Flow {checkpoint.flowId?.slice(0, 8) ?? "N/A"}
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-400">{checkpoint.reason}</p>
+                          {checkpoint.status === "PENDING" && isActiveStringThread ? (
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApprovalCheckpointDecision(checkpoint.id, "APPROVE")
+                                }
+                                disabled={approvalCheckpointActionId === checkpoint.id}
+                                className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 disabled:opacity-60"
+                              >
+                                Approve
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onApprovalCheckpointDecision(checkpoint.id, "REJECT")
+                                }
+                                disabled={approvalCheckpointActionId === checkpoint.id}
+                                className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : null}
         </div>
         <div className="space-y-3">
           <div className="rounded-2xl border border-white/10 bg-black/20 p-3">

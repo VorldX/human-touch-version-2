@@ -155,7 +155,7 @@ import {
 } from "@/components/vorldx-shell/shared";
 import { classifyEmailDraftReply } from "@/lib/agent/run/email-request-parser";
 import { SteerDetailsEditorSurface } from "@/components/vorldx-shell/surfaces/steer-details-editor-surface";
-import { ControlCollaborationPanel } from "@/components/vorldx-shell/surfaces/control-collaboration-panel";
+import { StringCollaborationPanel } from "@/components/vorldx-shell/surfaces/string-collaboration-panel";
 
 export function ControlDeckSurface({
   orgId,
@@ -1547,19 +1547,15 @@ export function ControlDeckSurface({
                               ) : null}
 
                               {stringDetailsTab === "COLLABORATION" ? (
-                                <ControlCollaborationPanel
-                                  orgId={orgId}
-                                  orgName={orgName}
-                                  orgRoleLabel={orgRoleLabel}
+                                <StringCollaborationPanel
                                   stringItem={activeStringItem}
                                   isActiveStringThread={isActiveStringThread}
                                   isApprovalBusy={isApprovalBusy}
-                                  permissionRequests={permissionRequests}
-                                  approvalCheckpoints={approvalCheckpoints}
-                                  activeStringPermissionRequests={activeStringPermissionRequests}
-                                  activeStringApprovalCheckpoints={activeStringApprovalCheckpoints}
-                                  activeStringResourcePlan={activeStringResourcePlan}
-                                  activeStringAutoSquad={activeStringAutoSquad}
+                                  discussionTurns={activeStringDiscussionTurns}
+                                  permissionRequests={activeStringPermissionRequests}
+                                  approvalCheckpoints={activeStringApprovalCheckpoints}
+                                  resourcePlan={activeStringResourcePlan}
+                                  autoSquad={activeStringAutoSquad}
                                   permissionRequestActionId={permissionRequestActionId}
                                   approvalCheckpointActionId={approvalCheckpointActionId}
                                   onSelectThread={onSelectThread}
