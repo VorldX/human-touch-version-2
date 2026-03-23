@@ -925,8 +925,14 @@ export function ControlCollaborationPanel({
         ) : null}
       </div>
 
-      <div className="grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
-        <div className="space-y-3">
+      <div
+        className={
+          showStringSections
+            ? "grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]"
+            : "grid gap-3 xl:grid-cols-2"
+        }
+      >
+        <div className={showStringSections ? "space-y-3" : "contents"}>
           {showStringSections && stringItem ? (
             <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1024,7 +1030,11 @@ export function ControlCollaborationPanel({
             </div>
           ) : null}
 
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+          <div
+            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+              showStringSections ? "" : "xl:order-3 xl:col-span-2"
+            }`}
+          >
             <div className="flex items-center justify-between gap-2">
               <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                 Incoming Organization Requests
@@ -1263,8 +1273,12 @@ export function ControlCollaborationPanel({
             </>
           ) : null}
         </div>
-        <div className="space-y-3">
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+        <div className={showStringSections ? "space-y-3" : "contents"}>
+          <div
+            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+              showStringSections ? "" : "xl:order-1"
+            }`}
+          >
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
                 <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
@@ -1288,7 +1302,11 @@ export function ControlCollaborationPanel({
             </p>
           </div>
 
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+          <div
+            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+              showStringSections ? "" : "xl:order-2"
+            }`}
+          >
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                 <Workflow size={12} />
@@ -1341,7 +1359,11 @@ export function ControlCollaborationPanel({
             ) : null}
           </div>
 
-          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+          <div
+            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+              showStringSections ? "" : "xl:order-4 xl:col-span-2"
+            }`}
+          >
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                 <Users size={12} />

@@ -67,6 +67,15 @@ export async function GET(request: NextRequest) {
   if (!access.ok) {
     return access.response;
   }
+  if (!access.actor.isAdmin) {
+    return NextResponse.json(
+      {
+        ok: false,
+        message: "Only founders and admins can change organization LLM settings."
+      },
+      { status: 403 }
+    );
+  }
 
   const org = await prisma.organization.findUnique({
     where: { id: orgId },

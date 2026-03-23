@@ -81,7 +81,7 @@ export const NAV_ITEMS = [
   },
   {
     id: "settings",
-    label: "Utility Settings",
+    label: "Settings",
     navLabel: "Settings",
     helper: "Policies + utilities",
     primary: "GOVERNANCE",
@@ -128,8 +128,7 @@ export const OPERATION_TAB_IDS = [
   "direction",
   "blueprint",
   "calendar",
-  "memory",
-  "settings"
+  "memory"
 ] as const;
 export type OperationTabId = (typeof OPERATION_TAB_IDS)[number];
 export const OPERATION_TAB_SET = new Set<string>(OPERATION_TAB_IDS);

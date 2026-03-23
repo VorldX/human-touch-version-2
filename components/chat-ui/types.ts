@@ -2,7 +2,7 @@ export type StringMode = "discussion" | "direction";
 export type CollaboratorKind = "HUMAN" | "AI";
 export type CollaboratorGroupType = "team";
 
-export type MessageRole = "user" | "system";
+export type MessageRole = "user" | "assistant" | "system";
 
 export interface DirectionStep {
   id: string;
@@ -15,7 +15,29 @@ export interface DirectionStep {
 
 export interface DirectionPayload {
   objective: string;
+  summary?: string;
+  teamName?: string;
+  nextAction?: string;
+  detailScore?: number;
+  requiredToolkits?: string[];
+  approvalCount?: number;
   steps: DirectionStep[];
+}
+
+export interface MessageMetrics {
+  latencyMs: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  provider?: string;
+  model?: string;
+  source?: string;
+}
+
+export interface MessageRouting {
+  route: "CHAT_RESPONSE" | "PLAN_REQUIRED";
+  reason?: string;
+  toolkitHints?: string[];
 }
 
 export interface ChatMessage {
@@ -23,7 +45,14 @@ export interface ChatMessage {
   role: MessageRole;
   content: string;
   createdAt: string;
+  authorName?: string;
+  authorRole?: string;
   direction?: DirectionPayload;
+  teamId?: string | null;
+  teamLabel?: string | null;
+  error?: boolean;
+  metrics?: MessageMetrics;
+  routing?: MessageRouting;
 }
 
 export interface ChatString {
@@ -31,6 +60,13 @@ export interface ChatString {
   title: string;
   mode: StringMode;
   updatedAt: string;
+  createdAt?: string;
+  directionId?: string | null;
+  planId?: string | null;
+  selectedTeamId?: string | null;
+  selectedTeamLabel?: string | null;
+  source?: "workspace" | "direction" | "plan";
+  persisted?: boolean;
   messages: ChatMessage[];
 }
 
@@ -42,6 +78,7 @@ export interface Collaborator {
   kind?: CollaboratorKind;
   online?: boolean;
   source?: "team" | "squad" | "presence" | "system";
+  avatar?: string;
 }
 
 export interface CollaboratorGroup {
@@ -50,4 +87,8 @@ export interface CollaboratorGroup {
   type: CollaboratorGroupType;
   memberIds: string[];
   createdAt: string;
+  updatedAt?: string;
+  focus?: string;
 }
+
+export type Team = CollaboratorGroup;

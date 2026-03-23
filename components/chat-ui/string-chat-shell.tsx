@@ -1,30 +1,36 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Building2, Loader2, LogOut, RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
-import { useFirebaseAuth } from "@/components/auth/firebase-auth-provider";
 import { ChatHeader } from "@/components/chat-ui/chat-header";
 import { ChatInput } from "@/components/chat-ui/chat-input";
 import { ChatWindow } from "@/components/chat-ui/chat-window";
-import { CreateGroupModal } from "@/components/chat-ui/create-group-modal";
-import { InviteModal } from "@/components/chat-ui/invite-modal";
+import { CollaborationPanel } from "@/components/chat-ui/collaboration-panel";
 import { Sidebar } from "@/components/chat-ui/sidebar";
-import { TeamPanel } from "@/components/chat-ui/team-panel";
-import type { ChatMessage, ChatString, Collaborator, CollaboratorGroup, CollaboratorKind, DirectionPayload, MessageRouting, StringMode } from "@/components/chat-ui/types";
-import type { ActiveUser, OrgContext } from "@/lib/store/vorldx-store";
-import { useVorldXStore } from "@/lib/store/vorldx-store";
+import type {
+  ChatMessage,
+  ChatString,
+  Collaborator,
+  DirectionPayload,
+  MessageRouting,
+  StringMode,
+  Team
+} from "@/components/chat-ui/types";
 
-const COLORS = ["bg-cyan-500", "bg-emerald-500", "bg-blue-500", "bg-amber-500", "bg-rose-500", "bg-violet-500"];
-const STRINGS_KEY = "vx.chat.strings.v2";
-const GROUPS_KEY = "vx.chat.groups.v2";
+const DEFAULT_CHAT_TITLE = "New string";
 const HISTORY_LIMIT = 10;
+const COFOUNDER_MANAGER_NAME = "Co-Founder Manager";
+const COFOUNDER_MANAGER_ROLE = "Organization lead";
+const STRINGS_UPDATED_EVENT = "vx:strings-updated";
 
-interface OrgListResponse {
+interface JsonEnvelope {
   ok?: boolean;
   message?: string;
-  activeOrgId?: string | null;
-  orgs?: OrgContext[];
+}
+
+interface StringApiResponse extends JsonEnvelope {
+  strings?: ChatString[];
+  string?: ChatString;
 }
 
 interface DirectionRecord {
@@ -54,20 +60,58 @@ interface PlanRecord {
   summary: string;
   direction: string;
   directionId: string | null;
-  primaryPlan: PlanPrimary;
+  primaryPlan?: PlanPrimary;
   updatedAt: string;
   createdAt: string;
 }
 
-interface JsonEnvelope<T> {
-  ok?: boolean;
-  message?: string;
-  [key: string]: unknown;
+interface DirectionsResponse extends JsonEnvelope {
+  directions?: DirectionRecord[];
 }
 
-interface DirectionChatApiResponse {
-  ok?: boolean;
-  message?: string;
+interface PlansResponse extends JsonEnvelope {
+  plans?: PlanRecord[];
+}
+
+interface HubTeamRecord {
+  id: string;
+  name: string;
+  description?: string;
+  memberUserIds?: string[];
+  personnelIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface HubMemberRecord {
+  userId: string;
+  username: string;
+  email: string;
+  roleLabel?: string;
+  isActiveOrganization?: boolean;
+}
+
+interface HubPersonnelRecord {
+  id: string;
+  name: string;
+  type: "HUMAN" | "AI";
+  role: string;
+  status: string;
+}
+
+interface HubOrganizationResponse extends JsonEnvelope {
+  actor?: {
+    userId?: string;
+    activeTeamId?: string | null;
+  };
+  members?: HubMemberRecord[];
+  personnel?: HubPersonnelRecord[];
+  collaboration?: {
+    teams?: HubTeamRecord[];
+  };
+}
+
+interface DirectionChatApiResponse extends JsonEnvelope {
   reply?: string;
   directionCandidate?: string;
   intentRouting?: {
@@ -87,14 +131,18 @@ interface DirectionChatApiResponse {
   } | null;
 }
 
-interface DirectionPlanApiResponse {
-  ok?: boolean;
-  message?: string;
+interface DirectionPlanApiResponse extends JsonEnvelope {
   analysis?: string;
   directionGiven?: string;
   primaryPlan?: PlanPrimary;
   requiredToolkits?: string[];
   requestCount?: number;
+  directionRecord?: {
+    id: string;
+  } | null;
+  planRecord?: {
+    id: string;
+  } | null;
   tokenUsage?: {
     promptTokens?: number;
     completionTokens?: number;
@@ -111,49 +159,142 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function rid(prefix: string) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+function createId(prefix: string) {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+
+  return `${prefix}-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
 }
 
-function tr(value: string, max = 96) {
-  const text = value.replace(/\s+/g, " ").trim();
-  if (!text) return "Untitled String";
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+function memberKey(userId: string) {
+  return `member:${userId}`;
 }
 
-function toMs(value: string) {
-  const ms = new Date(value).getTime();
-  return Number.isNaN(ms) ? 0 : ms;
+function toMs(value: string | undefined) {
+  const parsed = new Date(value ?? "").getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function ccolor(seed: string) {
-  const hash = Array.from(seed).reduce((n, ch) => n + ch.charCodeAt(0), 0);
-  return COLORS[hash % COLORS.length];
+function sortChats(chats: ChatString[]) {
+  return [...chats].sort((left, right) => toMs(right.updatedAt) - toMs(left.updatedAt));
+}
+
+function trimTitle(value: string, fallback = DEFAULT_CHAT_TITLE) {
+  const next = value.replace(/\s+/g, " ").trim();
+  if (!next) {
+    return fallback;
+  }
+  return next.length > 56 ? `${next.slice(0, 53)}...` : next;
+}
+
+function titleFromMessage(content: string) {
+  return trimTitle(content, DEFAULT_CHAT_TITLE);
+}
+
+function truncateText(value: string, max: number, fallback = DEFAULT_CHAT_TITLE) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return fallback;
+  }
+  return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 3))}...` : normalized;
 }
 
 function fallbackEmail(name: string, id: string) {
-  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "");
-  return `${slug || `member-${id.slice(-6)}`}@platform.local`;
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ".")
+    .replace(/^\.+|\.+$/g, "");
+  return `${slug || `member-${id.slice(-6)}`}@workspace.local`;
 }
 
-function readJson<T>(key: string, fallback: T): T {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = window.localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
+function createEmptyChat(team: Team | null): ChatString {
+  const timestamp = nowIso();
+
+  return {
+    id: createId("string"),
+    title: DEFAULT_CHAT_TITLE,
+    mode: "discussion",
+    updatedAt: timestamp,
+    createdAt: timestamp,
+    selectedTeamId: team?.id ?? null,
+    selectedTeamLabel: team?.name ?? null,
+    source: "workspace",
+    persisted: false,
+    messages: []
+  };
 }
 
-function writeJson<T>(key: string, value: T) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(key, JSON.stringify(value));
+function toDirectionPayload(
+  objective: string,
+  primary: PlanPrimary,
+  requiredToolkits?: string[],
+  approvalCount?: number,
+  teamName?: string | null
+): DirectionPayload {
+  const workflows = Array.isArray(primary.workflows) ? primary.workflows : [];
+  const steps = workflows.slice(0, 6).map((workflow, index) => {
+    const tasks = (workflow.tasks ?? [])
+      .map((task) => task.title?.trim() || "")
+      .filter(Boolean)
+      .slice(0, 5);
+    const actions = [...(workflow.deliverables ?? []), ...(workflow.successMetrics ?? [])]
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+
+    return {
+      id: createId("step"),
+      title: truncateText(workflow.title || "Execution workflow", 72, "Execution workflow"),
+      owner: workflow.ownerRole?.trim() || "Owner",
+      status: (index === 0 ? "in_progress" : "todo") as "in_progress" | "todo",
+      tasks: tasks.length > 0 ? tasks : ["Break the work into executable tasks"],
+      actions: actions.length > 0 ? actions : ["Review output against the objective"]
+    };
+  });
+
+  return {
+    objective: truncateText(objective, 220, "Structured direction"),
+    ...(primary.summary ? { summary: primary.summary } : {}),
+    ...(teamName ? { teamName } : {}),
+    ...(typeof primary.detailScore === "number"
+      ? { detailScore: Math.max(0, Math.min(100, Math.floor(primary.detailScore))) }
+      : {}),
+    ...(requiredToolkits && requiredToolkits.length > 0
+      ? { requiredToolkits: requiredToolkits.slice(0, 10) }
+      : {}),
+    ...(typeof approvalCount === "number" ? { approvalCount: Math.max(0, approvalCount) } : {}),
+    nextAction:
+      steps[0]?.title
+        ? `Start with "${steps[0].title}" and confirm the owner.`
+        : "Confirm the first owner and execution checkpoint.",
+    steps:
+      steps.length > 0
+        ? steps
+        : [
+            {
+              id: createId("step"),
+              title: "Execution planning",
+              owner: "Owner",
+              status: "in_progress",
+              tasks: ["Define the first workflow"],
+              actions: ["Review checkpoints"]
+            }
+          ]
+  };
+}
+
+function toHistory(messages: ChatMessage[]) {
+  return messages.slice(-HISTORY_LIMIT).map((message) => ({
+    role: message.role === "user" ? "owner" : "organization",
+    content: message.content.slice(0, 1200)
+  }));
 }
 
 async function parseResponse<T>(response: Response) {
   const rawText = await response.text();
   let payload: T | null = null;
+
   if (rawText) {
     try {
       payload = JSON.parse(rawText) as T;
@@ -161,481 +302,975 @@ async function parseResponse<T>(response: Response) {
       payload = null;
     }
   }
+
   return { payload, rawText };
 }
 
-function failMsg(status: number, fallback: string, payloadMessage?: string, rawText?: string) {
-  if (payloadMessage?.trim()) return payloadMessage;
-  if (rawText?.trim()) return `${fallback} (${status}): ${rawText.slice(0, 160)}`;
+function failMsg(
+  status: number,
+  fallback: string,
+  payloadMessage?: string,
+  rawText?: string
+) {
+  if (payloadMessage?.trim()) {
+    return payloadMessage;
+  }
+  if (rawText?.trim()) {
+    return `${fallback} (${status}): ${rawText.slice(0, 160)}`;
+  }
   return `${fallback} (${status}).`;
 }
 
-function blankString(): ChatString {
-  const t = nowIso();
-  return { id: rid("str"), title: "New String", mode: "discussion", updatedAt: t, messages: [] };
-}
+function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
+  const members = Array.isArray(payload.members) ? payload.members : [];
+  const personnel = Array.isArray(payload.personnel) ? payload.personnel : [];
+  const teamRows = Array.isArray(payload.collaboration?.teams) ? payload.collaboration?.teams : [];
 
-function toDirectionPayload(objective: string, primary: PlanPrimary, requiredToolkits?: string[], approvalCount?: number): DirectionPayload {
-  const workflows = Array.isArray(primary.workflows) ? primary.workflows : [];
-  const steps = workflows.slice(0, 6).map((wf, index) => {
-    const tasks = (wf.tasks ?? []).map((task) => task.title?.trim() || "").filter(Boolean).slice(0, 5);
-    const actions = [...(wf.deliverables ?? []), ...(wf.successMetrics ?? [])].map((x) => x.trim()).filter(Boolean).slice(0, 4);
-    return {
-      id: rid("step"),
-      title: tr(wf.title || "Execution Workflow", 72),
-      owner: wf.ownerRole?.trim() || "Owner",
-      status: (index === 0 ? "in_progress" : "todo") as "in_progress" | "todo",
-      tasks: tasks.length > 0 ? tasks : ["Break down work into executable tasks"],
-      actions: actions.length > 0 ? actions : ["Review output against objective"]
-    };
-  });
-  if (steps.length === 0) {
-    steps.push({ id: rid("step"), title: "Execution Planning", owner: "Owner", status: "in_progress", tasks: ["Define first workflow"], actions: ["Review checkpoints"] });
-  }
+  const collaborators: Collaborator[] = [
+    ...members.map((member) => ({
+      id: memberKey(member.userId),
+      name: member.username,
+      email: member.email,
+      role: member.roleLabel || "Member",
+      kind: "HUMAN" as const,
+      online: member.isActiveOrganization ?? true,
+      source: "presence" as const
+    })),
+    ...personnel.map((person) => ({
+      id: person.id,
+      name: person.name,
+      email: fallbackEmail(person.name, person.id),
+      role: person.role,
+      kind: person.type === "AI" ? ("AI" as const) : ("HUMAN" as const),
+      online: person.status !== "DISABLED",
+      source: "squad" as const
+    }))
+  ];
+
+  const teams: Team[] = teamRows.map((team) => ({
+    id: team.id,
+    name: team.name,
+    type: "team",
+    memberIds: [
+      ...(team.memberUserIds ?? []).map((userId) => memberKey(userId)),
+      ...(team.personnelIds ?? [])
+    ],
+    createdAt: team.createdAt,
+    updatedAt: team.updatedAt,
+    focus: team.description || "Collaboration routing"
+  }));
+
   return {
-    objective: tr(objective, 220),
-    ...(primary.summary ? { summary: primary.summary } : {}),
-    ...(typeof primary.detailScore === "number" ? { detailScore: Math.max(0, Math.min(100, Math.floor(primary.detailScore))) } : {}),
-    ...(requiredToolkits?.length ? { requiredToolkits: requiredToolkits.slice(0, 10) } : {}),
-    ...(typeof approvalCount === "number" ? { approvalCount: Math.max(0, Math.floor(approvalCount)) } : {}),
-    steps
+    collaborators,
+    teams,
+    actorMemberId: payload.actor?.userId ? memberKey(payload.actor.userId) : null,
+    activeTeamId: payload.actor?.activeTeamId ?? null
   };
 }
 
-function toHistory(messages: ChatMessage[]) {
-  return messages.slice(-HISTORY_LIMIT).map((m) => ({ role: m.role === "user" ? "owner" : "organization", content: m.content.slice(0, 1200) }));
-}
+function buildDerivedStrings(
+  strings: ChatString[],
+  directions: DirectionRecord[],
+  plans: PlanRecord[]
+) {
+  const knownDirectionIds = new Set(
+    strings
+      .flatMap((item) => [
+        item.directionId ?? "",
+        item.id.startsWith("direction:") ? item.id.slice("direction:".length) : ""
+      ])
+      .filter(Boolean)
+  );
+  const knownPlanIds = new Set(
+    strings
+      .flatMap((item) => [
+        item.planId ?? "",
+        item.id.startsWith("plan:") ? item.id.slice("plan:".length) : ""
+      ])
+      .filter(Boolean)
+  );
 
-function mergeStrings(localStrings: ChatString[], serverStrings: ChatString[]) {
-  const map = new Map<string, ChatString>();
-  for (const item of serverStrings) map.set(item.id, item);
-  for (const local of localStrings) {
-    const existing = map.get(local.id);
-    if (!existing) {
-      map.set(local.id, local);
+  const latestPlanByDirection = new Map<string, PlanRecord>();
+  for (const plan of plans) {
+    if (!plan.directionId) {
       continue;
     }
-    map.set(local.id, {
-      ...existing,
-      title: local.title || existing.title,
-      mode: local.mode,
-      updatedAt: toMs(local.updatedAt) > toMs(existing.updatedAt) ? local.updatedAt : existing.updatedAt,
-      messages: local.messages.length >= existing.messages.length ? local.messages : existing.messages
-    });
+    const existing = latestPlanByDirection.get(plan.directionId);
+    if (!existing || toMs(plan.updatedAt) > toMs(existing.updatedAt)) {
+      latestPlanByDirection.set(plan.directionId, plan);
+    }
   }
-  return [...map.values()].sort((a, b) => toMs(b.updatedAt) - toMs(a.updatedAt));
+
+  const directionStrings = directions
+    .filter((direction) => !knownDirectionIds.has(direction.id))
+    .map<ChatString>((direction) => {
+      const linkedPlan = latestPlanByDirection.get(direction.id) ?? null;
+      const createdAt = direction.createdAt || nowIso();
+      const updatedAt = linkedPlan?.updatedAt || direction.updatedAt || createdAt;
+      const messages: ChatMessage[] = [
+        {
+          id: createId("message"),
+          role: "system",
+          content: direction.summary || direction.direction || "Direction loaded.",
+          createdAt,
+          authorName: COFOUNDER_MANAGER_NAME,
+          authorRole: COFOUNDER_MANAGER_ROLE
+        }
+      ];
+
+      if (linkedPlan?.primaryPlan) {
+        messages.push({
+          id: createId("message"),
+          role: "system",
+          content: linkedPlan.summary || "Execution plan linked to this direction.",
+          createdAt: linkedPlan.createdAt || updatedAt,
+          authorName: COFOUNDER_MANAGER_NAME,
+          authorRole: "Direction lead",
+          direction: toDirectionPayload(direction.direction || direction.title, linkedPlan.primaryPlan),
+          routing: {
+            route: "PLAN_REQUIRED",
+            reason: "Execution plan loaded from backend."
+          }
+        });
+      }
+
+      return {
+        id: `direction:${direction.id}`,
+        title: truncateText(direction.title || direction.direction || "Direction", 72, "Direction"),
+        mode: "direction",
+        updatedAt,
+        createdAt,
+        directionId: direction.id,
+        planId: linkedPlan?.id ?? null,
+        source: linkedPlan ? "plan" : "direction",
+        persisted: true,
+        messages
+      };
+    });
+
+  const orphanPlanStrings = plans
+    .filter((plan) => !plan.directionId && !knownPlanIds.has(plan.id))
+    .map<ChatString>((plan) => ({
+      id: `plan:${plan.id}`,
+      title: truncateText(plan.title || plan.direction || "Execution plan", 72, "Execution plan"),
+      mode: "direction",
+      updatedAt: plan.updatedAt || plan.createdAt || nowIso(),
+      createdAt: plan.createdAt || nowIso(),
+      planId: plan.id,
+      source: "plan",
+      persisted: true,
+      messages: [
+        {
+          id: createId("message"),
+          role: "system",
+          content: plan.summary || "Execution plan loaded.",
+          createdAt: plan.createdAt || nowIso(),
+          authorName: COFOUNDER_MANAGER_NAME,
+          authorRole: "Direction lead",
+          direction: toDirectionPayload(plan.direction || plan.title, plan.primaryPlan || {})
+        }
+      ]
+    }));
+
+  return sortChats([...strings, ...directionStrings, ...orphanPlanStrings]);
 }
 
-export function StringChatShell({ embedded = false }: { embedded?: boolean }) {
-  const { user, signOutCurrentUser } = useFirebaseAuth();
+function normalizeChatString(value: ChatString): ChatString {
+  return {
+    ...value,
+    title: trimTitle(value.title || DEFAULT_CHAT_TITLE),
+    mode: value.mode === "direction" ? "direction" : "discussion",
+    updatedAt: value.updatedAt || nowIso(),
+    createdAt: value.createdAt || value.updatedAt || nowIso(),
+    selectedTeamId: value.selectedTeamId ?? null,
+    selectedTeamLabel: value.selectedTeamLabel ?? null,
+    source: value.source ?? "workspace",
+    persisted: value.persisted ?? true,
+    messages: Array.isArray(value.messages) ? value.messages : []
+  };
+}
 
-  const orgs = useVorldXStore((state) => state.orgs);
-  const currentOrg = useVorldXStore((state) => state.currentOrg);
-  const setOrgs = useVorldXStore((state) => state.setOrgs);
-  const setCurrentOrg = useVorldXStore((state) => state.setCurrentOrg);
-  const activeUsers = useVorldXStore((state) => state.activeUsers);
-  const setActiveUsers = useVorldXStore((state) => state.setActiveUsers);
-  const upsertActiveUsers = useVorldXStore((state) => state.upsertActiveUsers);
-  const removeActiveUser = useVorldXStore((state) => state.removeActiveUser);
-
-  const [strings, setStrings] = useState<ChatString[]>([]);
-  const [selectedString, setSelectedString] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+export function StringChatShell({
+  embedded = false,
+  orgId = null,
+  onOpenAddMember,
+  onOpenCreateTeam
+}: {
+  embedded?: boolean;
+  orgId?: string | null;
+  onOpenAddMember?: () => void;
+  onOpenCreateTeam?: () => void;
+}) {
+  const [chats, setChats] = useState<ChatString[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [mode, setMode] = useState<StringMode>("discussion");
-  const [teamPanelOpen, setTeamPanelOpen] = useState(false);
-  const [inviteOpen, setInviteOpen] = useState(false);
-  const [createGroupOpen, setCreateGroupOpen] = useState(false);
-  const [groups, setGroups] = useState<CollaboratorGroup[]>([]);
-  const [searchQuery, setSearchQuery] = useState("");
   const [draft, setDraft] = useState("");
-
-  const [loadingOrgs, setLoadingOrgs] = useState(false);
-  const [syncing, setSyncing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [actorMemberId, setActorMemberId] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [collaborationOpen, setCollaborationOpen] = useState(false);
   const [sending, setSending] = useState(false);
-  const [statusText, setStatusText] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusText, setStatusText] = useState<string | null>(null);
 
-  const activeOrg = currentOrg ?? orgs[0] ?? null;
-  const selected = useMemo(() => strings.find((item) => item.id === selectedString) ?? null, [selectedString, strings]);
-  const filteredStrings = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    if (!q) return strings;
-    return strings.filter((item) => item.title.toLowerCase().includes(q) || item.mode.toLowerCase().includes(q) || item.messages.some((m) => m.content.toLowerCase().includes(q)));
-  }, [searchQuery, strings]);
-  const collaborators = useMemo<Collaborator[]>(() => activeUsers.filter((x) => x.source !== "system").map((x) => ({ id: x.id, name: x.name, email: x.email ?? fallbackEmail(x.name, x.id), role: x.role, kind: x.kind ?? "HUMAN", online: x.online, source: x.source })), [activeUsers]);
-  const workforceMembers = useMemo(() => collaborators.filter((x) => x.source === "squad"), [collaborators]);
-  const latestMetrics = useMemo(() => [...(selected?.messages ?? [])].reverse().find((m) => m.metrics)?.metrics ?? null, [selected]);
-
-  const loadWorkforce = useCallback(async (orgId: string) => {
-    const response = await fetch(`/api/squad/personnel?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store", credentials: "include" });
-    const { payload, rawText } = await parseResponse<JsonEnvelope<{ personnel?: ActiveUser[] }> & { personnel?: Array<{ id: string; name: string; role: string; type: "HUMAN" | "AI"; status: string }> }>(response);
-    if (!response.ok || !payload?.ok) {
-      throw new Error(failMsg(response.status, "Failed to load workforce", payload?.message, rawText));
+  const loadVersionRef = useRef(0);
+  const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0] ?? null;
+  const selectedTeam = teams.find((team) => team.id === selectedTeamId) ?? null;
+  const filteredChats = chats.filter((chat) => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) {
+      return true;
     }
-    const personnel = Array.isArray(payload.personnel) ? payload.personnel : [];
-    const mapped: ActiveUser[] = personnel.map((item) => ({
-      id: item.id,
-      name: item.name,
-      email: fallbackEmail(item.name, item.id),
-      role: item.role,
-      kind: item.type === "AI" ? "AI" : "HUMAN",
-      color: ccolor(item.id),
-      online: item.status !== "DISABLED",
-      source: "squad"
-    }));
-    setActiveUsers(mapped);
-    return mapped.length;
-  }, [setActiveUsers]);
 
-  const hydrateWorkspace = useCallback(async (orgId: string) => {
-    setSyncing(true);
-    setError(null);
-    try {
-      const [directionsResp, plansResp, workforceCount] = await Promise.all([
-        fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store", credentials: "include" }),
-        fetch(`/api/plans?orgId=${encodeURIComponent(orgId)}`, { cache: "no-store", credentials: "include" }),
-        loadWorkforce(orgId)
-      ]);
-      const [{ payload: directionsPayload, rawText: directionsRaw }, { payload: plansPayload, rawText: plansRaw }] = await Promise.all([
-        parseResponse<JsonEnvelope<{ directions?: DirectionRecord[] }> & { directions?: DirectionRecord[] }>(directionsResp),
-        parseResponse<JsonEnvelope<{ plans?: PlanRecord[] }> & { plans?: PlanRecord[] }>(plansResp)
-      ]);
-      if (!directionsResp.ok || !directionsPayload?.ok) throw new Error(failMsg(directionsResp.status, "Failed to load directions", directionsPayload?.message, directionsRaw));
-      if (!plansResp.ok || !plansPayload?.ok) throw new Error(failMsg(plansResp.status, "Failed to load plans", plansPayload?.message, plansRaw));
+    return (
+      chat.title.toLowerCase().includes(query) ||
+      chat.messages.some((message) => message.content.toLowerCase().includes(query))
+    );
+  });
 
-      const directions = Array.isArray(directionsPayload.directions) ? directionsPayload.directions : [];
-      const plans = Array.isArray(plansPayload.plans) ? plansPayload.plans : [];
-      const planByDirection = new Map<string, PlanRecord>();
-      for (const plan of plans) {
-        if (!plan.directionId) continue;
-        const existing = planByDirection.get(plan.directionId);
-        if (!existing || toMs(plan.updatedAt) > toMs(existing.updatedAt)) planByDirection.set(plan.directionId, plan);
-      }
-      const directionStrings: ChatString[] = directions.map((direction) => {
-        const linkedPlan = planByDirection.get(direction.id) ?? null;
-        const createdAt = direction.createdAt || nowIso();
-        const updatedAt = direction.updatedAt || createdAt;
-        const messages: ChatMessage[] = [{ id: rid("msg"), role: "system", content: direction.summary || direction.direction || "Direction loaded.", createdAt }];
-        if (linkedPlan?.primaryPlan) {
-          messages.push({ id: rid("msg"), role: "system", content: linkedPlan.summary || "Execution plan linked to this direction.", createdAt: linkedPlan.createdAt || updatedAt, direction: toDirectionPayload(direction.direction || direction.title, linkedPlan.primaryPlan) });
-        }
-        return { id: `direction:${direction.id}`, title: tr(direction.title || direction.direction || "Direction", 72), mode: "direction", updatedAt, messages };
-      });
-      const orphanPlanStrings: ChatString[] = plans.filter((plan) => !plan.directionId).map((plan) => ({ id: `plan:${plan.id}`, title: tr(plan.title || plan.direction || "Execution Plan", 72), mode: "direction", updatedAt: plan.updatedAt || plan.createdAt || nowIso(), messages: [{ id: rid("msg"), role: "system", content: plan.summary || "Execution plan loaded.", createdAt: plan.createdAt || nowIso(), direction: toDirectionPayload(plan.direction || plan.title, plan.primaryPlan || {}) }] }));
-      const localStrings = readJson<ChatString[]>(`${STRINGS_KEY}:${orgId}`, []);
-      const merged = mergeStrings(localStrings, [...directionStrings, ...orphanPlanStrings]);
-      const nextStrings = merged.length > 0 ? merged : [blankString()];
-      setStrings(nextStrings);
-      setSelectedString((current) => (current && nextStrings.some((x) => x.id === current) ? current : nextStrings[0]?.id ?? null));
-      setStatusText(`Synced ${nextStrings.length} strings and ${workforceCount} workforce members.`);
-    } catch (e) {
-      setStrings((prev) => (prev.length > 0 ? prev : [blankString()]));
-      setError(e instanceof Error ? e.message : "Unable to sync workspace.");
-    } finally {
-      setSyncing(false);
-    }
-  }, [loadWorkforce]);
-
-  const loadOrganizations = useCallback(async () => {
-    if (!user?.uid || !user.email) {
-      setOrgs([]);
-      setCurrentOrg(null);
-      setStrings([]);
-      setSelectedString(null);
-      setActiveUsers([]);
+  useEffect(() => {
+    if (!activeChat) {
       return;
     }
-    setLoadingOrgs(true);
-    setError(null);
-    try {
-      const response = await fetch("/api/orgs", { cache: "no-store", credentials: "include" });
-      const { payload, rawText } = await parseResponse<OrgListResponse>(response);
-      if (!response.ok || !payload?.ok) throw new Error(failMsg(response.status, "Unable to load organizations", payload?.message, rawText));
-      const nextOrgs = Array.isArray(payload.orgs) ? payload.orgs : [];
-      setOrgs(nextOrgs);
-      if (nextOrgs.length === 0) {
-        setCurrentOrg(null);
-        setStrings([blankString()]);
-        setSelectedString(null);
-        setStatusText("No organization access found.");
+
+    setMode(activeChat.mode);
+
+    if (activeChat.selectedTeamId && activeChat.selectedTeamId !== selectedTeamId) {
+      setSelectedTeamId(activeChat.selectedTeamId);
+      return;
+    }
+
+    if (!activeChat.selectedTeamId && !selectedTeamId && teams.length > 0) {
+      setSelectedTeamId(teams[0]?.id ?? null);
+    }
+  }, [activeChat, selectedTeamId, teams]);
+
+  useEffect(() => {
+    if (activeChatId || chats.length === 0) {
+      return;
+    }
+
+    setActiveChatId(chats[0].id);
+  }, [activeChatId, chats]);
+
+  useEffect(() => {
+    if (!selectedTeamId) {
+      return;
+    }
+
+    if (!teams.some((team) => team.id === selectedTeamId)) {
+      setSelectedTeamId(teams[0]?.id ?? null);
+    }
+  }, [selectedTeamId, teams]);
+
+  useEffect(() => {
+    const loadWorkspace = async () => {
+      const currentLoadId = loadVersionRef.current + 1;
+      loadVersionRef.current = currentLoadId;
+
+      if (!orgId) {
+        setChats([]);
+        setActiveChatId(null);
+        setTeams([]);
+        setCollaborators([]);
+        setActorMemberId(null);
+        setSelectedTeamId(null);
+        setLoading(false);
+        setSending(false);
+        setError(null);
+        setStatusText(null);
         return;
       }
-      const nextOrg = nextOrgs.find((x) => x.id === payload.activeOrgId) ?? currentOrg ?? nextOrgs[0] ?? null;
-      setCurrentOrg(nextOrg);
-      setStatusText(nextOrg ? `Connected to ${nextOrg.name}.` : null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to load organizations.");
-    } finally {
-      setLoadingOrgs(false);
+
+      setLoading(true);
+      setError(null);
+      setStatusText("Switching string workspace...");
+      setChats([]);
+      setActiveChatId(null);
+      setTeams([]);
+      setCollaborators([]);
+      setActorMemberId(null);
+      setSelectedTeamId(null);
+      setMode("discussion");
+      setDraft("");
+      setSearchQuery("");
+      setSidebarOpen(false);
+      setCollaborationOpen(false);
+      setSending(false);
+
+      try {
+        const [stringsResponse, directionsResponse, plansResponse, hubResponse] =
+          await Promise.all([
+            fetch(`/api/strings?orgId=${encodeURIComponent(orgId)}`, {
+              cache: "no-store",
+              credentials: "include"
+            }),
+            fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, {
+              cache: "no-store",
+              credentials: "include"
+            }),
+            fetch(`/api/plans?orgId=${encodeURIComponent(orgId)}`, {
+              cache: "no-store",
+              credentials: "include"
+            }),
+            fetch(`/api/hub/organization?orgId=${encodeURIComponent(orgId)}`, {
+              cache: "no-store",
+              credentials: "include"
+            })
+          ]);
+
+        const [
+          { payload: stringsPayload, rawText: stringsRaw },
+          { payload: directionsPayload, rawText: directionsRaw },
+          { payload: plansPayload, rawText: plansRaw },
+          { payload: hubPayload, rawText: hubRaw }
+        ] = await Promise.all([
+          parseResponse<StringApiResponse>(stringsResponse),
+          parseResponse<DirectionsResponse>(directionsResponse),
+          parseResponse<PlansResponse>(plansResponse),
+          parseResponse<HubOrganizationResponse>(hubResponse)
+        ]);
+
+        if (!stringsResponse.ok || !stringsPayload?.ok) {
+          throw new Error(
+            failMsg(stringsResponse.status, "Failed to load strings", stringsPayload?.message, stringsRaw)
+          );
+        }
+        if (!directionsResponse.ok || !directionsPayload?.ok) {
+          throw new Error(
+            failMsg(
+              directionsResponse.status,
+              "Failed to load directions",
+              directionsPayload?.message,
+              directionsRaw
+            )
+          );
+        }
+        if (!plansResponse.ok || !plansPayload?.ok) {
+          throw new Error(
+            failMsg(plansResponse.status, "Failed to load plans", plansPayload?.message, plansRaw)
+          );
+        }
+        if (!hubResponse.ok || !hubPayload?.ok) {
+          throw new Error(
+            failMsg(hubResponse.status, "Failed to load collaboration", hubPayload?.message, hubRaw)
+          );
+        }
+
+        if (loadVersionRef.current !== currentLoadId) {
+          return;
+        }
+
+        const persistedStrings = Array.isArray(stringsPayload.strings)
+          ? stringsPayload.strings.map((item) => normalizeChatString(item))
+          : [];
+        const directions = Array.isArray(directionsPayload.directions)
+          ? directionsPayload.directions
+          : [];
+        const plans = Array.isArray(plansPayload.plans) ? plansPayload.plans : [];
+        const collaborationWorkspace = mapCollaborationWorkspace(hubPayload);
+        const hydratedStrings = buildDerivedStrings(persistedStrings, directions, plans);
+        const initialTeam =
+          collaborationWorkspace.teams.find(
+            (team) => team.id === collaborationWorkspace.activeTeamId
+          ) ??
+          collaborationWorkspace.teams[0] ??
+          null;
+        const nextStrings =
+          hydratedStrings.length > 0 ? hydratedStrings : [createEmptyChat(initialTeam)];
+
+        setCollaborators(collaborationWorkspace.collaborators);
+        setTeams(collaborationWorkspace.teams);
+        setActorMemberId(collaborationWorkspace.actorMemberId);
+        setChats(nextStrings);
+        setActiveChatId((current) =>
+          current && nextStrings.some((item) => item.id === current)
+            ? current
+            : nextStrings[0]?.id ?? null
+        );
+        setSelectedTeamId(
+          collaborationWorkspace.activeTeamId ?? nextStrings[0]?.selectedTeamId ?? initialTeam?.id ?? null
+        );
+        setStatusText(
+          `Synced ${nextStrings.length} strings, ${collaborationWorkspace.collaborators.length} collaborators, and ${collaborationWorkspace.teams.length} teams.`
+        );
+      } catch (nextError) {
+        if (loadVersionRef.current !== currentLoadId) {
+          return;
+        }
+
+        const fallbackChat = createEmptyChat(null);
+        setChats([fallbackChat]);
+        setActiveChatId(fallbackChat.id);
+        setTeams([]);
+        setCollaborators([]);
+        setActorMemberId(null);
+        setSelectedTeamId(null);
+        setError(nextError instanceof Error ? nextError.message : "Failed to load string workspace.");
+        setStatusText(null);
+      } finally {
+        if (loadVersionRef.current === currentLoadId) {
+          setLoading(false);
+        }
+      }
+    };
+
+    void loadWorkspace();
+  }, [orgId]);
+
+  async function persistChat(chat: ChatString) {
+    if (!orgId) {
+      return chat;
     }
-  }, [currentOrg, setActiveUsers, setCurrentOrg, setOrgs, user?.email, user?.uid]);
 
-  useEffect(() => {
-    void loadOrganizations();
-  }, [loadOrganizations]);
+    const response = await fetch("/api/strings", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        orgId,
+        id: chat.id,
+        title: chat.title,
+        mode: chat.mode,
+        updatedAt: chat.updatedAt,
+        createdAt: chat.createdAt,
+        directionId: chat.directionId ?? null,
+        planId: chat.planId ?? null,
+        selectedTeamId: chat.selectedTeamId ?? null,
+        selectedTeamLabel: chat.selectedTeamLabel ?? null,
+        source: chat.source ?? "workspace",
+        messages: chat.messages
+      })
+    });
+    const { payload, rawText } = await parseResponse<StringApiResponse>(response);
 
-  useEffect(() => {
-    if (!activeOrg?.id) return;
-    void hydrateWorkspace(activeOrg.id);
-  }, [activeOrg?.id, hydrateWorkspace]);
+    if (!response.ok || !payload?.ok || !payload.string) {
+      throw new Error(failMsg(response.status, "Failed to save string", payload?.message, rawText));
+    }
 
-  useEffect(() => {
-    if (!activeOrg?.id) {
-      setGroups([]);
+    const persisted = normalizeChatString(payload.string);
+    setChats((current) =>
+      sortChats(current.map((item) => (item.id === persisted.id ? persisted : item)))
+    );
+
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent(STRINGS_UPDATED_EVENT, {
+          detail: {
+            orgId,
+            stringId: persisted.id
+          }
+        })
+      );
+    }
+
+    return persisted;
+  }
+
+  async function persistActiveTeam(teamId: string | null) {
+    if (!orgId) {
       return;
     }
-    setGroups(readJson<CollaboratorGroup[]>(`${GROUPS_KEY}:${activeOrg.id}`, []));
-  }, [activeOrg?.id]);
 
-  useEffect(() => {
-    if (!activeOrg?.id) return;
-    writeJson(`${GROUPS_KEY}:${activeOrg.id}`, groups);
-  }, [activeOrg?.id, groups]);
+    const response = await fetch("/api/hub/organization", {
+      method: "PATCH",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        orgId,
+        collaborationAction: "SET_ACTIVE_TEAM",
+        activeTeamId: teamId ?? ""
+      })
+    });
+    const { payload, rawText } = await parseResponse<JsonEnvelope>(response);
 
-  useEffect(() => {
-    if (!activeOrg?.id) return;
-    writeJson(`${STRINGS_KEY}:${activeOrg.id}`, strings);
-  }, [activeOrg?.id, strings]);
+    if (!response.ok || !payload?.ok) {
+      throw new Error(
+        failMsg(response.status, "Failed to update active team", payload?.message, rawText)
+      );
+    }
+  }
 
-  useEffect(() => {
-    const syncSidebarByViewport = () => {
-      if (window.innerWidth >= 1024) setSidebarOpen(true);
-    };
-    syncSidebarByViewport();
-    window.addEventListener("resize", syncSidebarByViewport);
-    return () => window.removeEventListener("resize", syncSidebarByViewport);
-  }, []);
+  function replaceChat(nextChat: ChatString) {
+    setChats((current) =>
+      sortChats([
+        normalizeChatString(nextChat),
+        ...current.filter((item) => item.id !== nextChat.id)
+      ])
+    );
+  }
 
-  useEffect(() => {
-    if (selected) setMode(selected.mode);
-  }, [selected]);
+  function handleSelectChat(chatId: string) {
+    setActiveChatId(chatId);
+    setSidebarOpen(false);
+  }
 
-  useEffect(() => {
-    if (selectedString || strings.length === 0) return;
-    setSelectedString(strings[0]?.id ?? null);
-  }, [selectedString, strings]);
-
-  const handleSelectString = (stringId: string) => {
-    setSelectedString(stringId);
-    const next = strings.find((item) => item.id === stringId);
-    if (next) setMode(next.mode);
-    if (typeof window !== "undefined" && window.innerWidth < 1024) setSidebarOpen(false);
-  };
-
-  const handleNewString = () => {
-    const newString = blankString();
-    setStrings((prev) => [newString, ...prev]);
-    setSelectedString(newString.id);
+  function handleNewChat() {
+    const baseTeam = teams.find((team) => team.id === selectedTeamId) ?? teams[0] ?? null;
+    const nextChat = createEmptyChat(baseTeam);
+    setChats((current) => sortChats([nextChat, ...current]));
+    setActiveChatId(nextChat.id);
     setMode("discussion");
     setDraft("");
-    if (typeof window !== "undefined" && window.innerWidth < 1024) setSidebarOpen(false);
-  };
-
-  const handleTitleChange = (value: string) => {
-    if (!selected) return;
-    setStrings((prev) => prev.map((item) => (item.id === selected.id ? { ...item, title: tr(value, 72), updatedAt: nowIso() } : item)));
-  };
-
-  const handleModeChange = (nextMode: StringMode) => {
-    setMode(nextMode);
-    if (!selected) return;
-    setStrings((prev) => prev.map((item) => (item.id === selected.id ? { ...item, mode: nextMode, updatedAt: nowIso() } : item)));
-  };
-
-  const handleSend = useCallback(async () => {
-    const text = draft.trim();
-    const orgId = activeOrg?.id;
-    if (!text || !selected || !orgId || sending) return;
-
-    const threadId = selected.id;
-    const selectedMode = mode;
-    const userMessage: ChatMessage = { id: rid("msg"), role: "user", content: text, createdAt: nowIso() };
-    const baseHistory = [...selected.messages, userMessage];
-
-    setStrings((prev) => prev.map((item) => item.id === threadId ? { ...item, mode: selectedMode, updatedAt: nowIso(), messages: [...item.messages, userMessage] } : item));
-    setDraft("");
-    setSending(true);
+    setSidebarOpen(false);
     setError(null);
+    void persistChat(nextChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to save string.");
+    });
+  }
 
-    if (selected.title === "New String" || selected.title === "Untitled String") {
-      setStrings((prev) => prev.map((item) => item.id === threadId ? { ...item, title: tr(text, 72), updatedAt: nowIso() } : item));
+  function handleTitleChange(value: string) {
+    if (!activeChat) {
+      return;
     }
 
+    setChats((current) =>
+      current.map((chat) =>
+        chat.id === activeChat.id
+          ? {
+              ...chat,
+              title: value
+            }
+          : chat
+      )
+    );
+  }
+
+  function handleTitleBlur() {
+    if (!activeChat) {
+      return;
+    }
+
+    const nextChat = {
+      ...activeChat,
+      title: trimTitle(activeChat.title),
+      updatedAt: nowIso()
+    };
+    replaceChat(nextChat);
+    void persistChat(nextChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to save string title.");
+    });
+  }
+
+  function handleModeChange(nextMode: StringMode) {
+    setMode(nextMode);
+
+    if (!activeChat) {
+      return;
+    }
+
+    const nextChat = {
+      ...activeChat,
+      mode: nextMode,
+      updatedAt: nowIso()
+    };
+    replaceChat(nextChat);
+    void persistChat(nextChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to save string mode.");
+    });
+  }
+
+  function handleSelectTeam(teamId: string) {
+    const nextTeam = teams.find((team) => team.id === teamId) ?? null;
+
+    setSelectedTeamId(teamId);
+
+    if (activeChat) {
+      const nextChat = {
+        ...activeChat,
+        selectedTeamId: nextTeam?.id ?? null,
+        selectedTeamLabel: nextTeam?.name ?? null,
+        updatedAt: nowIso()
+      };
+      replaceChat(nextChat);
+      void persistChat(nextChat).catch((nextError) => {
+        setError(nextError instanceof Error ? nextError.message : "Failed to save team routing.");
+      });
+    }
+
+    if (!actorMemberId || nextTeam?.memberIds.includes(actorMemberId)) {
+      void persistActiveTeam(teamId).catch((nextError) => {
+        setError(nextError instanceof Error ? nextError.message : "Failed to update active team.");
+      });
+    }
+  }
+
+  async function sendMessage(teamId = selectedTeamId) {
+    const targetChat = activeChat;
+    const content = draft.trim();
+
+    if (!orgId || !targetChat || !content || sending) {
+      return;
+    }
+
+    const targetTeam = teams.find((team) => team.id === teamId) ?? null;
+    const timestamp = nowIso();
+    const selectedMode = mode;
+    const userMessage: ChatMessage = {
+      id: createId("message"),
+      role: "user",
+      content,
+      createdAt: timestamp,
+      teamId: targetTeam?.id ?? null,
+      teamLabel: targetTeam?.name ?? null
+    };
+
+    const optimisticChat: ChatString = {
+      ...targetChat,
+      title: targetChat.title === DEFAULT_CHAT_TITLE ? titleFromMessage(content) : targetChat.title,
+      mode: selectedMode,
+      updatedAt: timestamp,
+      selectedTeamId: targetTeam?.id ?? targetChat.selectedTeamId ?? null,
+      selectedTeamLabel: targetTeam?.name ?? targetChat.selectedTeamLabel ?? null,
+      messages: [...targetChat.messages, userMessage]
+    };
+
+    replaceChat(optimisticChat);
+    setDraft("");
+    setSending(true);
+    setCollaborationOpen(false);
+    setError(null);
+
+    const userPersistPromise = persistChat(optimisticChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to save string.");
+      return optimisticChat;
+    });
+
     try {
-      const chatStart = performance.now();
+      const chatStartedAt = performance.now();
       const chatResponse = await fetch("/api/control/direction-chat", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orgId, message: text, history: toHistory(baseHistory) })
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          orgId,
+          message: content,
+          history: toHistory(optimisticChat.messages)
+        })
       });
-      const chatLatency = Math.round(performance.now() - chatStart);
-      const { payload: chatPayload, rawText: chatRaw } = await parseResponse<JsonEnvelope<DirectionChatApiResponse> & DirectionChatApiResponse>(chatResponse);
+      const chatLatency = Math.round(performance.now() - chatStartedAt);
+      const { payload: chatPayload, rawText: chatRaw } =
+        await parseResponse<DirectionChatApiResponse>(chatResponse);
+
       if (!chatResponse.ok || !chatPayload?.ok || !chatPayload.reply) {
-        throw new Error(failMsg(chatResponse.status, "Organization chat failed", chatPayload?.message, chatRaw));
+        throw new Error(
+          failMsg(chatResponse.status, "Discussion request failed", chatPayload?.message, chatRaw)
+        );
       }
 
       const routing: MessageRouting | undefined = chatPayload.intentRouting
         ? {
             route: chatPayload.intentRouting.route,
-            ...(chatPayload.intentRouting.reason ? { reason: chatPayload.intentRouting.reason } : {}),
-            ...(Array.isArray(chatPayload.intentRouting.toolkitHints) ? { toolkitHints: chatPayload.intentRouting.toolkitHints } : {})
+            ...(chatPayload.intentRouting.reason
+              ? { reason: chatPayload.intentRouting.reason }
+              : {}),
+            ...(Array.isArray(chatPayload.intentRouting.toolkitHints)
+              ? { toolkitHints: chatPayload.intentRouting.toolkitHints }
+              : {})
           }
         : undefined;
 
-      const systemMessage: ChatMessage = {
-        id: rid("msg"),
-        role: "system",
-        content: chatPayload.reply,
-        createdAt: nowIso(),
-        metrics: {
-          latencyMs: Math.max(0, chatLatency),
-          ...(typeof chatPayload.tokenUsage?.promptTokens === "number" ? { promptTokens: chatPayload.tokenUsage.promptTokens } : {}),
-          ...(typeof chatPayload.tokenUsage?.completionTokens === "number" ? { completionTokens: chatPayload.tokenUsage.completionTokens } : {}),
-          ...(typeof chatPayload.tokenUsage?.totalTokens === "number" ? { totalTokens: chatPayload.tokenUsage.totalTokens } : {}),
-          ...(chatPayload.model?.provider ? { provider: chatPayload.model.provider } : {}),
-          ...(chatPayload.model?.name ? { model: chatPayload.model.name } : {}),
-          ...(chatPayload.model?.source ? { source: chatPayload.model.source } : {})
-        },
-        ...(routing ? { routing } : {})
-      };
+      const followUps: ChatMessage[] = [
+        {
+          id: createId("message"),
+          role: "system",
+          content: chatPayload.reply,
+          createdAt: nowIso(),
+          authorName: COFOUNDER_MANAGER_NAME,
+          authorRole: COFOUNDER_MANAGER_ROLE,
+          teamId: targetTeam?.id ?? null,
+          teamLabel: targetTeam?.name ?? null,
+          ...(routing ? { routing } : {}),
+          metrics: {
+            latencyMs: Math.max(0, chatLatency),
+            ...(typeof chatPayload.tokenUsage?.promptTokens === "number"
+              ? { promptTokens: chatPayload.tokenUsage.promptTokens }
+              : {}),
+            ...(typeof chatPayload.tokenUsage?.completionTokens === "number"
+              ? { completionTokens: chatPayload.tokenUsage.completionTokens }
+              : {}),
+            ...(typeof chatPayload.tokenUsage?.totalTokens === "number"
+              ? { totalTokens: chatPayload.tokenUsage.totalTokens }
+              : {}),
+            ...(chatPayload.model?.provider ? { provider: chatPayload.model.provider } : {}),
+            ...(chatPayload.model?.name ? { model: chatPayload.model.name } : {}),
+            ...(chatPayload.model?.source ? { source: chatPayload.model.source } : {})
+          }
+        }
+      ];
 
-      const followUps: ChatMessage[] = [systemMessage];
-      const shouldPlan = selectedMode === "direction" || chatPayload.intentRouting?.route === "PLAN_REQUIRED";
-      const directionText = (chatPayload.directionCandidate || text).trim();
+      let directionId = optimisticChat.directionId ?? null;
+      let planId = optimisticChat.planId ?? null;
+      const shouldPlan =
+        selectedMode === "direction" || chatPayload.intentRouting?.route === "PLAN_REQUIRED";
+      const directionText = (chatPayload.directionCandidate || content).trim();
 
       if (shouldPlan && directionText) {
-        const planStart = performance.now();
+        const planStartedAt = performance.now();
         const planResponse = await fetch("/api/control/direction-plan", {
           method: "POST",
           credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ orgId, direction: directionText, history: toHistory([...baseHistory, systemMessage]), humanPlan: "" })
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId,
+            direction: directionText,
+            threadId: targetChat.id,
+            history: toHistory([...optimisticChat.messages, ...followUps]),
+            humanPlan: ""
+          })
         });
-        const planLatency = Math.round(performance.now() - planStart);
-        const { payload: planPayload, rawText: planRaw } = await parseResponse<JsonEnvelope<DirectionPlanApiResponse> & DirectionPlanApiResponse>(planResponse);
+        const planLatency = Math.round(performance.now() - planStartedAt);
+        const { payload: planPayload, rawText: planRaw } =
+          await parseResponse<DirectionPlanApiResponse>(planResponse);
 
         if (planResponse.ok && planPayload?.ok && planPayload.primaryPlan) {
+          directionId = planPayload.directionRecord?.id ?? directionId;
+          planId = planPayload.planRecord?.id ?? planId;
+
           followUps.push({
-            id: rid("msg"),
+            id: createId("message"),
             role: "system",
             content: planPayload.analysis || "Execution plan generated and linked.",
             createdAt: nowIso(),
-            direction: toDirectionPayload(planPayload.directionGiven || directionText, planPayload.primaryPlan, planPayload.requiredToolkits, planPayload.requestCount),
+            authorName: COFOUNDER_MANAGER_NAME,
+            authorRole: "Direction lead",
+            teamId: targetTeam?.id ?? null,
+            teamLabel: targetTeam?.name ?? null,
+            direction: toDirectionPayload(
+              planPayload.directionGiven || directionText,
+              planPayload.primaryPlan,
+              planPayload.requiredToolkits,
+              planPayload.requestCount,
+              targetTeam?.name ?? null
+            ),
+            routing: {
+              route: "PLAN_REQUIRED",
+              reason: "Direction plan generated from this message.",
+              toolkitHints: planPayload.requiredToolkits ?? []
+            },
             metrics: {
               latencyMs: Math.max(0, planLatency),
-              ...(typeof planPayload.tokenUsage?.promptTokens === "number" ? { promptTokens: planPayload.tokenUsage.promptTokens } : {}),
-              ...(typeof planPayload.tokenUsage?.completionTokens === "number" ? { completionTokens: planPayload.tokenUsage.completionTokens } : {}),
-              ...(typeof planPayload.tokenUsage?.totalTokens === "number" ? { totalTokens: planPayload.tokenUsage.totalTokens } : {}),
+              ...(typeof planPayload.tokenUsage?.promptTokens === "number"
+                ? { promptTokens: planPayload.tokenUsage.promptTokens }
+                : {}),
+              ...(typeof planPayload.tokenUsage?.completionTokens === "number"
+                ? { completionTokens: planPayload.tokenUsage.completionTokens }
+                : {}),
+              ...(typeof planPayload.tokenUsage?.totalTokens === "number"
+                ? { totalTokens: planPayload.tokenUsage.totalTokens }
+                : {}),
               ...(planPayload.model?.provider ? { provider: planPayload.model.provider } : {}),
               ...(planPayload.model?.name ? { model: planPayload.model.name } : {}),
               ...(planPayload.model?.source ? { source: planPayload.model.source } : {})
-            },
-            routing: { route: "PLAN_REQUIRED", reason: "Direction plan generated from this message.", toolkitHints: planPayload.requiredToolkits ?? [] }
+            }
           });
         } else {
-          followUps.push({ id: rid("msg"), role: "system", content: failMsg(planResponse.status, "Planning step failed", planPayload?.message, planRaw), createdAt: nowIso(), error: true });
+          followUps.push({
+            id: createId("message"),
+            role: "system",
+            content: failMsg(
+              planResponse.status,
+              "Direction planning failed",
+              planPayload?.message,
+              planRaw
+            ),
+            createdAt: nowIso(),
+            authorName: "System",
+            authorRole: "Workspace notice",
+            teamId: targetTeam?.id ?? null,
+            teamLabel: targetTeam?.name ?? null,
+            error: true
+          });
         }
       }
 
-      setStrings((prev) => prev.map((item) => item.id === threadId ? { ...item, mode: selectedMode, updatedAt: nowIso(), messages: [...item.messages, ...followUps] } : item));
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Failed to send message.";
-      setError(msg);
-      setStrings((prev) => prev.map((item) => item.id === threadId ? { ...item, mode: selectedMode, updatedAt: nowIso(), messages: [...item.messages, { id: rid("msg"), role: "system", content: msg, createdAt: nowIso(), error: true }] } : item));
+      await userPersistPromise;
+
+      const finalChat: ChatString = {
+        ...optimisticChat,
+        updatedAt: followUps[followUps.length - 1]?.createdAt ?? nowIso(),
+        directionId,
+        planId,
+        messages: [...optimisticChat.messages, ...followUps]
+      };
+      replaceChat(finalChat);
+      await persistChat(finalChat);
+    } catch (nextError) {
+      const message =
+        nextError instanceof Error ? nextError.message : "Failed to send message.";
+      setError(message);
+
+      const failedChat: ChatString = {
+        ...optimisticChat,
+        updatedAt: nowIso(),
+        messages: [
+          ...optimisticChat.messages,
+          {
+            id: createId("message"),
+            role: "system",
+            content: message,
+            createdAt: nowIso(),
+            authorName: "System",
+            authorRole: "Workspace notice",
+            teamId: targetTeam?.id ?? null,
+            teamLabel: targetTeam?.name ?? null,
+            error: true
+          }
+        ]
+      };
+      replaceChat(failedChat);
+      void persistChat(failedChat).catch(() => undefined);
     } finally {
       setSending(false);
     }
-  }, [activeOrg?.id, draft, mode, selected, sending]);
+  }
 
-  const handleInvite = useCallback(async (input: { value: string; kind: CollaboratorKind }) => {
-    const orgId = activeOrg?.id;
-    if (!orgId) return;
-    const defaultRole = input.kind === "AI" ? "AI Agent" : "Employee";
-    const name = tr(input.value.includes("@") ? input.value.split("@")[0] || input.value : input.value, 48);
-    const email = input.value.includes("@") ? input.value : `${input.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "team"}@team.local`;
-    setError(null);
-    setStatusText(`Inviting ${name}...`);
-    try {
-      const response = await fetch("/api/squad/personnel", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orgId, type: input.kind === "AI" ? "AI" : "HUMAN", name, role: defaultRole })
-      });
-      const { payload, rawText } = await parseResponse<JsonEnvelope<Record<string, unknown>>>(response);
-      if (!response.ok || !payload?.ok) throw new Error(failMsg(response.status, "Unable to invite collaborator", payload?.message, rawText));
-      await loadWorkforce(orgId);
-      upsertActiveUsers([{ id: `invite:${email.toLowerCase()}`, name, email, role: defaultRole, kind: input.kind, color: ccolor(email.toLowerCase()), online: true, source: "team" }]);
-      setStatusText(`${name} added to workforce.`);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to invite collaborator.");
+  function handleDiscussWithTeam() {
+    handleModeChange("discussion");
+    setCollaborationOpen(false);
+
+    if (!draft.trim() && selectedTeam) {
+      setDraft(`Discuss with ${selectedTeam.name}: `);
     }
-  }, [activeOrg?.id, loadWorkforce, upsertActiveUsers]);
-
-  const handleCreateGroup = (input: { name: string; memberIds: string[] }) => {
-    const groupName = input.name.trim();
-    if (!groupName || input.memberIds.length === 0) return;
-    setGroups((prev) => [{ id: rid("grp"), name: groupName, type: "team", memberIds: Array.from(new Set(input.memberIds)), createdAt: nowIso() }, ...prev]);
-  };
-
-  const handleUseGroupInChat = (groupId: string) => {
-    const group = groups.find((item) => item.id === groupId);
-    if (!group) return;
-    const prefix = `@team:${group.name} `;
-    setDraft((prev) => (prev.trim() ? `${prev.trim()}\n${prefix}` : prefix));
-    setTeamPanelOpen(false);
-  };
-
-  const handleOrgSwitch = (orgId: string) => {
-    const next = orgs.find((item) => item.id === orgId) ?? null;
-    setCurrentOrg(next);
-    if (next) setStatusText(`Switched to ${next.name}.`);
-  };
-
-  const handleRefresh = async () => {
-    await loadOrganizations();
-    if (activeOrg?.id) await hydrateWorkspace(activeOrg.id);
-  };
-
-  if (!user) return null;
-
-  if (loadingOrgs && !activeOrg) {
-    return <main className="flex min-h-screen items-center justify-center bg-[#070b10] text-slate-200"><div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-black/30 px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em]"><Loader2 size={14} className="animate-spin" />Loading Workspace</div></main>;
   }
 
-  if (!activeOrg) {
-    return <main className="flex min-h-screen items-center justify-center bg-[#070b10] p-4 text-slate-100"><div className="w-full max-w-xl rounded-3xl border border-white/15 bg-[#0d131b]/95 p-6 shadow-[0_20px_60px_rgba(0,0,0,0.42)]"><p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300">Organization</p><h1 className="mt-2 text-2xl font-semibold text-slate-100">No organization found</h1><p className="mt-2 text-sm text-slate-400">This account has no organization access yet. Join or create an organization, then refresh.</p>{error ? <p className="mt-3 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">{error}</p> : null}<div className="mt-4 flex flex-wrap gap-2"><button type="button" onClick={handleRefresh} className="inline-flex items-center gap-2 rounded-full border border-cyan-500/35 bg-cyan-500/15 px-4 py-2 text-xs font-semibold text-cyan-100 transition hover:bg-cyan-500/25"><RefreshCw size={14} />Refresh</button><button type="button" onClick={signOutCurrentUser} className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/30 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-black/45"><LogOut size={14} />Sign Out</button></div></div></main>;
+  function handleSetDirection() {
+    handleModeChange("direction");
+    setCollaborationOpen(false);
+
+    if (!draft.trim() && selectedTeam) {
+      setDraft(`Direction for ${selectedTeam.name}: `);
+    }
   }
 
-  return (
-    <div className={`relative overflow-hidden bg-[#090d12] text-slate-100 ${embedded ? "h-full rounded-[28px] border border-white/10" : "h-[100dvh]"}`}>
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_14%_8%,rgba(6,182,212,0.16),transparent_48%),radial-gradient(circle_at_86%_96%,rgba(16,185,129,0.09),transparent_42%)]" />
-      <div className="relative flex h-full min-w-0 flex-col">
-        <header className="border-b border-white/10 bg-[#0a1119]/80 px-4 py-3 backdrop-blur sm:px-6">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0"><p className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-[0.16em] text-slate-400"><Building2 size={12} />VorldX String Console</p><p className="truncate text-sm font-semibold text-slate-100">{activeOrg.name}</p></div>
-            <div className="flex flex-wrap items-center gap-2"><label className="rounded-full border border-white/15 bg-black/25 px-3 py-1.5 text-xs text-slate-300"><span className="mr-2 text-slate-500">Org</span><select value={activeOrg.id} onChange={(e) => handleOrgSwitch(e.target.value)} className="bg-transparent text-xs font-semibold text-slate-100 outline-none">{orgs.map((org) => <option key={org.id} value={org.id} className="bg-[#0f141b] text-slate-100">{org.name}</option>)}</select></label><button type="button" onClick={handleRefresh} disabled={syncing || loadingOrgs} className="inline-flex items-center gap-1.5 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-3 py-1.5 text-xs font-semibold text-cyan-200 transition hover:bg-cyan-500/20 disabled:opacity-55">{syncing || loadingOrgs ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}Sync</button><button type="button" onClick={signOutCurrentUser} className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-black/35 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-black/45"><LogOut size={13} />Sign Out</button></div>
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">{statusText ? <span>{statusText}</span> : null}{latestMetrics ? <span className="rounded-full border border-white/10 bg-black/30 px-2 py-0.5">{typeof latestMetrics.totalTokens === "number" ? `${latestMetrics.totalTokens} tokens` : "No token data"} | {latestMetrics.latencyMs} ms</span> : null}</div>
-          {error ? <p className="mt-2 rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">{error}</p> : null}
-        </header>
+  function handleOpenAddMember() {
+    setCollaborationOpen(false);
+    onOpenAddMember?.();
+  }
 
-        <div className="relative flex min-h-0 flex-1">
-          <Sidebar sidebarOpen={sidebarOpen} searchQuery={searchQuery} strings={filteredStrings} selectedStringId={selectedString} onSearchQueryChange={setSearchQuery} onSelectString={handleSelectString} onNewString={handleNewString} onCloseMobile={() => setSidebarOpen(false)} />
-          <div className="flex min-w-0 flex-1">
-            <div className="flex min-w-0 flex-1 flex-col">
-              <ChatHeader title={selected?.title ?? "No String Selected"} mode={mode} teamPanelOpen={teamPanelOpen} onTitleChange={handleTitleChange} onModeChange={handleModeChange} onToggleSidebar={() => setSidebarOpen((prev) => !prev)} onToggleTeamPanel={() => setTeamPanelOpen((prev) => !prev)} />
-              {selected ? <ChatWindow mode={mode} messages={selected.messages} /> : <div className="flex flex-1 items-center justify-center p-6"><div className="rounded-2xl border border-dashed border-white/15 bg-black/25 px-6 py-10 text-center"><p className="text-sm font-semibold text-slate-200">No string selected</p><p className="mt-2 text-sm text-slate-500">Create your first string to start discussion or direction mode.</p><button type="button" onClick={handleNewString} className="mt-4 rounded-full border border-cyan-500/35 bg-cyan-500/12 px-4 py-2 text-xs font-semibold text-cyan-200 transition hover:bg-cyan-500/20">Create String</button></div></div>}
-              {selected ? <ChatInput mode={mode} value={draft} disabled={sending || syncing} submitting={sending} onValueChange={setDraft} onSend={handleSend} /> : null}
-            </div>
-            <TeamPanel open={teamPanelOpen} collaborators={collaborators} groups={groups} onInvite={() => setInviteOpen(true)} onCreateGroup={() => setCreateGroupOpen(true)} onRemove={(id) => removeActiveUser(id)} onRemoveGroup={(id) => setGroups((prev) => prev.filter((item) => item.id !== id))} onUseGroup={handleUseGroupInChat} onCloseMobile={() => setTeamPanelOpen(false)} />
+  function handleOpenCreateTeam() {
+    setCollaborationOpen(false);
+    onOpenCreateTeam?.();
+  }
+
+  const statusBanner =
+    error || statusText || loading ? (
+      <div className="border-b border-white/10 px-4 py-3 sm:px-6">
+        <div
+          className={`rounded-2xl border px-3 py-2 text-xs ${
+            error
+              ? "border-rose-500/35 bg-rose-500/10 text-rose-200"
+              : "border-white/10 bg-black/15 text-slate-400"
+          }`}
+        >
+          {error ?? (loading ? "Syncing string workspace..." : statusText)}
+        </div>
+      </div>
+    ) : null;
+
+  if (!orgId) {
+    return (
+      <div
+        className={`relative overflow-hidden bg-[#0a0f1c] text-slate-100 ${
+          embedded ? "flex h-full min-h-0 flex-1 rounded-[32px] border border-white/10" : "h-[100dvh]"
+        }`}
+      >
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(251,191,36,0.12),transparent_28%),linear-gradient(180deg,#0a0f1c_0%,#0b1220_48%,#09111d_100%)]" />
+        <div className="relative flex h-full min-h-0 flex-1 items-center justify-center p-6">
+          <div className="max-w-lg rounded-[32px] border border-dashed border-white/15 bg-black/20 px-6 py-10 text-center">
+            <p className="text-sm font-semibold text-slate-200">Connect an organization to use Strings.</p>
+            <p className="mt-2 text-sm text-slate-500">
+              String history, collaboration teams, discussion, and direction all load from the active org workspace.
+            </p>
           </div>
         </div>
       </div>
+    );
+  }
 
-      <InviteModal open={inviteOpen} onClose={() => setInviteOpen(false)} onInvite={handleInvite} />
-      <CreateGroupModal open={createGroupOpen} collaborators={workforceMembers} onClose={() => setCreateGroupOpen(false)} onCreate={handleCreateGroup} />
+  return (
+    <div
+      className={`relative overflow-hidden bg-[#0a0f1c] text-slate-100 ${
+        embedded
+          ? "flex h-full min-h-0 flex-1 rounded-[28px] border border-white/10 sm:rounded-[32px]"
+          : "h-[100dvh]"
+      }`}
+    >
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(251,191,36,0.12),transparent_28%),linear-gradient(180deg,#0a0f1c_0%,#0b1220_48%,#09111d_100%)]" />
+      <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.015)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.015)_1px,transparent_1px)] bg-[size:28px_28px] opacity-40" />
+
+      <div className="relative mx-auto flex h-full min-h-0 w-full max-w-[1760px] justify-center gap-2.5 p-2.5 sm:gap-3 sm:p-3 lg:gap-4 lg:p-4">
+        <Sidebar
+          open={sidebarOpen}
+          searchQuery={searchQuery}
+          chats={filteredChats}
+          activeChatId={activeChat?.id ?? null}
+          onSearchQueryChange={setSearchQuery}
+          onSelectChat={handleSelectChat}
+          onNewChat={handleNewChat}
+          onClose={() => setSidebarOpen(false)}
+        />
+
+        <main className="min-w-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-[#0f172a]/80 shadow-[0_24px_80px_rgba(0,0,0,0.28)] backdrop-blur sm:rounded-[32px]">
+          <div className="flex h-full min-h-0 flex-col">
+            <ChatHeader
+              title={activeChat?.title ?? DEFAULT_CHAT_TITLE}
+              mode={mode}
+              selectedTeamLabel={selectedTeam?.name ?? activeChat?.selectedTeamLabel ?? null}
+              onTitleChange={handleTitleChange}
+              onTitleBlur={handleTitleBlur}
+              onModeChange={handleModeChange}
+              onOpenSidebar={() => setSidebarOpen(true)}
+              onOpenCollaboration={() => setCollaborationOpen(true)}
+            />
+
+            {statusBanner}
+
+            <ChatWindow
+              mode={mode}
+              messages={activeChat?.messages ?? []}
+              isResponding={sending}
+            />
+
+            <ChatInput
+              mode={mode}
+              value={draft}
+              disabled={!activeChat || sending || loading}
+              sending={sending}
+              onValueChange={setDraft}
+              onSend={() => void sendMessage()}
+            />
+          </div>
+        </main>
+
+        <CollaborationPanel
+          open={collaborationOpen}
+          collaborators={collaborators}
+          teams={teams}
+          selectedTeamId={selectedTeamId}
+          onSelectTeam={handleSelectTeam}
+          onClose={() => setCollaborationOpen(false)}
+          onSendToTeam={() => void sendMessage(selectedTeamId)}
+          onDiscussWithTeam={handleDiscussWithTeam}
+          onSetDirection={handleSetDirection}
+          onOpenAddMember={handleOpenAddMember}
+          onOpenCreateTeam={handleOpenCreateTeam}
+          canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
+          sending={sending}
+        />
+      </div>
     </div>
   );
 }

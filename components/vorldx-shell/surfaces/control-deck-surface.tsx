@@ -324,6 +324,7 @@ export function ControlDeckSurface({
     !hasDirectionDraft &&
     !hasActionCards &&
     !planningResult?.analysis;
+  const hideControlDeckScreenshotElements = true;
   const actionQueueCount = Number(Boolean(pendingPlanLaunchApproval)) +
     Number(Boolean(pendingToolkitApproval)) +
     Number(Boolean(pendingEmailApproval)) +
@@ -1145,7 +1146,11 @@ export function ControlDeckSurface({
         isStringsView ? "h-[calc(100%+3.5rem)] sm:h-[calc(100%+6rem)] md:h-[calc(100%+7rem)]" : "h-full"
       }`}
     >
-      <div className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between">
+      <div
+        className={`flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between ${
+          hideControlDeckScreenshotElements ? "hidden" : ""
+        }`}
+      >
         <div>
           <p className="text-xs text-slate-500">Control interface</p>
           <p className="text-sm font-medium text-slate-200 sm:text-base">{workspaceTitle}</p>
@@ -1253,7 +1258,7 @@ export function ControlDeckSurface({
         </div>
       ) : null}
 
-      {showAdvanced && !isStringsView ? (
+      {showAdvanced && !isStringsView && !hideControlDeckScreenshotElements ? (
         <div className={`vx-panel grid gap-3 rounded-2xl p-3 sm:grid-cols-[minmax(0,280px)_1fr] ${themeStyle.border}`}>
           <label className="space-y-1">
             <span className="text-xs text-slate-500">Model</span>
@@ -1307,7 +1312,9 @@ export function ControlDeckSurface({
       ) : null}
 
       <div
-        className={`vx-panel relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#060a10]/96 p-3 shadow-[0_28px_70px_rgba(0,0,0,0.5)] sm:rounded-[30px] sm:p-4 ${themeStyle.border}`}
+        className={`vx-panel relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[24px] border border-white/10 bg-[#060a10]/96 p-3 shadow-[0_28px_70px_rgba(0,0,0,0.5)] sm:rounded-[30px] sm:p-4 ${
+          hideControlDeckScreenshotElements && !isStringsView ? "hidden" : ""
+        } ${themeStyle.border}`}
       >
         <div className="pointer-events-none absolute -left-20 top-0 h-52 w-52 rounded-full bg-cyan-500/6 blur-3xl" />
         <div className="pointer-events-none absolute -right-16 bottom-0 h-52 w-52 rounded-full bg-emerald-500/5 blur-3xl" />
@@ -2199,7 +2206,7 @@ export function ControlDeckSurface({
 
       </div>
 
-      {!isStringsView ? (
+      {!isStringsView && !hideControlDeckScreenshotElements ? (
         <div className="pointer-events-none fixed inset-x-0 bottom-[calc(4.7rem+env(safe-area-inset-bottom))] z-30 flex justify-center px-3 sm:px-4">
           <div className="pointer-events-auto w-full max-w-4xl">{composerBar}</div>
         </div>

@@ -68,6 +68,8 @@ import { FlowStringsSurface } from "@/components/vorldx-shell/surfaces/flow-stri
 import { ScanConsoleSurface } from "@/components/vorldx-shell/surfaces/scan-console-surface";
 import { SteerDetailsEditorSurface } from "@/components/vorldx-shell/surfaces/steer-details-editor-surface";
 import { useFlowScope } from "@/components/vorldx-shell/hooks/use-flow-scope";
+import { StringChatShell } from "@/components/chat-ui/string-chat-shell";
+import type { ChatMessage, ChatString, StringMode } from "@/components/chat-ui/types";
 
 import {
   ActorType,
@@ -182,6 +184,409 @@ import {
   workflowAgentLabelFromTaskTrace
 } from "@/components/vorldx-shell/shared";
 
+const STRINGS_UPDATED_EVENT = "vx:strings-updated";
+
+interface WorkspaceStringsResponse {
+  ok?: boolean;
+  message?: string;
+  strings?: ChatString[];
+}
+
+interface WorkspaceDirectionRecord {
+  id: string;
+  title: string;
+  summary: string;
+  direction: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface WorkspaceDirectionsResponse {
+  ok?: boolean;
+  message?: string;
+  directions?: WorkspaceDirectionRecord[];
+}
+
+interface WorkspacePlanRecord {
+  id: string;
+  title: string;
+  summary: string;
+  direction: string;
+  directionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  primaryPlan?: DirectionExecutionPlan;
+  fallbackPlan?: DirectionExecutionPlan;
+}
+
+interface WorkspacePlansResponse {
+  ok?: boolean;
+  message?: string;
+  plans?: WorkspacePlanRecord[];
+}
+
+function trimWorkspaceText(value: string | null | undefined) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toWorkspaceTimestamp(value: string | number | null | undefined) {
+  const parsed =
+    typeof value === "number" ? value : new Date(typeof value === "string" ? value : "").getTime();
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function buildWorkspaceTurnId(
+  prefix: "owner" | "organization",
+  createdAt: string | undefined,
+  index: number
+) {
+  const timestamp = toWorkspaceTimestamp(createdAt) || Date.now();
+  return `${prefix}-${timestamp}-${index}`;
+}
+
+function mapStringModeToControlMode(mode: StringMode): ControlMode {
+  return mode === "direction" ? "DIRECTION" : "MINDSTORM";
+}
+
+function mapChatMessageToDirectionTurn(
+  message: ChatMessage,
+  index: number
+): DirectionTurn | null {
+  const content =
+    trimWorkspaceText(message.content) ||
+    trimWorkspaceText(message.direction?.summary) ||
+    trimWorkspaceText(message.direction?.objective);
+
+  if (!content) {
+    return null;
+  }
+
+  if (message.role === "user") {
+    return {
+      id: buildWorkspaceTurnId("owner", message.createdAt, index),
+      role: "owner",
+      content
+    };
+  }
+
+  const modelLabel =
+    trimWorkspaceText(message.authorName) ||
+    trimWorkspaceText(message.teamLabel) ||
+    trimWorkspaceText(message.authorRole);
+
+  return {
+    id: buildWorkspaceTurnId("organization", message.createdAt, index),
+    role: "organization",
+    content,
+    ...(modelLabel ? { modelLabel } : {})
+  };
+}
+
+function deriveWorkspaceDirectionGiven(input: {
+  chatTitle: string;
+  mode: ControlMode;
+  messages: ChatMessage[];
+  linkedDirection: WorkspaceDirectionRecord | null;
+  linkedPlan: WorkspacePlanRecord | null;
+}) {
+  const latestDirectionObjective = [...input.messages]
+    .reverse()
+    .map((message) => trimWorkspaceText(message.direction?.objective))
+    .find(Boolean);
+  const latestOwnerMessage = [...input.messages]
+    .reverse()
+    .find((message) => message.role === "user" && trimWorkspaceText(message.content));
+  const latestMessage = [...input.messages]
+    .reverse()
+    .find((message) => trimWorkspaceText(message.content));
+
+  return (
+    trimWorkspaceText(input.linkedDirection?.direction) ||
+    trimWorkspaceText(input.linkedPlan?.direction) ||
+    latestDirectionObjective ||
+    trimWorkspaceText(latestOwnerMessage?.content) ||
+    trimWorkspaceText(latestMessage?.content) ||
+    trimWorkspaceText(input.chatTitle) ||
+    controlThreadDefaultTitle(input.mode)
+  );
+}
+
+function buildWorkspacePlanningResult(input: {
+  directionGiven: string;
+  linkedDirection: WorkspaceDirectionRecord | null;
+  linkedPlan: WorkspacePlanRecord | null;
+  messages: ChatMessage[];
+}): DirectionPlanningResult | null {
+  const primaryPlan = input.linkedPlan?.primaryPlan;
+  if (!primaryPlan) {
+    return null;
+  }
+
+  const fallbackPlan = input.linkedPlan?.fallbackPlan ?? primaryPlan;
+  const analysis =
+    trimWorkspaceText(input.linkedPlan?.summary) ||
+    trimWorkspaceText(input.linkedDirection?.summary) ||
+    trimWorkspaceText(primaryPlan.summary);
+  const requiredToolkits = [
+    ...new Set(
+      [
+        ...collectPlanToolkits(primaryPlan),
+        ...collectPlanToolkits(fallbackPlan),
+        ...input.messages.flatMap((message) => message.direction?.requiredToolkits ?? [])
+      ]
+        .map((item) => normalizeToolkitAlias(item))
+        .filter(Boolean)
+    )
+  ];
+
+  return {
+    analysis,
+    directionGiven: input.directionGiven,
+    primaryPlan,
+    fallbackPlan,
+    ...(requiredToolkits.length > 0 ? { requiredToolkits } : {}),
+    ...(input.linkedDirection?.id ? { directionRecord: { id: input.linkedDirection.id } } : {}),
+    ...(input.linkedPlan?.id ? { planRecord: { id: input.linkedPlan.id } } : {})
+  };
+}
+
+function buildWorkspaceHistoryItem(input: {
+  id: string;
+  title: string;
+  mode: ControlMode;
+  updatedAt: number;
+  messages: ChatMessage[];
+  linkedDirection: WorkspaceDirectionRecord | null;
+  linkedPlan: WorkspacePlanRecord | null;
+}) {
+  const turns = input.messages
+    .map((message, index) => mapChatMessageToDirectionTurn(message, index))
+    .filter((item): item is DirectionTurn => Boolean(item));
+  const directionGiven = deriveWorkspaceDirectionGiven({
+    chatTitle: input.title,
+    mode: input.mode,
+    messages: input.messages,
+    linkedDirection: input.linkedDirection,
+    linkedPlan: input.linkedPlan
+  });
+  const planningResult = buildWorkspacePlanningResult({
+    directionGiven,
+    linkedDirection: input.linkedDirection,
+    linkedPlan: input.linkedPlan,
+    messages: input.messages
+  });
+  const directionId =
+    trimWorkspaceText(input.linkedDirection?.id) ||
+    trimWorkspaceText(planningResult?.directionRecord?.id);
+  const planId =
+    trimWorkspaceText(input.linkedPlan?.id) || trimWorkspaceText(planningResult?.planRecord?.id);
+
+  return {
+    id: input.id,
+    title: trimWorkspaceText(input.title) || controlThreadDefaultTitle(input.mode),
+    mode: input.mode,
+    updatedAt: input.updatedAt,
+    turns,
+    directionGiven,
+    ...(planningResult ? { planningResult } : {}),
+    ...(directionId || planId
+      ? {
+          launchScope: {
+            directionId,
+            planId,
+            permissionRequestIds: [],
+            flowIds: []
+          }
+        }
+      : {})
+  } satisfies ControlThreadHistoryItem;
+}
+
+function buildWorkspaceDirectionHistoryItem(
+  direction: WorkspaceDirectionRecord,
+  linkedPlan: WorkspacePlanRecord | null
+) {
+  const createdAt = trimWorkspaceText(direction.createdAt) || trimWorkspaceText(direction.updatedAt);
+  const messages: ChatMessage[] = [
+    {
+      id: `direction-context-${direction.id}`,
+      role: "system",
+      content:
+        trimWorkspaceText(direction.summary) ||
+        trimWorkspaceText(direction.direction) ||
+        "Direction loaded.",
+      createdAt: createdAt || new Date().toISOString(),
+      authorName: "Co-Founder Manager",
+      authorRole: "Organization lead"
+    }
+  ];
+
+  if (linkedPlan?.primaryPlan) {
+    messages.push({
+      id: `direction-plan-${linkedPlan.id}`,
+      role: "system",
+      content: trimWorkspaceText(linkedPlan.summary) || "Execution plan linked to this direction.",
+      createdAt:
+        trimWorkspaceText(linkedPlan.createdAt) ||
+        trimWorkspaceText(linkedPlan.updatedAt) ||
+        createdAt ||
+        new Date().toISOString(),
+      authorName: "Co-Founder Manager",
+      authorRole: "Direction lead"
+    });
+  }
+
+  return buildWorkspaceHistoryItem({
+    id: `direction:${direction.id}`,
+    title: trimWorkspaceText(direction.title) || trimWorkspaceText(direction.direction) || "Direction",
+    mode: "DIRECTION",
+    updatedAt:
+      toWorkspaceTimestamp(linkedPlan?.updatedAt) ||
+      toWorkspaceTimestamp(direction.updatedAt) ||
+      toWorkspaceTimestamp(createdAt) ||
+      Date.now(),
+    messages,
+    linkedDirection: direction,
+    linkedPlan
+  });
+}
+
+function buildWorkspacePlanHistoryItem(plan: WorkspacePlanRecord) {
+  const createdAt = trimWorkspaceText(plan.createdAt) || trimWorkspaceText(plan.updatedAt);
+  return buildWorkspaceHistoryItem({
+    id: `plan:${plan.id}`,
+    title: trimWorkspaceText(plan.title) || trimWorkspaceText(plan.direction) || "Execution plan",
+    mode: "DIRECTION",
+    updatedAt:
+      toWorkspaceTimestamp(plan.updatedAt) || toWorkspaceTimestamp(createdAt) || Date.now(),
+    messages: [
+      {
+        id: `plan-context-${plan.id}`,
+        role: "system",
+        content: trimWorkspaceText(plan.summary) || "Execution plan loaded.",
+        createdAt: createdAt || new Date().toISOString(),
+        authorName: "Co-Founder Manager",
+        authorRole: "Direction lead"
+      }
+    ],
+    linkedDirection: null,
+    linkedPlan: plan
+  });
+}
+
+function mergeControlThreadHistories(
+  preferred: ControlThreadHistoryItem[],
+  fallback: ControlThreadHistoryItem[]
+) {
+  const merged = new Map<string, ControlThreadHistoryItem>();
+
+  for (const item of [...preferred, ...fallback]) {
+    if (!merged.has(item.id)) {
+      merged.set(item.id, item);
+    }
+  }
+
+  return [...merged.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function buildWorkspaceStringHistory(input: {
+  strings: ChatString[];
+  directions: WorkspaceDirectionRecord[];
+  plans: WorkspacePlanRecord[];
+}) {
+  const directionById = new Map(input.directions.map((item) => [item.id, item] as const));
+  const planById = new Map(input.plans.map((item) => [item.id, item] as const));
+  const latestPlanByDirection = new Map<string, WorkspacePlanRecord>();
+
+  for (const plan of input.plans) {
+    const directionId = trimWorkspaceText(plan.directionId);
+    if (!directionId) {
+      continue;
+    }
+    const existing = latestPlanByDirection.get(directionId);
+    if (!existing || toWorkspaceTimestamp(plan.updatedAt) > toWorkspaceTimestamp(existing.updatedAt)) {
+      latestPlanByDirection.set(directionId, plan);
+    }
+  }
+
+  const knownDirectionIds = new Set(
+    input.strings
+      .map((item) => trimWorkspaceText(item.directionId))
+      .filter((value): value is string => Boolean(value))
+  );
+  const knownPlanIds = new Set(
+    input.strings
+      .map((item) => trimWorkspaceText(item.planId))
+      .filter((value): value is string => Boolean(value))
+  );
+
+  const stringItems = input.strings.map((chat) => {
+    const linkedDirection = trimWorkspaceText(chat.directionId)
+      ? directionById.get(trimWorkspaceText(chat.directionId)) ?? null
+      : null;
+    const linkedPlan = trimWorkspaceText(chat.planId)
+      ? planById.get(trimWorkspaceText(chat.planId)) ?? null
+      : linkedDirection
+        ? latestPlanByDirection.get(linkedDirection.id) ?? null
+        : null;
+
+    return buildWorkspaceHistoryItem({
+      id: chat.id,
+      title: chat.title,
+      mode: mapStringModeToControlMode(chat.mode),
+      updatedAt:
+        toWorkspaceTimestamp(chat.updatedAt) ||
+        toWorkspaceTimestamp(chat.createdAt) ||
+        Date.now(),
+      messages: Array.isArray(chat.messages) ? chat.messages : [],
+      linkedDirection,
+      linkedPlan
+    });
+  });
+
+  const directionItems = input.directions
+    .filter((direction) => !knownDirectionIds.has(direction.id))
+    .map((direction) =>
+      buildWorkspaceDirectionHistoryItem(
+        direction,
+        latestPlanByDirection.get(direction.id) ?? null
+      )
+    );
+
+  const orphanPlanItems = input.plans
+    .filter((plan) => !trimWorkspaceText(plan.directionId) && !knownPlanIds.has(plan.id))
+    .map((plan) => buildWorkspacePlanHistoryItem(plan));
+
+  return mergeControlThreadHistories([...stringItems, ...directionItems, ...orphanPlanItems], []);
+}
+
+function buildWorkspaceLoadError(
+  status: number,
+  fallback: string,
+  payloadMessage?: string,
+  rawText?: string
+) {
+  if (trimWorkspaceText(payloadMessage)) {
+    return payloadMessage as string;
+  }
+  if (trimWorkspaceText(rawText)) {
+    return `${fallback} (${status}): ${rawText?.slice(0, 180)}`;
+  }
+  return `${fallback} (${status}).`;
+}
+
+function normalizeOperationTabId(
+  value: string | null | undefined,
+  primaryTab: PrimaryWorkspaceTabId
+): OperationTabId {
+  if (value && OPERATION_TAB_SET.has(value)) {
+    return value as OperationTabId;
+  }
+
+  const fallback = DEFAULT_PRIMARY_TAB_SUBTAB[primaryTab];
+  return OPERATION_TAB_SET.has(fallback) ? (fallback as OperationTabId) : "plan";
+}
+
 export function VorldXShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -226,6 +631,10 @@ export function VorldXShell() {
   >(DEFAULT_PRIMARY_TAB_SUBTAB);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [showUtilityMenu, setShowUtilityMenu] = useState(false);
+  const [squadLaunchIntent, setSquadLaunchIntent] = useState<{
+    action: "ADD_MEMBER" | "CREATE_TEAM";
+    nonce: number;
+  } | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [intent, setIntent] = useState("");
@@ -252,6 +661,7 @@ export function VorldXShell() {
     useState<ControlConversationDetail>("REASONING_MIN");
   const [controlEngaged, setControlEngaged] = useState(false);
   const [controlThreadHistory, setControlThreadHistory] = useState<ControlThreadHistoryItem[]>([]);
+  const [backendStringHistory, setBackendStringHistory] = useState<ControlThreadHistoryItem[]>([]);
   const [activeControlThreadId, setActiveControlThreadId] = useState<string | null>(null);
   const [controlHistoryHydrated, setControlHistoryHydrated] = useState(false);
   const [humanPlanDraft, setHumanPlanDraft] = useState("");
@@ -266,6 +676,7 @@ export function VorldXShell() {
   const [approvalCheckpointsLoading, setApprovalCheckpointsLoading] = useState(false);
   const [approvalCheckpointActionId, setApprovalCheckpointActionId] = useState<string | null>(null);
   const [clearPermissionRequestsInFlight, setClearPermissionRequestsInFlight] = useState(false);
+  const [showClearPermissionRequestsConfirm, setShowClearPermissionRequestsConfirm] = useState(false);
   const [canReviewPermissionRequests, setCanReviewPermissionRequests] = useState(false);
   const [controlScopedFlowIds, setControlScopedFlowIds] = useState<string[]>([]);
   const [signatureApprovals, setSignatureApprovals] = useState(1);
@@ -308,6 +719,7 @@ export function VorldXShell() {
   const approvalCheckpointsFetchSeqRef = useRef(0);
   const approvalCheckpointsInFlightRef = useRef(false);
   const pipelinePolicyInFlightRef = useRef(false);
+  const backendStringHistorySeqRef = useRef(0);
   const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
   const requestedTabHandledRef = useRef<string | null>(null);
   const workflowSnapshotTimersRef = useRef<Map<string, number>>(new Map());
@@ -349,6 +761,12 @@ export function VorldXShell() {
   const currentOrgId = currentOrg?.id ?? null;
   const currentOrgIsEarth = isEarthOrgContext(currentOrg);
   const isEarthWorkspaceActive = isEarthOrgContext(selectedOrg);
+  const canManageOrgRuntime =
+    selectedOrg.role === "Founder" || selectedOrg.role === "Admin";
+  const workspaceStringHistory = useMemo(
+    () => mergeControlThreadHistories(backendStringHistory, controlThreadHistory),
+    [backendStringHistory, controlThreadHistory]
+  );
 
   useEffect(() => {
     if (!controlMessage || controlMessage.tone === "error") {
@@ -555,6 +973,11 @@ export function VorldXShell() {
         return;
       }
 
+      if (tab === "settings") {
+        setWorkspaceMode("COMPASS");
+        return;
+      }
+
       if (OPERATION_TAB_SET.has(tab)) {
         syncOperationSubtab(tab as OperationTabId);
         setWorkspaceMode("FLOW");
@@ -567,6 +990,17 @@ export function VorldXShell() {
   const handleOperationTabChange = useCallback(
     (tab: OperationTabId) => {
       handleTabChange(tab);
+    },
+    [handleTabChange]
+  );
+
+  const handleOpenSquadIntent = useCallback(
+    (action: "ADD_MEMBER" | "CREATE_TEAM") => {
+      setSquadLaunchIntent({
+        action,
+        nonce: Date.now()
+      });
+      handleTabChange("squad");
     },
     [handleTabChange]
   );
@@ -1101,6 +1535,94 @@ export function VorldXShell() {
     return false;
   }, [resolvedOrg?.id, setCurrentOrg, setOrgs]);
 
+  const loadBackendStringHistory = useCallback(async () => {
+    if (!resolvedOrg?.id || !user?.uid) {
+      setBackendStringHistory([]);
+      return;
+    }
+
+    const loadId = backendStringHistorySeqRef.current + 1;
+    backendStringHistorySeqRef.current = loadId;
+    setBackendStringHistory([]);
+
+    try {
+      const [stringsResponse, directionsResponse, plansResponse] = await Promise.all([
+        fetch(`/api/strings?orgId=${encodeURIComponent(resolvedOrg.id)}`, {
+          cache: "no-store",
+          credentials: "include"
+        }),
+        fetch(`/api/directions?orgId=${encodeURIComponent(resolvedOrg.id)}`, {
+          cache: "no-store",
+          credentials: "include"
+        }),
+        fetch(`/api/plans?orgId=${encodeURIComponent(resolvedOrg.id)}`, {
+          cache: "no-store",
+          credentials: "include"
+        })
+      ]);
+
+      const [
+        { payload: stringsPayload, rawText: stringsRaw },
+        { payload: directionsPayload, rawText: directionsRaw },
+        { payload: plansPayload, rawText: plansRaw }
+      ] = await Promise.all([
+        parseJsonBody<WorkspaceStringsResponse>(stringsResponse),
+        parseJsonBody<WorkspaceDirectionsResponse>(directionsResponse),
+        parseJsonBody<WorkspacePlansResponse>(plansResponse)
+      ]);
+
+      if (!stringsResponse.ok || !stringsPayload?.ok) {
+        throw new Error(
+          buildWorkspaceLoadError(
+            stringsResponse.status,
+            "Failed to load strings",
+            stringsPayload?.message,
+            stringsRaw
+          )
+        );
+      }
+
+      if (!directionsResponse.ok || !directionsPayload?.ok) {
+        throw new Error(
+          buildWorkspaceLoadError(
+            directionsResponse.status,
+            "Failed to load directions",
+            directionsPayload?.message,
+            directionsRaw
+          )
+        );
+      }
+
+      if (!plansResponse.ok || !plansPayload?.ok) {
+        throw new Error(
+          buildWorkspaceLoadError(
+            plansResponse.status,
+            "Failed to load plans",
+            plansPayload?.message,
+            plansRaw
+          )
+        );
+      }
+
+      if (backendStringHistorySeqRef.current !== loadId) {
+        return;
+      }
+
+      setBackendStringHistory(
+        buildWorkspaceStringHistory({
+          strings: Array.isArray(stringsPayload.strings) ? stringsPayload.strings : [],
+          directions: Array.isArray(directionsPayload.directions) ? directionsPayload.directions : [],
+          plans: Array.isArray(plansPayload.plans) ? plansPayload.plans : []
+        })
+      );
+    } catch (error) {
+      if (backendStringHistorySeqRef.current !== loadId) {
+        return;
+      }
+      console.error("[VorldXShell] Failed to sync workspace strings into Flow.", error);
+    }
+  }, [resolvedOrg?.id, user?.uid]);
+
   useEffect(() => {
     if (!resolvedOrg?.id) {
       setPermissionRequests([]);
@@ -1146,6 +1668,33 @@ export function VorldXShell() {
     }, PIPELINE_POLICY_POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [loadPipelinePolicy, resolvedOrg?.id]);
+
+  useEffect(() => {
+    if (!resolvedOrg?.id || !user?.uid) {
+      setBackendStringHistory([]);
+      return;
+    }
+    void loadBackendStringHistory();
+  }, [loadBackendStringHistory, resolvedOrg?.id, user?.uid]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const handleStringsUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<{ orgId?: string | null }>).detail;
+      if (detail?.orgId && resolvedOrg?.id && detail.orgId !== resolvedOrg.id) {
+        return;
+      }
+      void loadBackendStringHistory();
+    };
+
+    window.addEventListener(STRINGS_UPDATED_EVENT, handleStringsUpdated);
+    return () => {
+      window.removeEventListener(STRINGS_UPDATED_EVENT, handleStringsUpdated);
+    };
+  }, [loadBackendStringHistory, resolvedOrg?.id]);
 
   useEffect(() => {
     const requestedTab = searchParams.get("tab");
@@ -1224,6 +1773,7 @@ export function VorldXShell() {
     setApprovalCheckpointsLoading(false);
     setApprovalCheckpointActionId(null);
     setClearPermissionRequestsInFlight(false);
+    setShowClearPermissionRequestsConfirm(false);
     setControlScopedFlowIds([]);
     setAgentRunResult(null);
     setAgentRunId("");
@@ -1823,7 +2373,7 @@ export function VorldXShell() {
     approvalCheckpoints,
     controlMode,
     controlScopedFlowIds,
-    controlThreadHistory,
+    controlThreadHistory: workspaceStringHistory,
     directionPlanningResult,
     flowCalendarSelectedDate,
     flowSelectedStringId,
@@ -1833,7 +2383,7 @@ export function VorldXShell() {
 
   const steerCardLookup = useMemo(() => {
     const lookup = new Map<string, SteerDeliverableCard>();
-    for (const item of controlThreadHistory) {
+    for (const item of workspaceStringHistory) {
       const draft = editableDraftsByString[item.id];
       const cards = draft
         ? buildDraftDeliverableCards({
@@ -1846,17 +2396,17 @@ export function VorldXShell() {
       });
     }
     return lookup;
-  }, [controlThreadHistory, editableDraftsByString]);
+  }, [editableDraftsByString, workspaceStringHistory]);
 
   useEffect(() => {
-    if (controlThreadHistory.length === 0) {
+    if (workspaceStringHistory.length === 0) {
       return;
     }
     setScoreByString((previous) => {
       let changed = false;
       const next = { ...previous };
 
-      for (const item of controlThreadHistory) {
+      for (const item of workspaceStringHistory) {
         const value = item.planningResult?.primaryPlan?.detailScore;
         if (typeof value !== "number" || !Number.isFinite(value)) {
           continue;
@@ -1899,7 +2449,7 @@ export function VorldXShell() {
 
       return changed ? next : previous;
     });
-  }, [controlThreadHistory]);
+  }, [workspaceStringHistory]);
 
   useEffect(() => {
     if (signatureApprovals > requiredSignatures) {
@@ -2376,6 +2926,10 @@ export function VorldXShell() {
     () => operationNavItems.filter((item) => item.primary === primaryWorkspaceTab),
     [operationNavItems, primaryWorkspaceTab]
   );
+  const safeOperationsTab = useMemo(
+    () => normalizeOperationTabId(operationsTab, primaryWorkspaceTab),
+    [operationsTab, primaryWorkspaceTab]
+  );
 
   const handlePrimaryWorkspaceTabSwitch = useCallback(
     (nextTab: PrimaryWorkspaceTabId) => {
@@ -2384,12 +2938,7 @@ export function VorldXShell() {
         setFlowGovernanceTab("SCAN");
         return;
       }
-      const targetSubTab = primaryTabLastSubtab[nextTab] ?? DEFAULT_PRIMARY_TAB_SUBTAB[nextTab];
-      if (OPERATION_TAB_SET.has(targetSubTab)) {
-        handleOperationTabChange(targetSubTab as OperationTabId);
-        return;
-      }
-      handleTabChange(targetSubTab);
+      handleOperationTabChange(normalizeOperationTabId(primaryTabLastSubtab[nextTab], nextTab));
     },
     [handleOperationTabChange, handleTabChange, primaryTabLastSubtab]
   );
@@ -2401,13 +2950,28 @@ export function VorldXShell() {
         return;
       }
       if (nextMode === "FLOW") {
-        handleOperationTabChange(operationsTab);
+        handleOperationTabChange(safeOperationsTab);
         return;
       }
       handleTabChange("hub");
     },
-    [handleOperationTabChange, handleTabChange, operationsTab]
+    [handleOperationTabChange, handleTabChange, safeOperationsTab]
   );
+
+  const isRequestCenterActive = showRequestCenter;
+  const isWorkforceTabActive = activeTab === "squad";
+  const isSettingsTabActive = activeTab === "settings";
+  const isUtilityMenuActive = showUtilityMenu;
+  const isCompassModeActive = activeTab === "control";
+  const isFlowModeActive = OPERATION_TAB_SET.has(activeTab);
+  const isHubModeActive = activeTab === "hub";
+
+  useEffect(() => {
+    if (operationsTab === safeOperationsTab) {
+      return;
+    }
+    setOperationsTab(safeOperationsTab);
+  }, [operationsTab, safeOperationsTab]);
 
   useEffect(() => {
     if (primaryWorkspaceTab !== "EXECUTION") {
@@ -3235,14 +3799,8 @@ export function VorldXShell() {
       return;
     }
 
-    const confirmed = window.confirm(
-      "Clear all permission requests for this organization? This cannot be undone."
-    );
-    if (!confirmed) {
-      return;
-    }
-
     setClearPermissionRequestsInFlight(true);
+    setShowClearPermissionRequestsConfirm(false);
     try {
       const response = await fetch(
         `/api/requests?orgId=${encodeURIComponent(resolvedOrg.id)}`,
@@ -4342,7 +4900,11 @@ export function VorldXShell() {
                       loadApprovalCheckpoints({ force: true })
                     ]);
                   }}
-                  className="relative inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
+                  className={`relative inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                    isRequestCenterActive
+                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                      : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                  }`}
                 >
                   <Bell size={14} />
                   <span className="hidden sm:inline">Requests</span>
@@ -4363,7 +4925,7 @@ export function VorldXShell() {
                     setShowUtilityMenu(false);
                   }}
                   className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
-                    activeTab === "squad"
+                    isWorkforceTabActive
                       ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
                       : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
                   }`}
@@ -4373,13 +4935,36 @@ export function VorldXShell() {
                 </button>
               ) : null}
 
+              {resolvedOrg ? (
+                <button
+                  onClick={() => {
+                    handleTabChange("settings");
+                    setShowRequestCenter(false);
+                    setShowOrgSwitcher(false);
+                    setShowUtilityMenu(false);
+                  }}
+                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                    isSettingsTabActive
+                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                      : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                  }`}
+                >
+                  <SettingsIcon size={14} />
+                  <span className="hidden sm:inline">Settings</span>
+                </button>
+              ) : null}
+
               <button
                 onClick={() => {
                   setShowUtilityMenu((prev) => !prev);
                   setShowRequestCenter(false);
                   setShowOrgSwitcher(false);
                 }}
-                className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
+                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                  isUtilityMenuActive
+                    ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                    : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                }`}
               >
                 <Activity size={14} />
                 <span className="hidden sm:inline">Utilities</span>
@@ -4436,22 +5021,12 @@ export function VorldXShell() {
                   </div>
                 </div>
 
-                <div className="mt-3 grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleTabChange("settings");
-                      setShowUtilityMenu(false);
-                    }}
-                    className="rounded-xl border border-white/20 bg-white/5 px-2.5 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10"
-                  >
-                    Utility Settings
-                  </button>
+                <div className="mt-3">
                   <button
                     type="button"
                     onClick={() => void handleSignOut()}
                     disabled={signOutInFlight}
-                    className="inline-flex items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2.5 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                    className="inline-flex w-full items-center justify-center gap-1 rounded-xl border border-red-500/35 bg-red-500/10 px-2.5 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                   >
                     {signOutInFlight ? <Loader2 size={12} className="animate-spin" /> : null}
                     Logout
@@ -4528,7 +5103,7 @@ export function VorldXShell() {
                     requestCenterPermissionRequests.length > 0 &&
                     !isRequestCenterScopedToCommand ? (
                       <button
-                        onClick={() => void handleClearPermissionRequests()}
+                        onClick={() => setShowClearPermissionRequestsConfirm(true)}
                         disabled={clearPermissionRequestsInFlight}
                         className="rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
                       >
@@ -4693,7 +5268,7 @@ export function VorldXShell() {
           <section
             className={`vx-scrollbar relative min-w-0 flex-1 overflow-x-hidden px-3 py-4 pb-24 sm:px-4 md:px-6 md:py-6 md:pb-28 lg:px-8 xl:px-10 2xl:px-12 ${
               resolvedOrg && activeTab === "control"
-                ? "min-h-0 overflow-hidden py-3 pb-36 md:py-5 md:pb-40"
+                ? "flex min-h-0 flex-col overflow-hidden py-2.5 pb-12 md:py-3 md:pb-14"
                 : resolvedOrg && workspaceMode === "FLOW"
                   ? "min-h-0 overflow-hidden py-2 pb-4 md:py-3 md:pb-5"
                 : "overflow-y-auto"
@@ -4726,13 +5301,15 @@ export function VorldXShell() {
                   initialScope={hubInitialScope}
                 />
               ) : activeTab === "squad" ? (
-                <SquadConsole
-                  orgId={null}
-                  personalEarthProfile={personalEarthProfile}
-                  onPersonalEarthModeChange={setEarthMode}
-                  themeStyle={{
-                    accent: themeStyle.accent,
-                    accentSoft: themeStyle.accentSoft,
+              <SquadConsole
+                orgId={null}
+                personalEarthProfile={personalEarthProfile}
+                onPersonalEarthModeChange={setEarthMode}
+                launchIntent={null}
+                onLaunchIntentHandled={() => setSquadLaunchIntent(null)}
+                themeStyle={{
+                  accent: themeStyle.accent,
+                  accentSoft: themeStyle.accentSoft,
                     border: themeStyle.border
                   }}
                 />
@@ -4750,334 +5327,12 @@ export function VorldXShell() {
                 />
               )
             ) : activeTab === "control" ? (
-              <ControlDeckSurface
+              <StringChatShell
+                key={`string-shell:${resolvedOrg?.id ?? "none"}`}
+                embedded
                 orgId={resolvedOrg?.id ?? null}
-                orgName={activeProfileOrganizationName}
-                orgRoleLabel={activeProfileRole}
-                themeStyle={{
-                  accent: themeStyle.accent,
-                  accentSoft: themeStyle.accentSoft,
-                  border: themeStyle.border
-                }}
-                mode={controlMode}
-                conversationDetail={controlConversationDetail}
-                engaged={controlEngaged}
-                directionGiven={intent}
-                turns={directionTurns}
-                directionModelId={directionModelId}
-                directionModels={DIRECTION_MODELS}
-                directionChatInFlight={directionChatInFlight}
-                directionPlanningInFlight={directionPlanningInFlight}
-                planningResult={directionPlanningResult}
-                message={controlMessage}
-                onDismissMessage={() => setControlMessage(null)}
-                agentRunResult={agentRunResult}
-                agentRunInputValues={agentRunInputValues}
-                pendingPlanLaunchApproval={pendingPlanLaunchApproval}
-                pendingEmailApproval={pendingEmailApproval}
-                pendingToolkitApproval={pendingToolkitApproval}
-                agentInputSourceUrl={agentRunInputSourceUrl}
-                agentInputFile={agentRunInputFile}
-                agentInputSubmitting={agentRunInputSubmitting}
-                agentActionBusy={launchInFlight || toolkitConnectInFlight}
-                permissionRequests={permissionRequests}
-                approvalCheckpoints={approvalCheckpoints}
-                permissionRequestActionId={permissionRequestActionId}
-                approvalCheckpointActionId={approvalCheckpointActionId}
-                historyItems={controlThreadHistory}
-                activeHistoryId={activeControlThreadId}
-                onCreateThread={handleCreateControlThread}
-                onSelectThread={handleLoadControlThread}
-                onModeChange={handleSwitchControlMode}
-                onConversationDetailChange={setControlConversationDetail}
-                onDirectionGivenChange={setIntent}
-                onAgentInputValueChange={(key, value) =>
-                  setAgentRunInputValues((prev) => ({
-                    ...prev,
-                    [key]: value
-                  }))
-                }
-                onAgentInputSourceUrlChange={setAgentRunInputSourceUrl}
-                onAgentInputFileChange={setAgentRunInputFile}
-                onSubmitAgentInputs={() => {
-                  void handleSubmitAgentInputs();
-                }}
-                onRejectAgentInput={handleRejectAgentInput}
-                onApprovePlanLaunch={() => {
-                  void handleApprovePlanLaunch();
-                }}
-                onRejectPlanLaunch={handleRejectPlanLaunch}
-                onApproveEmailDraft={() => {
-                  void handleApproveEmailDraft();
-                }}
-                onRejectEmailDraft={handleRejectEmailDraft}
-                onApproveToolkitAccess={() => {
-                  void handleApproveToolkitAccess();
-                }}
-                onRejectToolkitAccess={handleRejectToolkitAccess}
-                onPermissionRequestDecision={(requestId, decision) => {
-                  void handlePermissionRequestDecision(requestId, decision);
-                }}
-                onApprovalCheckpointDecision={(checkpointId, decision) => {
-                  void handleApprovalCheckpointDecision(checkpointId, decision);
-                }}
-                onOpenTools={() => handleTabChange("hub")}
-                onOpenStringInFlow={(threadId) => {
-                  setFlowSelectedStringId(threadId);
-                  handleTabChange("flow");
-                }}
-                onDirectionModelChange={setDirectionModelId}
-                onEngageWithMode={(nextMode) => {
-                  handleSwitchControlMode(nextMode);
-                  setControlEngaged(true);
-                }}
-                onVoiceIntent={handleVoiceIntent}
-                isRecordingIntent={isRecordingIntent}
-                onSendMessage={async (message, modeForMessage, attachmentPayload) => {
-                  const attachments = attachmentPayload?.files ?? [];
-                  const basePrompt = message.trim();
-                  if (!basePrompt && attachments.length === 0) {
-                    return;
-                  }
-
-                  if (!activeControlThreadId) {
-                    handleCreateControlThread(modeForMessage);
-                  }
-
-                  let prompt = basePrompt || "Use the attached files as the direction context.";
-                  const attachmentRefs: string[] = [];
-                  if (attachments.length > 0) {
-                    try {
-                      for (const file of attachments) {
-                        const fileRef = await uploadHumanInputToHub({
-                          file,
-                          name: file.name
-                        });
-                        attachmentRefs.push(fileRef);
-                      }
-                    } catch (error) {
-                      setControlMessage({
-                        tone: "error",
-                        text: error instanceof Error ? error.message : "Failed to upload attachments."
-                      });
-                      return;
-                    }
-                    prompt = `${prompt}\n\nHub attachment refs: ${attachmentRefs.join(", ")}`;
-                    setControlMessage({
-                      tone: "success",
-                      text: `Attached ${attachments.length} file(s) to Hub input context.`
-                    });
-                  }
-
-                  if (modeForMessage === "MINDSTORM") {
-                    const trimmed = prompt.trim();
-                    if (!trimmed) {
-                      return;
-                    }
-
-                    if (isRecurringTaskPrompt(trimmed)) {
-                      setPendingToolkitApproval(null);
-                      setApprovedToolkitRequestId(null);
-                      setPendingEmailApproval(null);
-                      setPendingPlanLaunchApproval(null);
-                      setAgentRunResult(null);
-                      setAgentRunId("");
-                      setAgentRunInputValues({});
-                      setAgentRunInputSourceUrl("");
-                      setAgentRunInputFile(null);
-                      setControlMode("DIRECTION");
-                      setControlConversationDetail("DIRECTION_GIVEN");
-                      setIntent(trimmed);
-                      setDirectionPrompt(trimmed);
-                      setControlMessage({
-                        tone: "success",
-                        text: "Recurring task detected. Routed to Direction planning."
-                      });
-                      await handleDirectionChat(trimmed, "MINDSTORM");
-                      return;
-                    }
-
-                    const directLaunchBlockedByPolicy =
-                      pipelinePolicy?.strictFeatureEnabled === true &&
-                      (pipelinePolicy.blockDirectWorkflowLaunch ||
-                        pipelinePolicy.enforcePlanBeforeExecution ||
-                        pipelinePolicy.requireDetailedPlan ||
-                        pipelinePolicy.requireMultiWorkflowDecomposition);
-
-                    if (directLaunchBlockedByPolicy && shouldDirectWorkflowLaunch(trimmed)) {
-                      setPendingToolkitApproval(null);
-                      setApprovedToolkitRequestId(null);
-                      setPendingEmailApproval(null);
-                      setPendingPlanLaunchApproval(null);
-                      setPendingChatPlanRoute(null);
-                      setControlMode("DIRECTION");
-                      setControlConversationDetail("DIRECTION_GIVEN");
-                      setIntent(trimmed);
-                      setDirectionPrompt(trimmed);
-                      setControlMessage({
-                        tone: "warning",
-                        text: "Direct launch blocked by strict pipeline policy. Routing to planning."
-                      });
-                      await handleGenerateDirectionPlans(trimmed, {
-                        toolkitHints: inferToolkitsFromDirectionPrompt(trimmed),
-                        navigateToPlanTab: true
-                      });
-                      return;
-                    }
-
-                    if (shouldDirectWorkflowLaunch(trimmed)) {
-                      setPendingToolkitApproval(null);
-                      setApprovedToolkitRequestId(null);
-                      setPendingEmailApproval(null);
-                      setPendingPlanLaunchApproval(null);
-                      setPendingChatPlanRoute(null);
-                      setAgentRunResult(null);
-                      setAgentRunId("");
-                      setAgentRunInputValues({});
-                      setAgentRunInputSourceUrl("");
-                      setAgentRunInputFile(null);
-                      setDirectionTurns((prev) => [
-                        ...prev,
-                        {
-                          id: `owner-direct-flow-${Date.now()}`,
-                          role: "owner",
-                          content: trimmed
-                        }
-                      ]);
-                      setIntent(trimmed);
-                      setControlConversationDetail("DIRECTION_GIVEN");
-                      setControlMessage({
-                        tone: "success",
-                        text: "Quick execution intent detected. Launching workflow directly."
-                      });
-                      await handleLaunchMainAgent(trimmed);
-                      return;
-                    }
-
-                    setDirectionPrompt(trimmed);
-                    await handleDirectionChat(trimmed, "MINDSTORM");
-                    return;
-                  }
-                  const trimmed = prompt.trim();
-                  if (!trimmed) {
-                    return;
-                  }
-
-                  if (pendingPlanLaunchApproval) {
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `owner-plan-approval-${Date.now()}`,
-                        role: "owner",
-                        content: trimmed
-                      }
-                    ]);
-
-                    if (isApprovalReply(trimmed)) {
-                      await handleApprovePlanLaunch();
-                      return;
-                    }
-
-                    if (isRejectReply(trimmed)) {
-                      handleRejectPlanLaunch();
-                      return;
-                    }
-
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `org-plan-approval-hint-${Date.now()}`,
-                        role: "organization",
-                        content:
-                          "Reply with \"approve\" to launch this plan, or \"reject\" to keep it in planning."
-                      }
-                    ]);
-                    return;
-                  }
-
-                  if (pendingToolkitApproval) {
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `owner-toolkit-approval-${Date.now()}`,
-                        role: "owner",
-                        content: trimmed
-                      }
-                    ]);
-
-                    if (isApprovalReply(trimmed)) {
-                      await handleApproveToolkitAccess();
-                      return;
-                    }
-
-                    if (isRejectReply(trimmed)) {
-                      handleRejectToolkitAccess();
-                      return;
-                    }
-
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `org-toolkit-approval-hint-${Date.now()}`,
-                        role: "organization",
-                        content:
-                          "Reply with \"approve\" to grant tool access, or \"reject\" to keep the task paused."
-                      }
-                    ]);
-                    return;
-                  }
-
-                  if (pendingEmailApproval) {
-                    setDirectionTurns((prev) => [
-                      ...prev,
-                      {
-                        id: `owner-email-approval-${Date.now()}`,
-                        role: "owner",
-                        content: trimmed
-                      }
-                    ]);
-
-                    const draftReplyIntent = classifyEmailDraftReply(trimmed);
-
-                    if (draftReplyIntent === "approve") {
-                      setIntent(pendingEmailApproval.prompt);
-                      await handleLaunchMainAgent(
-                        pendingEmailApproval.prompt,
-                        undefined,
-                        {
-                          confirmEmailDraft: true
-                        }
-                      );
-                      return;
-                    }
-
-                    if (draftReplyIntent === "cancel") {
-                      handleRejectEmailDraft();
-                      return;
-                    }
-
-                    const revisedPrompt = `${pendingEmailApproval.prompt}\n\nAdditional edits from user: ${trimmed}`;
-                    setIntent(revisedPrompt);
-                    await handleLaunchMainAgent(revisedPrompt);
-                    return;
-                  }
-
-                  setPendingToolkitApproval(null);
-                  setApprovedToolkitRequestId(null);
-                  setPendingEmailApproval(null);
-                  setAgentRunResult(null);
-                  setAgentRunId("");
-                  setAgentRunInputValues({});
-                  setAgentRunInputSourceUrl("");
-                  setAgentRunInputFile(null);
-                  setIntent(trimmed);
-                  setDirectionPrompt(trimmed);
-                  await handleGenerateDirectionPlans(trimmed, {
-                    toolkitHints: inferToolkitsFromDirectionPrompt(trimmed),
-                    navigateToPlanTab: false,
-                    autoLaunch: true
-                  });
-                }}
+                onOpenAddMember={() => handleOpenSquadIntent("ADD_MEMBER")}
+                onOpenCreateTeam={() => handleOpenSquadIntent("CREATE_TEAM")}
               />
             ) : resolvedOrg && workspaceMode === "FLOW" ? (
               <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[clamp(240px,22vw,320px)_minmax(0,1fr)] [@media(min-width:1920px)]:grid-cols-[clamp(260px,18vw,360px)_minmax(0,1fr)]">
@@ -5091,7 +5346,7 @@ export function VorldXShell() {
                   onSelectedDateChange={setFlowCalendarSelectedDate}
                   selectedStringId={flowSelectedStringId}
                   onSelectedStringChange={setFlowSelectedStringId}
-                  stringItems={controlThreadHistory}
+                  stringItems={workspaceStringHistory}
                 />
                 <div className="flex min-h-0 flex-col gap-4">
                   <div className="space-y-2">
@@ -5227,7 +5482,7 @@ export function VorldXShell() {
                   </div>
 
                   <div className="vx-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
-                    {primaryWorkspaceTab === "FOCUS" ? (
+                    {primaryWorkspaceTab === "FOCUS" && flowStringsTab === "DETAILS" ? (
                       <FlowStringsSurface
                         calendarDate={flowCalendarSelectedDate}
                         stringItem={flowSelectedString}
@@ -5240,6 +5495,16 @@ export function VorldXShell() {
                         steerDecisions={steerDecisions}
                         onSteerDecision={handleSteerDecision}
                         surfaceTab={flowStringsTab}
+                      />
+                    ) : primaryWorkspaceTab === "FOCUS" && flowStringsTab === "BLUEPRINT" ? (
+                      <BlueprintConsole
+                        key={`strings-blueprint-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
+                        orgId={resolvedOrg.id}
+                        themeStyle={{
+                          accent: themeStyle.accent,
+                          accentSoft: themeStyle.accentSoft,
+                          border: themeStyle.border
+                        }}
                       />
                     ) : primaryWorkspaceTab === "EXECUTION" &&
                       (flowExecutionTab === "STEER" || flowExecutionTab === "DETAILS") ? (
@@ -5304,6 +5569,7 @@ export function VorldXShell() {
                       <SettingsConsole
                         key={`settings-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
                         orgId={resolvedOrg.id}
+                        canManageRuntime={canManageOrgRuntime}
                         themeStyle={{
                           accent: themeStyle.accent,
                           accentSoft: themeStyle.accentSoft,
@@ -5397,6 +5663,7 @@ export function VorldXShell() {
                       <SettingsConsole
                         key={`settings-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
                         orgId={resolvedOrg.id}
+                        canManageRuntime={canManageOrgRuntime}
                         themeStyle={{
                           accent: themeStyle.accent,
                           accentSoft: themeStyle.accentSoft,
@@ -5437,6 +5704,8 @@ export function VorldXShell() {
                 orgId={resolvedOrg.id}
                 personalEarthProfile={personalEarthProfile}
                 onPersonalEarthModeChange={setEarthMode}
+                launchIntent={squadLaunchIntent}
+                onLaunchIntentHandled={() => setSquadLaunchIntent(null)}
                 themeStyle={{
                   accent: themeStyle.accent,
                   accentSoft: themeStyle.accentSoft,
@@ -5455,6 +5724,7 @@ export function VorldXShell() {
             ) : activeTab === "settings" ? (
               <SettingsConsole
                 orgId={resolvedOrg.id}
+                canManageRuntime={canManageOrgRuntime}
                 themeStyle={{
                   accent: themeStyle.accent,
                   accentSoft: themeStyle.accentSoft,
@@ -5482,7 +5752,7 @@ export function VorldXShell() {
             type="button"
             onClick={() => handleWorkspaceModeSwitch("COMPASS")}
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "COMPASS"
+              isCompassModeActive
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
             }`}
@@ -5494,7 +5764,7 @@ export function VorldXShell() {
             type="button"
             onClick={() => handleWorkspaceModeSwitch("FLOW")}
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "FLOW"
+              isFlowModeActive
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
             }`}
@@ -5506,7 +5776,7 @@ export function VorldXShell() {
             type="button"
             onClick={() => handleWorkspaceModeSwitch("HUB")}
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold transition ${
-              workspaceMode === "HUB"
+              isHubModeActive
                 ? "bg-cyan-500/20 text-cyan-100"
                 : "text-slate-300 hover:bg-white/10"
             }`}
@@ -5527,6 +5797,72 @@ export function VorldXShell() {
           <div className="vx-ghost-vignette pointer-events-none fixed inset-0 z-50" />
         </>
       )}
+
+      {showClearPermissionRequestsConfirm && resolvedOrg ? (
+        <div
+          className="fixed inset-0 z-[84] flex items-center justify-center bg-black/75 p-4"
+          onClick={() => {
+            if (!clearPermissionRequestsInFlight) {
+              setShowClearPermissionRequestsConfirm(false);
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-[28px] border border-white/15 bg-[#0d1117] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-red-300">
+                  Clear Requests
+                </p>
+                <p className="mt-2 text-sm font-semibold text-slate-100">
+                  Remove all permission requests for this organization?
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowClearPermissionRequestsConfirm(false)}
+                disabled={clearPermissionRequestsInFlight}
+                className="rounded-full border border-white/20 p-2 text-slate-300 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-3 py-3 text-sm text-slate-300">
+              This clears all organization-level permission requests from the request center. This action cannot be undone.
+            </div>
+
+            <div className="mt-3 flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/20 px-3 py-2">
+              <span className="text-xs uppercase tracking-[0.16em] text-slate-500">Pending requests</span>
+              <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-semibold text-slate-200">
+                {requestCenterPermissionRequests.length}
+              </span>
+            </div>
+
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowClearPermissionRequestsConfirm(false)}
+                disabled={clearPermissionRequestsInFlight}
+                className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleClearPermissionRequests()}
+                disabled={clearPermissionRequestsInFlight}
+                className="inline-flex items-center gap-2 rounded-full border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/20 disabled:opacity-60"
+              >
+                {clearPermissionRequestsInFlight ? <Loader2 size={12} className="animate-spin" /> : null}
+                {clearPermissionRequestsInFlight ? "Clearing..." : "Clear all"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {pendingHumanInput && (
         <div className="fixed inset-0 z-[82] flex items-center justify-center bg-black/75 p-4">

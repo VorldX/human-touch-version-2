@@ -105,6 +105,7 @@ interface SettingsConsoleProps {
   orgId: string;
   themeStyle: { accent: string; accentSoft: string; border: string };
   initialLane?: Lane;
+  canManageRuntime?: boolean;
 }
 
 function shortProvider(provider: IdentityAccount["provider"]) {
@@ -185,7 +186,12 @@ function ruleTypeLabel(type: OrchestrationPipelineRuleType) {
   return "Enforce Specialist Tool Assignment";
 }
 
-export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsConsoleProps) {
+export function SettingsConsole({
+  orgId,
+  themeStyle,
+  initialLane,
+  canManageRuntime = false
+}: SettingsConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
 
   const [lane, setLane] = useState<Lane>(initialLane ?? "webhooks");
@@ -809,160 +815,172 @@ export function SettingsConsole({ orgId, themeStyle, initialLane }: SettingsCons
         </div>
       ) : (
         <div className={`vx-panel space-y-4 rounded-3xl p-4 ${themeStyle.border}`}>
-          <form onSubmit={saveOrchestration} className="space-y-3">
-            <div className="grid gap-2 md:grid-cols-3">
-              <label className="text-xs text-slate-300">
-                Mode
-                <select
-                  value={llmSettings.mode}
-                  onChange={(event) => {
-                    const nextMode = event.target.value as RuntimeMode;
-                    setLlmSettings((prev) => ({
-                      ...prev,
-                      mode: nextMode
-                    }));
-                    if (nextMode === "PLATFORM_MANAGED") {
-                      setPrimaryProviderApiKey("");
-                      setFallbackProviderApiKey("");
-                    }
-                  }}
-                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                >
-                  <option value="BYOK">BYOK</option>
-                  <option value="PLATFORM_MANAGED">PLATFORM_MANAGED</option>
-                </select>
-              </label>
-              <label className="text-xs text-slate-300">
-                Plan
-                <select
-                  value={llmSettings.servicePlan}
-                  onChange={(event) =>
-                    setLlmSettings((prev) => ({
-                      ...prev,
-                      servicePlan: event.target.value as ServicePlan,
-                      serviceMarkupPct: defaultMarkup(event.target.value as ServicePlan)
-                    }))
-                  }
-                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                >
-                  <option value="STARTER">STARTER</option>
-                  <option value="GROWTH">GROWTH</option>
-                  <option value="ENTERPRISE">ENTERPRISE</option>
-                </select>
-              </label>
-              <label className="text-xs text-slate-300">
-                Execution Mode
-                <select
-                  value={llmSettings.executionMode}
-                  onChange={(event) =>
-                    setLlmSettings((prev) => ({
-                      ...prev,
-                      executionMode: event.target.value as ExecutionMode
-                    }))
-                  }
-                  className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                >
-                  <option value="ECO">ECO</option>
-                  <option value="BALANCED">BALANCED</option>
-                  <option value="TURBO">TURBO</option>
-                </select>
-              </label>
-            </div>
-            <div className="grid gap-2 md:grid-cols-2">
-              <input
-                value={llmSettings.provider}
-                onChange={(event) =>
-                  setLlmSettings((prev) => ({ ...prev, provider: event.target.value }))
-                }
-                placeholder="Primary provider"
-                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              />
-              <input
-                value={llmSettings.model}
-                onChange={(event) =>
-                  setLlmSettings((prev) => ({ ...prev, model: event.target.value }))
-                }
-                placeholder="Primary model"
-                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              />
-              <input
-                value={llmSettings.fallbackProvider}
-                onChange={(event) =>
-                  setLlmSettings((prev) => ({ ...prev, fallbackProvider: event.target.value }))
-                }
-                placeholder="Fallback provider"
-                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              />
-              <input
-                value={llmSettings.fallbackModel}
-                onChange={(event) =>
-                  setLlmSettings((prev) => ({ ...prev, fallbackModel: event.target.value }))
-                }
-                placeholder="Fallback model"
-                className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-              />
-            </div>
-            <input
-              type="number"
-              min={0}
-              max={200}
-              step={0.1}
-              value={llmSettings.serviceMarkupPct}
-              onChange={(event) =>
-                setLlmSettings((prev) => ({
-                  ...prev,
-                  serviceMarkupPct: Number(event.target.value) || 0
-                }))
-              }
-              className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-            />
+          {!canManageRuntime ? (
+            <p className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              Only founders and admins can change organization models and API keys. Members can use
+              the active organization runtime, but cannot edit its credentials.
+            </p>
+          ) : null}
 
-            {llmSettings.mode === "BYOK" ? (
-              <div className="grid gap-2 md:grid-cols-2">
+          <form onSubmit={saveOrchestration}>
+            <fieldset
+              disabled={!canManageRuntime || savingLlm}
+              className={`space-y-3 ${!canManageRuntime ? "opacity-60" : ""}`}
+            >
+              <div className="grid gap-2 md:grid-cols-3">
                 <label className="text-xs text-slate-300">
-                  {llmSettings.provider} API key (Primary)
-                  <input
-                    type="password"
-                    value={primaryProviderApiKey}
-                    onChange={(event) => setPrimaryProviderApiKey(event.target.value)}
-                    placeholder={`Paste ${llmSettings.provider} key`}
-                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                  />
+                  Mode
+                  <select
+                    value={llmSettings.mode}
+                    onChange={(event) => {
+                      const nextMode = event.target.value as RuntimeMode;
+                      setLlmSettings((prev) => ({
+                        ...prev,
+                        mode: nextMode
+                      }));
+                      if (nextMode === "PLATFORM_MANAGED") {
+                        setPrimaryProviderApiKey("");
+                        setFallbackProviderApiKey("");
+                      }
+                    }}
+                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                  >
+                    <option value="BYOK">BYOK</option>
+                    <option value="PLATFORM_MANAGED">PLATFORM_MANAGED</option>
+                  </select>
                 </label>
                 <label className="text-xs text-slate-300">
-                  {llmSettings.fallbackProvider} API key (Fallback)
-                  <input
-                    type="password"
-                    value={fallbackProviderApiKey}
-                    onChange={(event) => setFallbackProviderApiKey(event.target.value)}
-                    placeholder={`Paste ${llmSettings.fallbackProvider} key`}
-                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none"
-                  />
+                  Plan
+                  <select
+                    value={llmSettings.servicePlan}
+                    onChange={(event) =>
+                      setLlmSettings((prev) => ({
+                        ...prev,
+                        servicePlan: event.target.value as ServicePlan,
+                        serviceMarkupPct: defaultMarkup(event.target.value as ServicePlan)
+                      }))
+                    }
+                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                  >
+                    <option value="STARTER">STARTER</option>
+                    <option value="GROWTH">GROWTH</option>
+                    <option value="ENTERPRISE">ENTERPRISE</option>
+                  </select>
+                </label>
+                <label className="text-xs text-slate-300">
+                  Execution Mode
+                  <select
+                    value={llmSettings.executionMode}
+                    onChange={(event) =>
+                      setLlmSettings((prev) => ({
+                        ...prev,
+                        executionMode: event.target.value as ExecutionMode
+                      }))
+                    }
+                    className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                  >
+                    <option value="ECO">ECO</option>
+                    <option value="BALANCED">BALANCED</option>
+                    <option value="TURBO">TURBO</option>
+                  </select>
                 </label>
               </div>
-            ) : (
-              <p className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-xs text-blue-200">
-                Platform-managed mode uses company-managed provider keys. Organization users only
-                choose models and manage credits.
-              </p>
-            )}
+              <div className="grid gap-2 md:grid-cols-2">
+                <input
+                  value={llmSettings.provider}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, provider: event.target.value }))
+                  }
+                  placeholder="Primary provider"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                />
+                <input
+                  value={llmSettings.model}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, model: event.target.value }))
+                  }
+                  placeholder="Primary model"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                />
+                <input
+                  value={llmSettings.fallbackProvider}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, fallbackProvider: event.target.value }))
+                  }
+                  placeholder="Fallback provider"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                />
+                <input
+                  value={llmSettings.fallbackModel}
+                  onChange={(event) =>
+                    setLlmSettings((prev) => ({ ...prev, fallbackModel: event.target.value }))
+                  }
+                  placeholder="Fallback model"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                />
+              </div>
+              <input
+                type="number"
+                min={0}
+                max={200}
+                step={0.1}
+                value={llmSettings.serviceMarkupPct}
+                onChange={(event) =>
+                  setLlmSettings((prev) => ({
+                    ...prev,
+                    serviceMarkupPct: Number(event.target.value) || 0
+                  }))
+                }
+                className="w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+              />
 
-            <div className="text-xs text-slate-400">
-              Configured providers:{" "}
-              {llmSettings.configuredApiKeyProviders.length > 0
-                ? llmSettings.configuredApiKeyProviders.join(", ")
-                : "None"}
-              {" | "}Updated:{" "}
-              {llmSettings.updatedAt ? new Date(llmSettings.updatedAt).toLocaleString() : "Never"}
-            </div>
-            <button
-              type="submit"
-              disabled={savingLlm}
-              className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-black transition hover:bg-emerald-500 hover:text-white disabled:opacity-60"
-            >
-              {savingLlm ? <Loader2 size={14} className="animate-spin" /> : null}
-              Save Orchestration Settings
-            </button>
+              {llmSettings.mode === "BYOK" ? (
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-xs text-slate-300">
+                    {llmSettings.provider} API key (Primary)
+                    <input
+                      type="password"
+                      value={primaryProviderApiKey}
+                      onChange={(event) => setPrimaryProviderApiKey(event.target.value)}
+                      placeholder={`Paste ${llmSettings.provider} key`}
+                      className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-300">
+                    {llmSettings.fallbackProvider} API key (Fallback)
+                    <input
+                      type="password"
+                      value={fallbackProviderApiKey}
+                      onChange={(event) => setFallbackProviderApiKey(event.target.value)}
+                      placeholder={`Paste ${llmSettings.fallbackProvider} key`}
+                      className="mt-1 w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none disabled:cursor-not-allowed"
+                    />
+                  </label>
+                </div>
+              ) : (
+                <p className="rounded-xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-xs text-blue-200">
+                  Platform-managed mode uses company-managed provider keys. Organization users only
+                  choose models and manage credits.
+                </p>
+              )}
+
+              <div className="text-xs text-slate-400">
+                Configured providers:{" "}
+                {llmSettings.configuredApiKeyProviders.length > 0
+                  ? llmSettings.configuredApiKeyProviders.join(", ")
+                  : "None"}
+                {" | "}Updated:{" "}
+                {llmSettings.updatedAt ? new Date(llmSettings.updatedAt).toLocaleString() : "Never"}
+              </div>
+              <button
+                type="submit"
+                disabled={savingLlm || !canManageRuntime}
+                className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-black transition hover:bg-emerald-500 hover:text-white disabled:opacity-60"
+              >
+                {savingLlm ? <Loader2 size={14} className="animate-spin" /> : null}
+                Save Orchestration Settings
+              </button>
+            </fieldset>
           </form>
 
           <section className="space-y-3 rounded-2xl border border-white/10 bg-black/30 p-3">

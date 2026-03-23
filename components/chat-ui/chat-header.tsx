@@ -1,60 +1,75 @@
 "use client";
 
-import { Menu, Users } from "lucide-react";
+import { Menu, PanelRight } from "lucide-react";
 
-import { ModeToggle } from "@/components/chat-ui/mode-toggle";
+import { ModeTabs } from "@/components/chat-ui/mode-tabs";
 import type { StringMode } from "@/components/chat-ui/types";
 
 interface ChatHeaderProps {
   title: string;
   mode: StringMode;
-  teamPanelOpen: boolean;
+  selectedTeamLabel: string | null;
   onTitleChange: (value: string) => void;
+  onTitleBlur: () => void;
   onModeChange: (mode: StringMode) => void;
-  onToggleSidebar: () => void;
-  onToggleTeamPanel: () => void;
+  onOpenSidebar: () => void;
+  onOpenCollaboration: () => void;
 }
 
 export function ChatHeader({
   title,
   mode,
-  teamPanelOpen,
+  selectedTeamLabel,
   onTitleChange,
+  onTitleBlur,
   onModeChange,
-  onToggleSidebar,
-  onToggleTeamPanel
+  onOpenSidebar,
+  onOpenCollaboration
 }: ChatHeaderProps) {
+  const helperText =
+    mode === "discussion"
+      ? selectedTeamLabel
+        ? `Discuss with your co-founder manager in ${selectedTeamLabel}.`
+        : "Discuss with your co-founder manager, then route the string into a team when needed."
+      : selectedTeamLabel
+        ? `This same string is now shaping direction for ${selectedTeamLabel}.`
+        : "This same string is now in direction mode for structured decisions.";
+
   return (
-    <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-3 sm:px-6">
-      <div className="flex min-w-0 items-center gap-2">
+    <header className="flex shrink-0 flex-wrap items-start justify-between gap-3 border-b border-white/10 px-4 py-4 sm:items-center sm:gap-4 sm:px-6">
+      <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
         <button
           type="button"
-          onClick={onToggleSidebar}
-          className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-white/15 bg-black/25 text-slate-300 transition hover:bg-black/40"
-          aria-label="Toggle sidebar"
+          onClick={onOpenSidebar}
+          className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-slate-200 transition hover:bg-white/[0.06] lg:hidden"
+          aria-label="Open sidebar"
         >
           <Menu size={16} />
         </button>
-        <input
-          value={title}
-          onChange={(event) => onTitleChange(event.target.value)}
-          className="min-w-0 rounded-xl border border-transparent bg-transparent px-2 py-1 text-lg font-semibold text-slate-100 outline-none transition focus:border-white/15 focus:bg-black/20"
-        />
+
+        <div className="min-w-0 flex-1">
+          <p className="text-xs uppercase tracking-[0.16em] text-slate-500">String</p>
+          <input
+            value={title}
+            onBlur={onTitleBlur}
+            onChange={(event) => onTitleChange(event.target.value)}
+            className="mt-1 w-full min-w-0 rounded-2xl border border-transparent bg-transparent px-2 py-1 text-lg font-semibold text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-white/10 focus:bg-black/10 sm:text-xl"
+          />
+          <p className="mt-1 max-w-2xl text-xs text-slate-400">
+            {helperText}
+          </p>
+        </div>
       </div>
 
-      <div className="flex items-center gap-2">
-        <ModeToggle mode={mode} onModeChange={onModeChange} />
+      <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-end">
+        <ModeTabs mode={mode} onChange={onModeChange} />
         <button
           type="button"
-          onClick={onToggleTeamPanel}
-          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
-            teamPanelOpen
-              ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
-              : "border-white/15 bg-black/25 text-slate-300 hover:bg-black/40"
-          }`}
+          onClick={onOpenCollaboration}
+          className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-slate-200 transition hover:bg-white/[0.06] xl:hidden"
+          aria-label="Open collaboration panel"
         >
-          <Users size={14} />
-          Team
+          <PanelRight size={16} />
         </button>
       </div>
     </header>

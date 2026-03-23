@@ -178,6 +178,11 @@ interface SquadConsoleProps {
   orgId: string | null;
   personalEarthProfile: PersonalEarthProfileDescriptor;
   onPersonalEarthModeChange: (mode: EarthProfileMode) => void;
+  launchIntent?: {
+    action: "ADD_MEMBER" | "CREATE_TEAM";
+    nonce: number;
+  } | null;
+  onLaunchIntentHandled?: () => void;
   themeStyle: {
     accent: string;
     accentSoft: string;
@@ -697,6 +702,8 @@ export function SquadConsole({
   orgId,
   personalEarthProfile,
   onPersonalEarthModeChange,
+  launchIntent = null,
+  onLaunchIntentHandled,
   themeStyle
 }: SquadConsoleProps) {
   const notify = useVorldXStore((state) => state.pushNotification);
@@ -767,6 +774,22 @@ export function SquadConsole({
     earthProfileDraft.approvalMode,
     earthProfileDraftControlLevel
   );
+
+  useEffect(() => {
+    if (!launchIntent || isEarthWorkspace) {
+      return;
+    }
+
+    if (launchIntent.action === "ADD_MEMBER") {
+      setConsoleTab("ROSTER");
+      setShowRecruitModal(true);
+    } else {
+      setConsoleTab("COLLABORATION");
+      setShowRecruitModal(false);
+    }
+
+    onLaunchIntentHandled?.();
+  }, [isEarthWorkspace, launchIntent, onLaunchIntentHandled]);
 
   const loadSquad = useCallback(
     async (silent?: boolean) => {
@@ -2287,17 +2310,25 @@ export function SquadConsole({
               showStringSections={false}
             />
 
-            <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
-              <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
-                    Team Builder
-                  </p>
-                  <span className={`rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}>
+            <div className="grid items-start gap-4 2xl:grid-cols-[minmax(0,1.08fr)_minmax(320px,0.92fr)]">
+              <div className={`vx-panel flex h-full min-h-0 flex-col rounded-3xl p-4 sm:p-5 ${themeStyle.border}`}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                      Team Builder
+                    </p>
+                    <p className="max-w-2xl text-sm text-slate-400">
+                      Group human and AI members into a shared team that can be reused across strings, discussions, and direction.
+                    </p>
+                  </div>
+                  <span
+                    className={`shrink-0 rounded-full px-3 py-1 text-[10px] uppercase tracking-[0.2em] ${themeStyle.accentSoft}`}
+                  >
                     Workforce + AI
                   </span>
                 </div>
-                <div className="grid gap-3 md:grid-cols-2">
+
+                <div className="mt-4 grid gap-3 xl:grid-cols-2">
                   <label className="space-y-1">
                     <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Team Name</span>
                     <input
@@ -2318,12 +2349,14 @@ export function SquadConsole({
                   </label>
                 </div>
 
-                <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                <div className="mt-4 flex min-h-0 flex-1 flex-col rounded-2xl border border-white/10 bg-black/25 p-3">
                   <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Select Members</p>
                   {personnel.length === 0 ? (
-                    <p className="mt-2 text-xs text-slate-500">No workforce members available yet.</p>
+                    <div className="mt-3 flex min-h-[180px] items-center justify-center rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 text-center">
+                      <p className="text-xs text-slate-500">No workforce members available yet.</p>
+                    </div>
                   ) : (
-                    <div className="mt-2 grid gap-2 md:grid-cols-2">
+                    <div className="mt-3 grid content-start gap-2 sm:grid-cols-2">
                       {personnel.map((member) => {
                         const selected = teamMemberDraftIds.includes(member.id);
                         return (
@@ -2331,7 +2364,7 @@ export function SquadConsole({
                             key={member.id}
                             type="button"
                             onClick={() => toggleTeamMemberDraft(member.id)}
-                            className={`rounded-xl border px-3 py-2 text-left transition ${
+                            className={`flex h-full flex-col justify-start rounded-xl border px-3 py-2 text-left transition ${
                               selected
                                 ? "border-emerald-500/40 bg-emerald-500/12"
                                 : "border-white/10 bg-black/35 hover:bg-white/5"
@@ -2348,7 +2381,7 @@ export function SquadConsole({
                   )}
                 </div>
 
-                <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
                   <p className="text-[11px] text-slate-400">
                     {teamMemberDraftIds.length} member{teamMemberDraftIds.length === 1 ? "" : "s"} selected
                   </p>
@@ -2372,21 +2405,26 @@ export function SquadConsole({
                 </div>
               </div>
 
-              <div className={`vx-panel space-y-3 rounded-3xl p-4 ${themeStyle.border}`}>
-                <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
-                  Active Teams
-                </p>
-                {teams.length === 0 ? (
-                  <p className="rounded-xl border border-white/10 bg-black/25 px-3 py-3 text-xs text-slate-500">
-                    No teams created yet. Start with Team Builder.
+              <div className={`vx-panel flex h-full min-h-0 flex-col rounded-3xl p-4 sm:p-5 ${themeStyle.border}`}>
+                <div className="space-y-1">
+                  <p className="text-xs font-bold uppercase tracking-[0.2em] text-slate-200">
+                    Active Teams
                   </p>
+                  <p className="text-sm text-slate-400">
+                    Teams created here stay available to collaboration routing throughout the organization.
+                  </p>
+                </div>
+                {teams.length === 0 ? (
+                  <div className="mt-4 flex min-h-[220px] flex-1 items-center justify-center rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 text-center">
+                    <p className="text-xs text-slate-500">No teams created yet. Start with Team Builder.</p>
+                  </div>
                 ) : (
-                  <div className="space-y-2">
+                  <div className="mt-4 grid content-start gap-3">
                     {teams.map((team) => (
                       <div key={team.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <p className="text-sm font-semibold text-slate-100">{team.name}</p>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="break-words text-sm font-semibold text-slate-100">{team.name}</p>
                             <p className="text-[10px] uppercase tracking-[0.12em] text-slate-500">
                               {new Date(team.createdAt).toLocaleString()}
                             </p>
@@ -2394,7 +2432,7 @@ export function SquadConsole({
                           <button
                             type="button"
                             onClick={() => handleRemoveTeam(team.id)}
-                            className="rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
+                            className="shrink-0 rounded-full border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-red-300"
                           >
                             Remove
                           </button>

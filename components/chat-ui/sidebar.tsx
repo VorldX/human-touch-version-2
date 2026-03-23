@@ -1,47 +1,50 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { PlusCircle, Search, X } from "lucide-react";
+import { Plus, Search, X } from "lucide-react";
 
-import { StringList } from "@/components/chat-ui/string-list";
+import { ChatHistoryItem } from "@/components/chat-ui/chat-history-item";
 import type { ChatString } from "@/components/chat-ui/types";
 
 interface SidebarProps {
-  sidebarOpen: boolean;
+  open: boolean;
   searchQuery: string;
-  strings: ChatString[];
-  selectedStringId: string | null;
+  chats: ChatString[];
+  activeChatId: string | null;
   onSearchQueryChange: (value: string) => void;
-  onSelectString: (stringId: string) => void;
-  onNewString: () => void;
-  onCloseMobile: () => void;
+  onSelectChat: (chatId: string) => void;
+  onNewChat: () => void;
+  onClose: () => void;
 }
 
 export function Sidebar({
-  sidebarOpen,
+  open,
   searchQuery,
-  strings,
-  selectedStringId,
+  chats,
+  activeChatId,
   onSearchQueryChange,
-  onSelectString,
-  onNewString,
-  onCloseMobile
+  onSelectChat,
+  onNewChat,
+  onClose
 }: SidebarProps) {
   const sidebarContent = (
-    <div className="flex h-full flex-col rounded-2xl border border-white/10 bg-[#0f141b] p-4 shadow-[0_18px_40px_rgba(0,0,0,0.35)]">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-slate-100">Strings</h2>
+    <div className="flex h-full min-h-0 flex-col rounded-[24px] border border-white/10 bg-[#121826]/90 p-3 shadow-[0_18px_60px_rgba(0,0,0,0.28)] backdrop-blur sm:rounded-[28px] sm:p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">History</p>
+          <h2 className="mt-1 text-lg font-semibold text-slate-100">Strings</h2>
+        </div>
         <button
           type="button"
-          onClick={onNewString}
-          className="inline-flex items-center gap-1.5 rounded-full border border-cyan-500/35 bg-cyan-500/10 px-3 py-1.5 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-500/20"
+          onClick={onNewChat}
+          className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-2 text-sm font-medium text-slate-950 transition hover:scale-[1.01] sm:px-4"
         >
-          <PlusCircle size={14} />
-          New
+          <Plus size={16} />
+          New String
         </button>
       </div>
 
-      <label className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+      <label className="mt-4 flex items-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
         <Search size={14} className="text-slate-500" />
         <input
           value={searchQuery}
@@ -51,49 +54,51 @@ export function Sidebar({
         />
       </label>
 
-      <div className="vx-scrollbar mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
-        <StringList
-          items={strings}
-          selectedStringId={selectedStringId}
-          onSelectString={onSelectString}
-        />
+      <div className="vx-scrollbar mt-4 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+        {chats.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-white/10 px-4 py-5 text-sm text-slate-500">
+            No strings found.
+          </div>
+        ) : (
+          chats.map((chat) => (
+            <ChatHistoryItem
+              key={chat.id}
+              chat={chat}
+              active={chat.id === activeChatId}
+              onSelect={onSelectChat}
+            />
+          ))
+        )}
       </div>
     </div>
   );
 
   return (
     <>
-      <motion.aside
-        initial={false}
-        animate={{ width: sidebarOpen ? 320 : 0, opacity: sidebarOpen ? 1 : 0 }}
-        transition={{ type: "spring", stiffness: 240, damping: 28 }}
-        className="hidden h-full shrink-0 overflow-hidden lg:block"
-      >
-        <div className="h-full p-3">{sidebarContent}</div>
-      </motion.aside>
+      <aside className="hidden h-full w-[240px] shrink-0 lg:block 2xl:w-[260px]">{sidebarContent}</aside>
 
       <AnimatePresence>
-        {sidebarOpen ? (
+        {open ? (
           <motion.div
             key="mobile-sidebar"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px] lg:hidden"
-            onClick={onCloseMobile}
+            onClick={onClose}
           >
             <motion.aside
-              initial={{ x: -320 }}
+              initial={{ x: -280 }}
               animate={{ x: 0 }}
-              exit={{ x: -320 }}
+              exit={{ x: -280 }}
               transition={{ type: "spring", stiffness: 260, damping: 28 }}
-              className="h-full w-[min(88vw,320px)] p-3"
+              className="h-full w-[min(92vw,320px)] p-2.5 sm:p-3"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="mb-2 flex items-center justify-end">
+              <div className="mb-3 flex items-center justify-end">
                 <button
                   type="button"
-                  onClick={onCloseMobile}
+                  onClick={onClose}
                   className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/25 text-slate-300 transition hover:bg-black/40"
                 >
                   <X size={14} />
