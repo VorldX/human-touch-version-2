@@ -10,7 +10,8 @@ import {
   ShieldCheck,
   UserCheck,
   Users,
-  Workflow
+  Workflow,
+  X
 } from "lucide-react";
 
 import type {
@@ -24,6 +25,12 @@ type MembershipRole = "FOUNDER" | "ADMIN" | "EMPLOYEE";
 type JoinRequestRole = "EMPLOYEE" | "ADMIN";
 type ManagementLevel = "FOUNDER" | "ADMIN" | "SUB_ADMIN" | "MANAGER" | "WORKER";
 type AccessArea = "STRINGS" | "APPROVALS" | "WORKFORCE" | "HUB" | "SETTINGS" | "ROLES";
+export type CollaborationSurfaceTab =
+  | "OVERVIEW"
+  | "REQUESTS"
+  | "STRINGS"
+  | "TEAMS"
+  | "ACCESS";
 
 interface CollaborationMessage {
   tone: "success" | "warning" | "error";
@@ -262,7 +269,8 @@ export function ControlCollaborationPanel({
   onApproveToolkitAccess = noop,
   onRejectToolkitAccess = noop,
   onPermissionRequestDecision = noopDecision,
-  onApprovalCheckpointDecision = noopDecision
+  onApprovalCheckpointDecision = noopDecision,
+  onActiveTabChange
 }: {
   orgId: string | null;
   orgName: string;
@@ -301,6 +309,7 @@ export function ControlCollaborationPanel({
     checkpointId: string,
     decision: "APPROVE" | "REJECT"
   ) => void;
+  onActiveTabChange?: (tab: CollaborationSurfaceTab) => void;
 }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -322,12 +331,19 @@ export function ControlCollaborationPanel({
     Record<string, JoinRequestRole>
   >({});
   const [joinRequestNoteDrafts, setJoinRequestNoteDrafts] = useState<Record<string, string>>({});
+  const [newMemberEmail, setNewMemberEmail] = useState("");
+  const [newMemberName, setNewMemberName] = useState("");
+  const [newMemberRole, setNewMemberRole] = useState<JoinRequestRole>("EMPLOYEE");
+  const [activeSurfaceTab, setActiveSurfaceTab] =
+    useState<CollaborationSurfaceTab>("OVERVIEW");
   const [activeTeamDraft, setActiveTeamDraft] = useState("");
   const [teamEditor, setTeamEditor] = useState<TeamEditorState>(() => emptyTeamEditor());
   const [savingMemberId, setSavingMemberId] = useState<string | null>(null);
+  const [addingMember, setAddingMember] = useState(false);
   const [savingActiveTeam, setSavingActiveTeam] = useState(false);
   const [savingTeam, setSavingTeam] = useState(false);
   const [deletingTeamId, setDeletingTeamId] = useState<string | null>(null);
+  const [teamDeleteConfirm, setTeamDeleteConfirm] = useState<CollaborationTeam | null>(null);
   const [actingJoinRequestId, setActingJoinRequestId] = useState<string | null>(null);
 
   const canCreateTeams = actor?.role === "FOUNDER";
@@ -482,7 +498,76 @@ export function ControlCollaborationPanel({
 
   useEffect(() => {
     setTeamEditor(emptyTeamEditor());
+    setNewMemberEmail("");
+    setNewMemberName("");
+    setNewMemberRole("EMPLOYEE");
   }, [orgId]);
+
+  useEffect(() => {
+    setActiveSurfaceTab("OVERVIEW");
+  }, [orgId, showStringSections]);
+
+  useEffect(() => {
+    onActiveTabChange?.(activeSurfaceTab);
+  }, [activeSurfaceTab, onActiveTabChange]);
+
+  const handleAddMember = useCallback(async () => {
+    if (!orgId) {
+      return;
+    }
+
+    const email = newMemberEmail.trim().toLowerCase();
+    const username = newMemberName.trim();
+    if (!email) {
+      setMessage({
+        tone: "warning",
+        text: "Member email is required."
+      });
+      return;
+    }
+
+    setAddingMember(true);
+    try {
+      const response = await fetch("/api/hub/organization", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orgId,
+          collaborationAction: "ADD_MEMBER",
+          email,
+          username: username || undefined,
+          memberRole: newMemberRole
+        })
+      });
+      const { payload, rawText } = await parseJsonResponse<{ ok?: boolean; message?: string }>(
+        response
+      );
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          payload?.message ??
+            (rawText
+              ? `Failed to add member (${response.status}): ${rawText.slice(0, 180)}`
+              : "Failed to add member.")
+        );
+      }
+
+      setNewMemberEmail("");
+      setNewMemberName("");
+      setNewMemberRole("EMPLOYEE");
+      setMessage({
+        tone: "success",
+        text: `${email} added to the organization.`
+      });
+      await loadCollaboration(true);
+    } catch (error) {
+      setMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to add member."
+      });
+    } finally {
+      setAddingMember(false);
+    }
+  }, [loadCollaboration, newMemberEmail, newMemberName, newMemberRole, orgId]);
 
   const handleSaveMember = useCallback(
     async (member: CollaborationMember) => {
@@ -703,13 +788,11 @@ export function ControlCollaborationPanel({
 
   const handleDeleteTeam = useCallback(
     async (team: CollaborationTeam) => {
-      if (
-        !orgId ||
-        (typeof window !== "undefined" && !window.confirm(`Delete ${team.name}?`))
-      ) {
+      if (!orgId) {
         return;
       }
 
+      setTeamDeleteConfirm(null);
       setDeletingTeamId(team.id);
       try {
         const response = await fetch("/api/hub/organization", {
@@ -800,6 +883,245 @@ export function ControlCollaborationPanel({
     [joinRequestNoteDrafts, joinRequestRoleDrafts, loadCollaboration, orgId]
   );
 
+  const collaborationTabs = useMemo(
+    () =>
+      [
+        {
+          id: "OVERVIEW" as const,
+          label: "Overview",
+          helper: "Org posture and current state",
+          count: null
+        },
+        {
+          id: "REQUESTS" as const,
+          label: "Requests",
+          helper: "Incoming access reviews",
+          count: pendingJoinRequests.length
+        },
+        ...(showStringSections
+          ? [
+              {
+                id: "STRINGS" as const,
+                label: "Strings",
+                helper: "String approvals and workforce context",
+                count:
+                  pendingStringCards +
+                  activeStringPermissionRequests.length +
+                  activeStringApprovalCheckpoints.length
+              }
+            ]
+          : []),
+        {
+          id: "TEAMS" as const,
+          label: "Teams",
+          helper: "Builder, roster, and assignments",
+          count: teams.length
+        },
+        {
+          id: "ACCESS" as const,
+          label: "Access",
+          helper: "Roles, levels, and permissions",
+          count: members.length
+        }
+      ] satisfies Array<{
+        id: CollaborationSurfaceTab;
+        label: string;
+        helper: string;
+        count: number | null;
+      }>,
+    [
+      activeStringApprovalCheckpoints.length,
+      activeStringPermissionRequests.length,
+      members.length,
+      pendingJoinRequests.length,
+      pendingStringCards,
+      showStringSections,
+      teams.length
+    ]
+  );
+  const linkedWorkforceCount = personnel.filter((item) => item.teamIds.length > 0).length;
+  const activeTabDetails = (() => {
+    if (activeSurfaceTab === "REQUESTS") {
+      return {
+        kicker: "Requests Workspace",
+        title: "Review incoming organization access requests",
+        description: canManageMembers
+          ? "Approve or reject membership requests and shape how new collaborators join the organization."
+          : "This queue is reserved for founders and admins, but it still shows where incoming membership demand lands.",
+        containerClass:
+          "border-amber-500/20 bg-[radial-gradient(circle_at_top_left,rgba(245,158,11,0.16),transparent_55%),rgba(2,6,23,0.92)]",
+        kickerClass: "text-amber-200",
+        metrics: [
+          {
+            label: "Pending requests",
+            value: pendingJoinRequests.length,
+            helper: canManageMembers ? "Need review" : "Visible to admins"
+          },
+          {
+            label: "Admin reviewers",
+            value: organization?.memberCounts.admins ?? 0,
+            helper: "Can process joins"
+          },
+          {
+            label: "Employees",
+            value: organization?.memberCounts.employees ?? 0,
+            helper: "Already onboarded"
+          }
+        ]
+      };
+    }
+
+    if (activeSurfaceTab === "STRINGS") {
+      return {
+        kicker: "Strings Workspace",
+        title: "Resolve string-linked approvals and workforce signals",
+        description: isActiveStringThread
+          ? "Track thread approvals, permission requests, checkpoints, and workforce context for the active string."
+          : "This string is in monitor mode until it becomes active, so approvals stay visible but read-only.",
+        containerClass:
+          "border-emerald-500/20 bg-[radial-gradient(circle_at_top_left,rgba(16,185,129,0.14),transparent_55%),rgba(2,6,23,0.92)]",
+        kickerClass: "text-emerald-200",
+        metrics: [
+          {
+            label: "Pending cards",
+            value: pendingStringCards,
+            helper: "Launch, toolkit, email"
+          },
+          {
+            label: "Permission requests",
+            value: activeStringPermissionRequests.length,
+            helper: "String access asks"
+          },
+          {
+            label: "Checkpoints",
+            value: activeStringApprovalCheckpoints.length,
+            helper: "Approval gates"
+          },
+          {
+            label: "Workforce roles",
+            value: activeStringResourcePlan.length,
+            helper: "Linked to this string"
+          }
+        ]
+      };
+    }
+
+    if (activeSurfaceTab === "TEAMS") {
+      return {
+        kicker: "Teams Workspace",
+        title: "Build collaboration teams and manage assignments",
+        description: canCreateTeams
+          ? "Create and edit teams, attach workforce, and let members switch their active operating team here."
+          : "See your available team assignments and switch your active team while founders manage the shared roster.",
+        containerClass:
+          "border-cyan-500/20 bg-[radial-gradient(circle_at_top_left,rgba(6,182,212,0.14),transparent_55%),rgba(2,6,23,0.92)]",
+        kickerClass: "text-cyan-200",
+        metrics: [
+          {
+            label: "Active team",
+            value: actor?.activeTeamName || "Unassigned",
+            helper: `${actorMembership?.teamNames.length ?? 0} linked team(s)`
+          },
+          {
+            label: "Teams",
+            value: teams.length,
+            helper: "Org collaboration groups"
+          },
+          {
+            label: "Workforce linked",
+            value: linkedWorkforceCount,
+            helper: "Personnel on teams"
+          },
+          {
+            label: "Builder access",
+            value: canCreateTeams ? "Founder" : "View only",
+            helper: canCreateTeams ? "You can edit teams" : "Founder manages changes"
+          }
+        ]
+      };
+    }
+
+    if (activeSurfaceTab === "ACCESS") {
+      return {
+        kicker: "Access Workspace",
+        title: "Manage member authority, levels, and coverage",
+        description: canManageMembers
+          ? "Add members, set organization role, assign collaboration level, and scope access areas from one place."
+          : "This view shows how collaboration authority is distributed across the organization.",
+        containerClass:
+          "border-sky-500/20 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.14),transparent_55%),rgba(2,6,23,0.92)]",
+        kickerClass: "text-sky-200",
+        metrics: [
+          {
+            label: "Members",
+            value: members.length,
+            helper: "Org-linked users"
+          },
+          {
+            label: "Profiles",
+            value: managementCatalog.length,
+            helper: "Management levels"
+          },
+          {
+            label: "Employee roles",
+            value: organization?.memberCounts.employees ?? 0,
+            helper: "Can be scoped"
+          },
+          {
+            label: "Admins",
+            value: organization?.memberCounts.admins ?? 0,
+            helper: "Full org coverage"
+          }
+        ]
+      };
+    }
+
+    return {
+      kicker: "Overview Workspace",
+      title: "Monitor collaboration health across the organization",
+      description:
+        "See your org posture, current assignment state, pending work, and collaboration capacity before drilling into a focused tab.",
+      containerClass:
+        "border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.12),transparent_55%),rgba(2,6,23,0.92)]",
+      kickerClass: "text-cyan-200",
+      metrics: [
+        {
+          label: "Organization",
+          value: orgName,
+          helper: orgRoleLabel
+        },
+        {
+          label: "My team",
+          value: actor?.activeTeamName || "Unassigned",
+          helper: `${actorMembership?.teamNames.length ?? 0} linked team(s)`
+        },
+        {
+          label: "Members",
+          value: members.length,
+          helper: `${organization?.memberCounts.employees ?? 0} employee role(s)`
+        },
+        {
+          label: "Teams",
+          value: teams.length,
+          helper: `${linkedWorkforceCount} workforce linked`
+        },
+        {
+          label: "Pending inbox",
+          value: pendingJoinRequests.length + orgPendingPermissionCount + orgPendingCheckpointCount,
+          helper: showStringSections
+            ? `${pendingJoinRequests.length} join | ${orgPendingPermissionCount} requests`
+            : `${pendingJoinRequests.length} join request(s)`
+        }
+      ]
+    };
+  })();
+  const activeTabMetricGridClass =
+    activeTabDetails.metrics.length >= 5
+      ? "md:grid-cols-2 xl:grid-cols-5"
+      : activeTabDetails.metrics.length === 4
+        ? "md:grid-cols-2 xl:grid-cols-4"
+        : "md:grid-cols-3";
+
   if (!orgId) {
     return (
       <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-6 text-center text-sm text-slate-500">
@@ -849,91 +1171,110 @@ export function ControlCollaborationPanel({
         </div>
       ) : null}
 
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
+      <div className={`rounded-[28px] border px-4 py-4 ${activeTabDetails.containerClass}`}>
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-            Collaboration Operating Model
+          <p
+            className={`text-[10px] font-semibold uppercase tracking-[0.16em] ${activeTabDetails.kickerClass}`}
+          >
+            {activeTabDetails.kicker}
           </p>
           <p className="mt-1 text-sm font-semibold text-slate-100">
-            Org role controls platform authority. Management level controls collaboration
-            coverage.
+            {activeTabDetails.title}
+          </p>
+          <p className="mt-2 max-w-3xl text-xs leading-5 text-slate-400">
+            {activeTabDetails.description}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => void loadCollaboration(true)}
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[11px] font-semibold text-slate-200"
-        >
-          {refreshing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          Refresh
-        </button>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-slate-200">
+            {orgName}
+          </span>
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-slate-300">
+            {actor?.roleLabel || orgRoleLabel}
+          </span>
+          <button
+            type="button"
+            onClick={() => void loadCollaboration(true)}
+            className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-[11px] font-semibold text-slate-200"
+          >
+            {refreshing ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <RefreshCw size={13} />
+            )}
+            Refresh
+          </button>
+        </div>
       </div>
 
       <div
         className={`grid gap-2 ${
-          showStringSections ? "md:grid-cols-6" : "md:grid-cols-5"
+          showStringSections ? "sm:grid-cols-2 xl:grid-cols-5" : "sm:grid-cols-2 xl:grid-cols-4"
         }`}
       >
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Organization</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">{orgName}</p>
-          <p className="mt-1 text-[11px] text-slate-500">{orgRoleLabel}</p>
-        </article>
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">My Team</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">
-            {actor?.activeTeamName || "Unassigned"}
-          </p>
-          <p className="mt-1 text-[11px] text-slate-500">
-            {actorMembership?.teamNames.length ?? 0} linked team(s)
-          </p>
-        </article>
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Employees</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">{members.length}</p>
-          <p className="mt-1 text-[11px] text-slate-500">
-            {organization?.memberCounts.employees ?? 0} employee role(s)
-          </p>
-        </article>
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Teams</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">{teams.length}</p>
-          <p className="mt-1 text-[11px] text-slate-500">
-            {personnel.filter((item) => item.teamIds.length > 0).length} workforce linked
-          </p>
-        </article>
-        <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-          <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Pending Inbox</p>
-          <p className="mt-1 text-sm font-semibold text-slate-100">
-            {pendingJoinRequests.length + orgPendingPermissionCount + orgPendingCheckpointCount}
-          </p>
-          <p className="mt-1 text-[11px] text-slate-500">
-            {showStringSections
-              ? `${pendingJoinRequests.length} join | ${orgPendingPermissionCount} request`
-              : `${pendingJoinRequests.length} join request(s)`}
-          </p>
-        </article>
-        {showStringSections ? (
-          <article className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
-            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">String Queue</p>
-            <p className="mt-1 text-sm font-semibold text-slate-100">{pendingStringCards}</p>
-            <p className="mt-1 text-[11px] text-slate-500">
-              {activeStringPermissionRequests.length} request |{" "}
-              {activeStringApprovalCheckpoints.length} checkpoint
-            </p>
-          </article>
-        ) : null}
+        {collaborationTabs.map((tab) => {
+          const active = activeSurfaceTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveSurfaceTab(tab.id)}
+              className={`rounded-[22px] border px-3 py-3 text-left transition ${
+                active
+                  ? "border-cyan-400/45 bg-cyan-500/12 text-cyan-100 shadow-[0_0_0_1px_rgba(34,211,238,0.12)]"
+                  : "border-white/10 bg-black/20 text-slate-300 hover:bg-white/5"
+              }`}
+              aria-pressed={active}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p
+                    className={`text-[10px] font-semibold uppercase tracking-[0.16em] ${
+                      active ? "text-cyan-100" : "text-slate-500"
+                    }`}
+                  >
+                    {tab.label}
+                  </p>
+                  <p className={`mt-1 text-xs leading-5 ${active ? "text-slate-100" : "text-slate-400"}`}>
+                    {tab.helper}
+                  </p>
+                </div>
+                {tab.count !== null ? (
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10px] ${
+                      active ? "bg-cyan-500/20 text-cyan-100" : "bg-black/30 text-slate-400"
+                    }`}
+                  >
+                    {tab.count}
+                  </span>
+                ) : null}
+              </div>
+            </button>
+          );
+        })}
       </div>
 
-      <div
-        className={
-          showStringSections
-            ? "grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]"
-            : "grid gap-3 xl:grid-cols-2"
-        }
-      >
-        <div className={showStringSections ? "space-y-3" : "contents"}>
-          {showStringSections && stringItem ? (
+      <div className={`grid gap-2 ${activeTabMetricGridClass}`}>
+        {activeTabDetails.metrics.map((metric) => (
+          <article key={metric.label} className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
+            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{metric.label}</p>
+            <p className="mt-1 text-sm font-semibold text-slate-100">{metric.value}</p>
+            <p className="mt-1 text-[11px] text-slate-500">{metric.helper}</p>
+          </article>
+        ))}
+      </div>
+
+      {activeSurfaceTab !== "ACCESS" ? (
+        <div
+          className={
+            showStringSections
+              ? "grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]"
+              : "grid gap-3 xl:grid-cols-2"
+          }
+        >
+          {activeSurfaceTab === "REQUESTS" || activeSurfaceTab === "STRINGS" ? (
+            <div className={showStringSections ? "space-y-3" : "contents"}>
+              {showStringSections && stringItem && activeSurfaceTab === "STRINGS" ? (
             <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
@@ -1030,30 +1371,31 @@ export function ControlCollaborationPanel({
             </div>
           ) : null}
 
-          <div
-            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
-              showStringSections ? "" : "xl:order-3 xl:col-span-2"
-            }`}
-          >
+              {activeSurfaceTab === "REQUESTS" ? (
+                <div
+                  className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+                    showStringSections ? "" : "xl:order-3 xl:col-span-2"
+                  }`}
+                >
             <div className="flex items-center justify-between gap-2">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-                Incoming Organization Requests
-              </p>
-              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
-            {pendingJoinRequests.length}
-          </span>
-        </div>
-        {!canManageMembers ? (
-          <p className="mt-3 text-xs text-slate-500">
-            Join requests are visible only to founders and admins.
-          </p>
-        ) : pendingJoinRequests.length === 0 ? (
-          <p className="mt-3 text-xs text-slate-500">
-            No pending join requests for this organization.
-          </p>
-        ) : (
-          <div className="mt-3 space-y-2">
-            {pendingJoinRequests.map((request) => (
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+                  Incoming Organization Requests
+                </p>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
+                  {pendingJoinRequests.length}
+                </span>
+              </div>
+              {!canManageMembers ? (
+                <p className="mt-3 text-xs text-slate-500">
+                  Join requests are visible only to founders and admins.
+                </p>
+              ) : pendingJoinRequests.length === 0 ? (
+                <p className="mt-3 text-xs text-slate-500">
+                  No pending join requests for this organization.
+                </p>
+              ) : (
+                <div className="mt-3 space-y-2">
+                  {pendingJoinRequests.map((request) => (
                   <article
                     key={request.id}
                     className="rounded-2xl border border-white/10 bg-black/25 px-3 py-3"
@@ -1121,12 +1463,13 @@ export function ControlCollaborationPanel({
                       </button>
                     </div>
                   </article>
-                ))}
-              </div>
-            )}
-          </div>
+                  ))}
+                </div>
+              )}
+                </div>
+              ) : null}
 
-          {showStringSections ? (
+              {showStringSections && activeSurfaceTab === "STRINGS" ? (
             <>
               <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
                 <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
@@ -1272,13 +1615,16 @@ export function ControlCollaborationPanel({
               </div>
             </>
           ) : null}
-        </div>
-        <div className={showStringSections ? "space-y-3" : "contents"}>
-          <div
-            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
-              showStringSections ? "" : "xl:order-1"
-            }`}
-          >
+            </div>
+          ) : null}
+          {activeSurfaceTab === "OVERVIEW" || activeSurfaceTab === "TEAMS" ? (
+            <div className={showStringSections ? "space-y-3" : "contents"}>
+              {activeSurfaceTab === "OVERVIEW" ? (
+                <div
+                  className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+                    showStringSections ? "" : "xl:order-1"
+                  }`}
+                >
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
                 <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
@@ -1300,13 +1646,15 @@ export function ControlCollaborationPanel({
               {organization?.description ||
                 "Use collaboration to route org requests, define teams, and manage access boundaries."}
             </p>
-          </div>
+                </div>
+              ) : null}
 
-          <div
-            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
-              showStringSections ? "" : "xl:order-2"
-            }`}
-          >
+              {activeSurfaceTab === "TEAMS" ? (
+                <div
+                  className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+                    showStringSections ? "" : "xl:order-3"
+                  }`}
+                >
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                 <Workflow size={12} />
@@ -1357,13 +1705,15 @@ export function ControlCollaborationPanel({
                 </p>
               </div>
             ) : null}
-          </div>
+                </div>
+              ) : null}
 
-          <div
-            className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
-              showStringSections ? "" : "xl:order-4 xl:col-span-2"
-            }`}
-          >
+              {activeSurfaceTab === "TEAMS" ? (
+                <div
+                  className={`rounded-2xl border border-white/10 bg-black/20 p-3 ${
+                    showStringSections ? "" : "xl:order-4 xl:col-span-2"
+                  }`}
+                >
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
                 <Users size={12} />
@@ -1532,7 +1882,7 @@ export function ControlCollaborationPanel({
                         </button>
                         <button
                           type="button"
-                          onClick={() => void handleDeleteTeam(team)}
+                          onClick={() => setTeamDeleteConfirm(team)}
                           disabled={deletingTeamId === team.id}
                           className="rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] font-semibold text-red-200 disabled:opacity-60"
                         >
@@ -1567,12 +1917,17 @@ export function ControlCollaborationPanel({
                 </p>
               ) : null}
             </div>
-          </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-      </div>
+      ) : null}
 
-      <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+      {activeSurfaceTab === "ACCESS" ? (
+        <div className="space-y-3">
+          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
             <ShieldCheck size={12} />
             Management Levels
@@ -1580,22 +1935,24 @@ export function ControlCollaborationPanel({
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-slate-300">
             {managementCatalog.length} profiles
           </span>
-        </div>
-        <div className="mt-3 grid gap-2 md:grid-cols-5">
-          {managementCatalog.map((item) => (
-            <div
-              key={item.id}
-              className={`rounded-2xl border px-3 py-3 ${managementPillClass(item.id)}`}
-            >
-              <p className="text-[10px] font-semibold uppercase tracking-[0.16em]">{item.label}</p>
-              <p className="mt-2 text-[11px] leading-5 text-current/85">{item.helper}</p>
             </div>
-          ))}
-        </div>
-      </div>
+            <div className="mt-3 grid gap-2 md:grid-cols-5">
+              {managementCatalog.map((item) => (
+                <div
+                  key={item.id}
+                  className={`rounded-2xl border px-3 py-3 ${managementPillClass(item.id)}`}
+                >
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.16em]">
+                    {item.label}
+                  </p>
+                  <p className="mt-2 text-[11px] leading-5 text-current/85">{item.helper}</p>
+                </div>
+              ))}
+            </div>
+          </div>
 
-      <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
             <UserCheck size={12} />
             Employee Directory And Access Control
@@ -1603,8 +1960,60 @@ export function ControlCollaborationPanel({
           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-slate-300">
             {members.length} member(s)
           </span>
-        </div>
-        <div className="mt-3 space-y-3">
+            </div>
+            <div className="mt-3 space-y-3">
+          {canManageMembers ? (
+            <div className="rounded-2xl border border-dashed border-cyan-500/30 bg-cyan-500/5 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
+                    Add Organization Member
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-400">
+                    Add an employee or admin so collaboration access becomes manageable here.
+                  </p>
+                </div>
+                <span className="rounded-full border border-cyan-500/25 bg-cyan-500/10 px-2.5 py-1 text-[10px] text-cyan-100">
+                  Founder/Admin
+                </span>
+              </div>
+              <div className="mt-3 grid gap-2 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_160px_auto]">
+                <input
+                  value={newMemberEmail}
+                  onChange={(event) => setNewMemberEmail(event.target.value)}
+                  placeholder="member@email.com"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-[11px] text-slate-100 outline-none"
+                />
+                <input
+                  value={newMemberName}
+                  onChange={(event) => setNewMemberName(event.target.value)}
+                  placeholder="Display name"
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-[11px] text-slate-100 outline-none"
+                />
+                <select
+                  value={newMemberRole}
+                  onChange={(event) => setNewMemberRole(event.target.value as JoinRequestRole)}
+                  className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-[11px] font-semibold text-slate-100 outline-none"
+                >
+                  <option value="EMPLOYEE">Employee</option>
+                  <option value="ADMIN">Admin</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => void handleAddMember()}
+                  disabled={addingMember}
+                  className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-[11px] font-semibold text-cyan-200 disabled:opacity-60"
+                >
+                  {addingMember ? "Adding..." : "Add member"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {canManageMembers && members.filter((member) => member.role !== "FOUNDER").length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-white/10 bg-black/20 px-4 py-4 text-[11px] text-slate-500">
+              Only the founder is in organization access right now. Add a member above to manage collaboration permissions here.
+            </div>
+          ) : null}
           {members.map((member) => {
             const roleDraft = roleDrafts[member.userId] ?? member.role;
             const levelDraft = levelDrafts[member.userId] ?? member.managementLevel;
@@ -1767,8 +2176,66 @@ export function ControlCollaborationPanel({
               </article>
             );
           })}
+            </div>
+          </div>
         </div>
-      </div>
+      ) : null}
+
+      {teamDeleteConfirm ? (
+        <div
+          className="fixed inset-0 z-[72] flex items-center justify-center bg-black/75 p-4"
+          onClick={() => {
+            if (!deletingTeamId) {
+              setTeamDeleteConfirm(null);
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-[28px] border border-white/15 bg-[#0d1117] p-5 shadow-[0_24px_80px_rgba(0,0,0,0.45)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-red-300">Delete Team</p>
+                <p className="mt-2 text-sm font-semibold text-slate-100">
+                  Remove {teamDeleteConfirm.name} from collaboration?
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTeamDeleteConfirm(null)}
+                disabled={Boolean(deletingTeamId)}
+                className="rounded-full border border-white/20 p-2 text-slate-300 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-red-500/25 bg-red-500/10 px-3 py-3 text-sm text-slate-300">
+              This removes the team and its current collaboration assignment structure from the organization UI.
+            </div>
+
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setTeamDeleteConfirm(null)}
+                disabled={Boolean(deletingTeamId)}
+                className="rounded-full border border-white/20 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 transition hover:bg-white/10 disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDeleteTeam(teamDeleteConfirm)}
+                disabled={Boolean(deletingTeamId)}
+                className="rounded-full border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/20 disabled:opacity-60"
+              >
+                {deletingTeamId === teamDeleteConfirm.id ? "Deleting..." : "Delete team"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

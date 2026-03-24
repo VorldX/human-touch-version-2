@@ -8,69 +8,91 @@ import type { StringMode } from "@/components/chat-ui/types";
 interface ChatHeaderProps {
   title: string;
   mode: StringMode;
+  stringPanelOpen: boolean;
+  stringPanelPinned?: boolean;
   selectedTeamLabel: string | null;
+  statusText?: string | null;
+  statusTone?: "neutral" | "error";
   onTitleChange: (value: string) => void;
   onTitleBlur: () => void;
   onModeChange: (mode: StringMode) => void;
+  onToggleStringPanel: () => void;
   onOpenSidebar: () => void;
-  onOpenCollaboration: () => void;
 }
 
 export function ChatHeader({
   title,
   mode,
+  stringPanelOpen,
+  stringPanelPinned = false,
   selectedTeamLabel,
+  statusText,
+  statusTone = "neutral",
   onTitleChange,
   onTitleBlur,
   onModeChange,
-  onOpenSidebar,
-  onOpenCollaboration
+  onToggleStringPanel,
+  onOpenSidebar
 }: ChatHeaderProps) {
-  const helperText =
-    mode === "discussion"
-      ? selectedTeamLabel
-        ? `Discuss with your co-founder manager in ${selectedTeamLabel}.`
-        : "Discuss with your co-founder manager, then route the string into a team when needed."
-      : selectedTeamLabel
-        ? `This same string is now shaping direction for ${selectedTeamLabel}.`
-        : "This same string is now in direction mode for structured decisions.";
-
   return (
-    <header className="flex shrink-0 flex-wrap items-start justify-between gap-3 border-b border-white/10 px-4 py-4 sm:items-center sm:gap-4 sm:px-6">
-      <div className="flex min-w-0 flex-1 items-start gap-3 sm:items-center">
-        <button
-          type="button"
-          onClick={onOpenSidebar}
-          className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-slate-200 transition hover:bg-white/[0.06] lg:hidden"
-          aria-label="Open sidebar"
-        >
-          <Menu size={16} />
-        </button>
+    <header className="shrink-0 border-b border-white/[0.06] bg-[#0f172a]/96 px-3 sm:px-4">
+      <div className="grid h-14 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+          <button
+            type="button"
+            onClick={onOpenSidebar}
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/[0.06] bg-white/[0.04] text-slate-200 transition duration-200 hover:bg-white/[0.08]"
+            aria-label="Open sidebar"
+          >
+            <Menu size={16} />
+          </button>
 
-        <div className="min-w-0 flex-1">
-          <p className="text-xs uppercase tracking-[0.16em] text-slate-500">String</p>
-          <input
-            value={title}
-            onBlur={onTitleBlur}
-            onChange={(event) => onTitleChange(event.target.value)}
-            className="mt-1 w-full min-w-0 rounded-2xl border border-transparent bg-transparent px-2 py-1 text-lg font-semibold text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-white/10 focus:bg-black/10 sm:text-xl"
-          />
-          <p className="mt-1 max-w-2xl text-xs text-slate-400">
-            {helperText}
-          </p>
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+            <input
+              value={title}
+              onBlur={onTitleBlur}
+              onChange={(event) => onTitleChange(event.target.value)}
+              placeholder="Untitled string"
+              className="h-9 w-full min-w-0 max-w-[220px] rounded-xl border border-transparent bg-transparent px-2.5 text-sm font-medium text-slate-200 outline-none transition duration-200 placeholder:text-slate-500 focus:border-white/[0.08] focus:bg-white/[0.04]"
+            />
+
+            {statusText ? (
+              <span
+                className={`hidden max-w-[220px] truncate rounded-full border px-2.5 py-1 text-[11px] xl:inline-flex ${
+                  statusTone === "error"
+                    ? "border-rose-500/20 bg-rose-500/10 text-rose-200"
+                    : "border-white/[0.08] bg-white/[0.04] text-slate-400"
+                }`}
+              >
+                {statusText}
+              </span>
+            ) : null}
+          </div>
         </div>
-      </div>
 
-      <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-end">
-        <ModeTabs mode={mode} onChange={onModeChange} />
-        <button
-          type="button"
-          onClick={onOpenCollaboration}
-          className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-slate-200 transition hover:bg-white/[0.06] xl:hidden"
-          aria-label="Open collaboration panel"
-        >
-          <PanelRight size={16} />
-        </button>
+        <div className="flex items-center justify-center px-2">
+          {selectedTeamLabel ? (
+            <span className="hidden max-w-[220px] truncate rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-medium text-cyan-100 sm:inline-flex">
+              {selectedTeamLabel}
+            </span>
+          ) : null}
+        </div>
+
+        <div className="flex min-w-0 items-center justify-end gap-2">
+          <ModeTabs mode={mode} onChange={onModeChange} />
+          <button
+            type="button"
+            onClick={onToggleStringPanel}
+            className={`inline-flex h-9 items-center gap-2 rounded-xl border px-3 text-[12px] font-medium transition duration-200 ${
+              stringPanelOpen
+                ? "border-cyan-400/20 bg-cyan-400/10 text-cyan-100"
+                : "border-white/[0.06] bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"
+            } ${stringPanelPinned ? "xl:hidden" : ""}`}
+          >
+            <PanelRight size={14} />
+            <span className="hidden sm:inline">String Panel</span>
+          </button>
+        </div>
       </div>
     </header>
   );

@@ -72,9 +72,7 @@ import {
   EditableWorkflowDraft,
   FLOW_STRING_DETAILS_SUBTABS,
   FlowExecutionSurfaceTab,
-  FlowGovernanceSurfaceTab,
   FlowStringDetailsSubtab,
-  FlowStringsSurfaceTab,
   HumanInputRequest,
   NAV_ITEMS,
   NAV_ITEM_MAP,
@@ -100,7 +98,6 @@ import {
   SteerDeliverableCard,
   SteerLane,
   SteerLaneTab,
-  SteerSurfaceTab,
   StringDeliverableCard,
   StringDetailsTab,
   StringScanRow,
@@ -111,9 +108,9 @@ import {
   UserJoinRequest,
   WorkspaceMode,
   buildDraftDeliverableCards,
-  buildEditableStringDraft,
   buildLocalMonthGrid,
   buildPlanCardMeta,
+  buildStringCollaborationSnapshot,
   buildStringDiscussionTurns,
   buildThreadDeliverableCards,
   buildThreadScanRows,
@@ -149,6 +146,7 @@ import {
   randomPresence,
   getScopedApprovalCheckpointsForString,
   getScopedPermissionRequestsForString,
+  resolveEditableStringDraft,
   shouldDirectWorkflowLaunch,
   shouldForceDirectionPlanRoute,
   sleep,
@@ -157,8 +155,6 @@ import {
   toLocalDateKey,
   workflowAgentLabelFromTaskTrace
 } from "@/components/vorldx-shell/shared";
-import { SteerDetailsEditorSurface } from "@/components/vorldx-shell/surfaces/steer-details-editor-surface";
-import { SteerConsoleSurface } from "@/components/vorldx-shell/surfaces/steer-console-surface";
 
 export function FlowStringsSurface({
   calendarDate,
@@ -167,11 +163,10 @@ export function FlowStringsSurface({
   permissionRequests,
   approvalCheckpoints,
   draftsByString = {},
-  onDraftChange,
   scoreByString = {},
   steerDecisions,
   onSteerDecision,
-  surfaceTab
+  initialDetailsTab = "OVERVIEW"
 }: {
   calendarDate?: string | null;
   stringItem: ControlThreadHistoryItem | null;
@@ -179,14 +174,16 @@ export function FlowStringsSurface({
   permissionRequests: PermissionRequestItem[];
   approvalCheckpoints: ApprovalCheckpointItem[];
   draftsByString?: Record<string, EditableStringDraft>;
-  onDraftChange?: (stringId: string, nextDraft: EditableStringDraft) => void;
   scoreByString?: Record<string, StringScoreRecord[]>;
   steerDecisions: Record<string, SteerLaneTab>;
   onSteerDecision: (cardId: string, lane: SteerLaneTab) => void;
-  surfaceTab: FlowStringsSurfaceTab;
+  initialDetailsTab?: FlowStringDetailsSubtab;
 }) {
-  const [detailsTab, setDetailsTab] = useState<FlowStringDetailsSubtab>("OVERVIEW");
-  const [blueprintLane, setBlueprintLane] = useState<SteerSurfaceTab>("CENTER");
+  const [detailsTab, setDetailsTab] = useState<FlowStringDetailsSubtab>(initialDetailsTab);
+  const [expandedWorkflowIndex, setExpandedWorkflowIndex] = useState<number | null>(0);
+  useEffect(() => {
+    setDetailsTab(initialDetailsTab);
+  }, [initialDetailsTab]);
   const parseDetailScore = (value: string | null | undefined) => {
     const parsed = Number.parseInt((value ?? "").trim(), 10);
     if (!Number.isFinite(parsed)) {
@@ -232,13 +229,12 @@ export function FlowStringsSurface({
       allStringItems.map((item) => ({
         item,
         stringTitle: controlThreadDisplayTitle(item),
-        draft:
-          draftsByString[item.id] ??
-          buildEditableStringDraft({
-            stringItem: item,
-            permissionRequests: permissionRequestsByString.get(item.id) ?? [],
-            approvalCheckpoints: approvalCheckpointsByString.get(item.id) ?? []
-          })
+        draft: resolveEditableStringDraft({
+          draft: draftsByString[item.id],
+          stringItem: item,
+          permissionRequests: permissionRequestsByString.get(item.id) ?? [],
+          approvalCheckpoints: approvalCheckpointsByString.get(item.id) ?? []
+        })
       })),
     [allStringItems, approvalCheckpointsByString, draftsByString, permissionRequestsByString]
   );
@@ -299,6 +295,16 @@ export function FlowStringsSurface({
       })) ?? [],
     [activeDraft?.workflows]
   );
+  useEffect(() => {
+    if (workflows.length === 0) {
+      setExpandedWorkflowIndex(null);
+      return;
+    }
+
+    setExpandedWorkflowIndex((current) =>
+      current === null || current < 0 || current >= workflows.length ? 0 : current
+    );
+  }, [stringItem?.id, workflows.length]);
   const milestones = useMemo(() => activeDraft?.milestones ?? [], [activeDraft?.milestones]);
   const pathway = useMemo(
     () =>
@@ -518,6 +524,39 @@ export function FlowStringsSurface({
     () => buildLaneCounts(allDeliverableCards),
     [allDeliverableCards, buildLaneCounts]
   );
+  const activeCollaboration = useMemo(
+    () =>
+      buildStringCollaborationSnapshot({
+        draft: activeDraft,
+        stringItem
+      }),
+    [activeDraft, stringItem]
+  );
+  const allCollaboration = useMemo(() => {
+    let totalCount = 0;
+    let stringsWithContext = 0;
+    let helper = "No collaboration context yet.";
+
+    draftRows.forEach(({ item, draft, stringTitle }) => {
+      const snapshot = buildStringCollaborationSnapshot({
+        draft,
+        stringItem: item
+      });
+      totalCount += snapshot.totalCount;
+      if (snapshot.totalCount > 0) {
+        stringsWithContext += 1;
+        if (helper === "No collaboration context yet." && snapshot.summary !== "No collaboration context yet.") {
+          helper = `${stringTitle} | ${snapshot.summary}`;
+        }
+      }
+    });
+
+    return {
+      totalCount,
+      stringsWithContext,
+      helper
+    };
+  }, [draftRows]);
   const activeOverviewCards = useMemo(
     () =>
       activeDraft
@@ -569,10 +608,17 @@ export function FlowStringsSurface({
               label: "Scoring",
               value: detailScore === null ? "N/A" : `${detailScore}/100`,
               helper: `${activeLaneCounts.APPROVED} approved | ${activeScoreRecords.length} activity records`
+            },
+            {
+              label: "Collaboration",
+              value: `${activeCollaboration.totalCount}`,
+              helper: activeCollaboration.summary
             }
           ]
         : [],
     [
+      activeCollaboration.summary,
+      activeCollaboration.totalCount,
       activeApprovalCheckpoints.length,
       activeDraft,
       activeLaneCounts.APPROVED,
@@ -638,9 +684,20 @@ export function FlowStringsSurface({
         label: "Scoring",
         value: `${allScores.filter((item) => item.score !== null).length}`,
         helper: `${allScoreActivity.length} score and steer activity record(s)`
+      },
+      {
+        label: "Collaboration",
+        value: `${allCollaboration.totalCount}`,
+        helper:
+          allCollaboration.stringsWithContext > 0
+            ? `${allCollaboration.stringsWithContext} string(s) with collaboration context | ${allCollaboration.helper}`
+            : allCollaboration.helper
       }
     ],
     [
+      allCollaboration.helper,
+      allCollaboration.stringsWithContext,
+      allCollaboration.totalCount,
       allDeliverableCards.length,
       allDirections.length,
       allDiscussionTurns.length,
@@ -672,35 +729,6 @@ export function FlowStringsSurface({
     }
     return "border-amber-500/35 bg-amber-500/10 text-amber-200";
   };
-  const blueprintSurface = stringItem ? (
-    <SteerDetailsEditorSurface
-      stringItem={stringItem}
-      calendarDate={calendarDate}
-      permissionRequests={activePermissionRequests}
-      approvalCheckpoints={activeApprovalCheckpoints}
-      draftsByString={draftsByString}
-      scoreByString={scoreByString}
-      steerLane={blueprintLane === "DETAILS" ? "CENTER" : blueprintLane}
-      onSteerLaneChange={setBlueprintLane}
-      steerDecisions={steerDecisions}
-      readOnly
-    />
-  ) : (
-    <SteerConsoleSurface
-      stringItem={stringItem}
-      allStringItems={allStringItems}
-      calendarDate={calendarDate}
-      activeLane={blueprintLane}
-      onActiveLaneChange={setBlueprintLane}
-      draftsByString={draftsByString}
-      onDraftChange={onDraftChange}
-      scoreByString={scoreByString}
-      decisions={steerDecisions}
-      onDecision={onSteerDecision}
-      permissionRequests={permissionRequests}
-      approvalCheckpoints={approvalCheckpoints}
-    />
-  );
 
   if (!stringItem) {
     return (
@@ -712,7 +740,7 @@ export function FlowStringsSurface({
           <p className="mt-1 text-sm font-semibold text-slate-100">No string selected, showing all strings</p>
           <p className="mt-1 text-xs text-slate-400">
             Details now aggregate discussion, direction, plan, workflow, pathway, approvals,
-            milestones, and scoring across every visible string.
+            milestones, deliverables, scoring, and collaboration across every visible string.
           </p>
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <div className="rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
@@ -730,8 +758,7 @@ export function FlowStringsSurface({
           </div>
         </div>
 
-        {surfaceTab === "DETAILS" ? (
-          <div className="space-y-3">
+        <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2 rounded-[24px] border border-white/10 bg-black/20 p-2">
               {FLOW_STRING_DETAILS_SUBTABS.map((tab) => (
                 <button
@@ -1140,9 +1167,6 @@ export function FlowStringsSurface({
               </div>
             ) : null}
           </div>
-        ) : (
-          blueprintSurface
-        )}
       </div>
     );
   }
@@ -1187,8 +1211,7 @@ export function FlowStringsSurface({
         </div>
       </div>
 
-      {surfaceTab === "DETAILS" ? (
-        <div className="space-y-3">
+      <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-2 rounded-[24px] border border-white/10 bg-black/20 p-2">
             {FLOW_STRING_DETAILS_SUBTABS.map((tab) => (
               <button
@@ -1491,16 +1514,47 @@ export function FlowStringsSurface({
                       key={`${workflow.title}-${index}`}
                       className="rounded-2xl border border-white/10 bg-black/25 px-3 py-3"
                     >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-xs font-semibold text-slate-100">{workflow.title}</p>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedWorkflowIndex(index)}
+                        className="flex w-full flex-wrap items-center justify-between gap-2 text-left"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            {expandedWorkflowIndex === index ? (
+                              <ChevronDown size={14} className="text-slate-400" />
+                            ) : (
+                              <ChevronRight size={14} className="text-slate-400" />
+                            )}
+                            <p className="text-xs font-semibold text-slate-100">{workflow.title}</p>
+                          </div>
+                          <p className="mt-1 text-[11px] text-slate-400">
+                            {workflow.ownerRole || "Owner"}
+                            {workflow.goal ? ` | ${compactTaskTitle(workflow.goal, workflow.title)}` : ""}
+                          </p>
+                        </div>
                         <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-slate-300">
                           {workflow.tasks.length} task(s)
                         </span>
-                      </div>
-                      <p className="mt-1 text-[11px] text-slate-400">
-                        {workflow.ownerRole || "Owner"}
-                        {workflow.goal ? ` | ${compactTaskTitle(workflow.goal, workflow.title)}` : ""}
-                      </p>
+                      </button>
+                      {expandedWorkflowIndex === index ? (
+                        <div className="mt-3 space-y-2 border-t border-white/10 pt-3">
+                          {workflow.tasks.length === 0 ? (
+                            <p className="text-xs text-slate-500">No tasks were captured for this workflow yet.</p>
+                          ) : (
+                            workflow.tasks.map((task, taskIndex) => (
+                              <div
+                                key={`${workflow.title}-task-${taskIndex}`}
+                                className="rounded-2xl border border-white/10 bg-black/20 px-3 py-2.5"
+                              >
+                                <p className="text-xs font-semibold text-slate-100">
+                                  {taskIndex + 1}. {task}
+                                </p>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      ) : null}
                     </div>
                   ))
                 )}
@@ -1809,9 +1863,6 @@ export function FlowStringsSurface({
             </div>
           ) : null}
         </div>
-      ) : (
-        blueprintSurface
-      )}
     </div>
   );
 }

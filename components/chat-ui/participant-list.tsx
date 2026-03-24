@@ -17,18 +17,18 @@ function initials(name: string) {
 export function ParticipantList({ participants }: ParticipantListProps) {
   if (participants.length === 0) {
     return (
-      <div className="rounded-2xl border border-dashed border-white/10 px-4 py-5 text-sm text-slate-500">
+      <div className="rounded-2xl border border-dashed border-white/10 bg-black/15 px-4 py-6 text-sm leading-6 text-slate-500">
         No active participants in this view.
       </div>
     );
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2.5">
       {participants.map((participant) => (
         <div
           key={participant.id}
-          className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/15 px-3 py-3"
+          className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/15 px-3 py-3 transition duration-200 hover:border-white/15 hover:bg-white/[0.04]"
         >
           <div className="relative">
             <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-xs font-semibold text-slate-100">
@@ -43,7 +43,7 @@ export function ParticipantList({ participants }: ParticipantListProps) {
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-medium text-slate-100">{participant.name}</p>
             <p className="truncate text-xs text-slate-400">
-              {participant.role || "Contributor"} • {participant.kind === "AI" ? "AI" : "Human"}
+              {participant.role || "Contributor"} | {participant.kind === "AI" ? "AI" : "Human"}
             </p>
           </div>
         </div>

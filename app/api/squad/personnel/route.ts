@@ -1,6 +1,8 @@
 export const dynamic = "force-dynamic";
 
 import {
+  AgentRole,
+  AgentStatus,
   LogType,
   Prisma,
   PersonnelStatus,
@@ -38,6 +40,17 @@ function parsePricingModel(value: string | undefined): PricingModel | null {
   if (value === "SUBSCRIPTION") return PricingModel.SUBSCRIPTION;
   if (value === "OUTCOME") return PricingModel.OUTCOME;
   return null;
+}
+
+function inferAgentRoleFromPersonnelRole(value: string): AgentRole {
+  const normalized = value.toLowerCase();
+  if (/\b(main|boss|orchestrator)\b/.test(normalized)) {
+    return AgentRole.MAIN;
+  }
+  if (/\b(manager|lead|strategist|head)\b/.test(normalized)) {
+    return AgentRole.MANAGER;
+  }
+  return AgentRole.WORKER;
 }
 
 export async function GET(request: NextRequest) {
@@ -242,6 +255,41 @@ export async function POST(request: NextRequest) {
       }
     });
 
+    let agentProfile = null as { id: string; role: AgentRole } | null;
+
+    if (type === PersonnelType.AI) {
+      const existingAgentProfile = await tx.agent.findFirst({
+        where: {
+          orgId,
+          personnelId: personnel.id
+        },
+        select: {
+          id: true,
+          role: true
+        }
+      });
+
+      if (existingAgentProfile) {
+        agentProfile = existingAgentProfile;
+      } else {
+        agentProfile = await tx.agent.create({
+          data: {
+            orgId,
+            personnelId: personnel.id,
+            role: inferAgentRoleFromPersonnelRole(personnel.role),
+            status: AgentStatus.ACTIVE,
+            name: personnel.name,
+            goal: personnel.expertise ?? `${personnel.role} support`,
+            allowedTools: []
+          },
+          select: {
+            id: true,
+            role: true
+          }
+        });
+      }
+    }
+
     if (featureFlags.capabilityVault && Array.isArray(body?.capabilityGrants)) {
       const grants = body.capabilityGrants.filter(
         (entry) => assignedOAuthIds.includes(entry.linkedAccountId)
@@ -277,7 +325,8 @@ export async function POST(request: NextRequest) {
         meta: {
           type,
           role: personnel.role,
-          capabilityVault: featureFlags.capabilityVault
+          capabilityVault: featureFlags.capabilityVault,
+          agentProfileId: agentProfile?.id ?? null
         }
       },
       tx
@@ -290,19 +339,24 @@ export async function POST(request: NextRequest) {
         type: SpendEventType.PREDICTED_BURN,
         meta: {
           source: "squad.recruit",
-          personnelId: personnel.id
+          personnelId: personnel.id,
+          agentProfileId: agentProfile?.id ?? null
         }
       },
       tx
     );
 
-    return personnel;
+    return {
+      personnel,
+      agentProfile
+    };
   });
 
   return NextResponse.json(
     {
       ok: true,
-      personnel: created
+      personnel: created.personnel,
+      agentProfile: created.agentProfile
     },
     { status: 201 }
   );

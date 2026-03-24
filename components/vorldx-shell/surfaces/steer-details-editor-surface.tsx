@@ -111,9 +111,9 @@ import {
   UserJoinRequest,
   WorkspaceMode,
   buildDraftDeliverableCards,
-  buildEditableStringDraft,
   buildLocalMonthGrid,
   buildPlanCardMeta,
+  buildStringCollaborationSnapshot,
   buildStringDiscussionTurns,
   buildThreadDeliverableCards,
   buildThreadScanRows,
@@ -140,6 +140,7 @@ import {
   makeDirectionTurnId,
   makeLocalDraftId,
   normalizeDeliverableId,
+  normalizeEditableStringDraft,
   normalizeHumanInputReason,
   normalizePlanAnalysisText,
   normalizeToolkitAlias,
@@ -147,6 +148,7 @@ import {
   openCenteredPopup,
   primaryWorkspaceScopeLabel,
   randomPresence,
+  resolveEditableStringDraft,
   shouldDirectWorkflowLaunch,
   shouldForceDirectionPlanRoute,
   sleep,
@@ -218,13 +220,14 @@ export function SteerDetailsEditorSurface({
 
   const writeDraft = useCallback(
     (stringId: string, nextDraft: EditableStringDraft) => {
+      const normalizedDraft = normalizeEditableStringDraft(nextDraft);
       if (isExternalDraftMode) {
-        onDraftChange?.(stringId, nextDraft);
+        onDraftChange?.(stringId, normalizedDraft);
         return;
       }
       setInternalDraftsByString((previous) => ({
         ...previous,
-        [stringId]: nextDraft
+        [stringId]: normalizedDraft
       }));
     },
     [isExternalDraftMode, onDraftChange]
@@ -239,7 +242,7 @@ export function SteerDetailsEditorSurface({
     }
     writeDraft(
       activeStringItem.id,
-      buildEditableStringDraft({
+      resolveEditableStringDraft({
         stringItem: activeStringItem,
         permissionRequests,
         approvalCheckpoints
@@ -253,7 +256,18 @@ export function SteerDetailsEditorSurface({
     writeDraft
   ]);
 
-  const activeDraft = activeStringItem ? resolvedDraftsByString[activeStringItem.id] ?? null : null;
+  const activeDraft = useMemo(
+    () =>
+      activeStringItem
+        ? resolveEditableStringDraft({
+            draft: resolvedDraftsByString[activeStringItem.id],
+            stringItem: activeStringItem,
+            permissionRequests,
+            approvalCheckpoints
+          })
+        : null,
+    [activeStringItem, approvalCheckpoints, permissionRequests, resolvedDraftsByString]
+  );
   const activePlan = activeStringItem?.planningResult?.primaryPlan ?? null;
   const activeRequiredToolkits = activeStringItem?.planningResult?.requiredToolkits ?? [];
   const activeScoreRecords = useMemo(
@@ -300,39 +314,18 @@ export function SteerDetailsEditorSurface({
       (total, workflow) => total + splitDraftLines(workflow.deliverablesText).length,
       0
     ) ?? 0;
-  const collaborationParticipants = useMemo(() => {
-    const entries = new Map<
-      string,
-      { id: string; actorType: ActorType; actorLabel: string; turnCount: number }
-    >();
-    activeDraft?.discussion.forEach((entry, index) => {
-      const actorLabel =
-        entry.actorLabel.trim() || (entry.actorType === "HUMAN" ? "Owner" : "Participant");
-      const key = `${entry.actorType}:${actorLabel.toLowerCase()}`;
-      const existing = entries.get(key);
-      if (existing) {
-        existing.turnCount += 1;
-        return;
-      }
-      entries.set(key, {
-        id: `participant-${index}`,
-        actorType: entry.actorType,
-        actorLabel,
-        turnCount: 1
-      });
-    });
-    return [...entries.values()];
-  }, [activeDraft]);
-  const collaborationWorkforce = useMemo(
-    () => activePlan?.resourcePlan ?? [],
-    [activePlan?.resourcePlan]
+  const collaborationSnapshot = useMemo(
+    () =>
+      buildStringCollaborationSnapshot({
+        draft: activeDraft,
+        stringItem: activeStringItem
+      }),
+    [activeDraft, activeStringItem]
   );
-  const collaborationAutoSquad = activeStringItem?.planningResult?.autoSquad ?? null;
-  const collaborationCount =
-    collaborationParticipants.length +
-    collaborationWorkforce.length +
-    (collaborationAutoSquad?.created?.length ?? 0) +
-    (collaborationAutoSquad?.requestedRoles?.length ?? 0);
+  const collaborationParticipants = collaborationSnapshot.participants;
+  const collaborationWorkforce = collaborationSnapshot.workforce;
+  const collaborationAutoSquad = collaborationSnapshot.autoSquad;
+  const collaborationCount = collaborationSnapshot.totalCount;
   const overviewCards = useMemo(
     () =>
       activeDraft
@@ -397,20 +390,14 @@ export function SteerDetailsEditorSurface({
             {
               label: "Collaboration",
               value: `${collaborationCount}`,
-              helper:
-                collaborationWorkforce[0]?.role ||
-                collaborationParticipants[0]?.actorLabel ||
-                collaborationAutoSquad?.created?.[0]?.name ||
-                "No collaboration context yet."
+              helper: collaborationSnapshot.summary
             }
           ]
         : [],
     [
       activeDraft,
-      collaborationAutoSquad?.created,
       collaborationCount,
-      collaborationParticipants,
-      collaborationWorkforce,
+      collaborationSnapshot.summary,
       draftPlanDeliverables,
       steerCards.length,
       steerLaneCounts.APPROVED,
@@ -424,8 +411,8 @@ export function SteerDetailsEditorSurface({
         return;
       }
       const current =
-        resolvedDraftsByString[activeStringItem.id] ??
-        buildEditableStringDraft({
+        resolveEditableStringDraft({
+          draft: resolvedDraftsByString[activeStringItem.id],
           stringItem: activeStringItem,
           permissionRequests,
           approvalCheckpoints
@@ -441,7 +428,7 @@ export function SteerDetailsEditorSurface({
     }
     writeDraft(
       activeStringItem.id,
-      buildEditableStringDraft({
+      resolveEditableStringDraft({
         stringItem: activeStringItem,
         permissionRequests,
         approvalCheckpoints

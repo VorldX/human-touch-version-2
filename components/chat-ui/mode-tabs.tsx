@@ -9,14 +9,14 @@ interface ModeTabsProps {
 
 export function ModeTabs({ mode, onChange }: ModeTabsProps) {
   return (
-    <div className="inline-flex w-full max-w-full rounded-full border border-white/10 bg-black/20 p-1 sm:w-auto">
+    <div className="inline-flex h-9 max-w-full rounded-xl border border-white/[0.06] bg-white/[0.04] p-0.5 sm:w-auto">
       <button
         type="button"
         onClick={() => onChange("discussion")}
-        className={`flex-1 whitespace-nowrap rounded-full px-3 py-2 text-xs font-medium transition sm:flex-none sm:px-4 sm:text-sm ${
+        className={`flex-1 whitespace-nowrap rounded-[10px] px-3 py-1.5 text-[12px] font-medium transition duration-200 sm:flex-none ${
           mode === "discussion"
-            ? "bg-white text-slate-950 shadow-sm"
-            : "text-slate-400 hover:text-slate-200"
+            ? "bg-white text-slate-950"
+            : "text-slate-400 hover:bg-white/[0.05] hover:text-slate-200"
         }`}
       >
         Discussion
@@ -24,10 +24,10 @@ export function ModeTabs({ mode, onChange }: ModeTabsProps) {
       <button
         type="button"
         onClick={() => onChange("direction")}
-        className={`flex-1 whitespace-nowrap rounded-full px-3 py-2 text-xs font-medium transition sm:flex-none sm:px-4 sm:text-sm ${
+        className={`flex-1 whitespace-nowrap rounded-[10px] px-3 py-1.5 text-[12px] font-medium transition duration-200 sm:flex-none ${
           mode === "direction"
-            ? "bg-amber-300 text-slate-950 shadow-sm"
-            : "text-slate-400 hover:text-slate-200"
+            ? "bg-amber-300 text-slate-950"
+            : "text-slate-400 hover:bg-white/[0.05] hover:text-slate-200"
         }`}
       >
         Direction

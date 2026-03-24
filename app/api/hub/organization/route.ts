@@ -46,6 +46,15 @@ function parseManagedRole(value: unknown) {
   return null;
 }
 
+function isValidEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function deriveUsernameFromEmail(email: string) {
+  const local = email.split("@")[0]?.trim() || "user";
+  return local.slice(0, 64);
+}
+
 function parseManagementLevel(value: unknown): CollaborationManagementLevel | null {
   if (value === "FOUNDER") return "FOUNDER";
   if (value === "ADMIN") return "ADMIN";
@@ -77,6 +86,7 @@ function parseAccessAreas(value: unknown) {
 }
 
 function parseCollaborationAction(value: unknown) {
+  if (value === "ADD_MEMBER") return "ADD_MEMBER";
   if (value === "SAVE_MEMBER_PROFILE") return "SAVE_MEMBER_PROFILE";
   if (value === "SAVE_TEAM") return "SAVE_TEAM";
   if (value === "DELETE_TEAM") return "DELETE_TEAM";
@@ -677,7 +687,9 @@ export async function PATCH(request: NextRequest) {
   if (!access.ok) {
     return access.response;
   }
-  const hasMemberRoleShape = memberUserId.length > 0 || input.role !== undefined;
+  // `memberUserId` is shared by collaboration profile updates, so only an explicit
+  // `role` field should classify the payload as an organization-role mutation.
+  const hasMemberRoleShape = input.role !== undefined;
   const hasDelegatedAccessShape = action !== null || input.targetKind !== undefined || input.targetId !== undefined;
   const collaborationAction = parseCollaborationAction(input.collaborationAction);
   const hasCollaborationShape =
@@ -1028,6 +1040,138 @@ export async function PATCH(request: NextRequest) {
         },
         { status: 400 }
       );
+    }
+
+    if (collaborationAction === "ADD_MEMBER") {
+      if (!access.actor.isAdmin) {
+        return denyManageAccess(
+          "Founder or admin access is required to add organization members."
+        );
+      }
+
+      if (
+        !hasOnlyKeys(input, [
+          "orgId",
+          "collaborationAction",
+          "email",
+          "username",
+          "memberRole"
+        ])
+      ) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message: "Invalid add member patch payload."
+          },
+          { status: 400 }
+        );
+      }
+
+      const email = asText(input.email).toLowerCase();
+      const username = asText(input.username);
+      const memberRole = parseManagedRole(input.memberRole);
+
+      if (!email || !isValidEmail(email) || !memberRole) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message: "A valid email and memberRole are required."
+          },
+          { status: 400 }
+        );
+      }
+
+      const existingMembership = await prisma.orgMember.findFirst({
+        where: {
+          orgId,
+          user: {
+            email
+          }
+        },
+        select: {
+          role: true
+        }
+      });
+
+      if (existingMembership) {
+        return NextResponse.json(
+          {
+            ok: false,
+            message:
+              existingMembership.role === OrgRole.FOUNDER
+                ? "Founder membership already exists for that email."
+                : "That user already belongs to this organization. Use the access controls below to update their role."
+          },
+          { status: 409 }
+        );
+      }
+
+      const created = await prisma.$transaction(async (tx) => {
+        const user = await tx.user.upsert({
+          where: { email },
+          update: username
+            ? {
+                username
+              }
+            : {},
+          create: {
+            email,
+            username: username || deriveUsernameFromEmail(email)
+          },
+          select: {
+            id: true,
+            username: true,
+            email: true,
+            activeOrgId: true
+          }
+        });
+
+        const membership = await tx.orgMember.create({
+          data: {
+            userId: user.id,
+            orgId,
+            role: memberRole
+          },
+          select: {
+            userId: true,
+            role: true,
+            createdAt: true
+          }
+        });
+
+        if (!user.activeOrgId) {
+          await tx.user.update({
+            where: { id: user.id },
+            data: {
+              activeOrgId: orgId
+            }
+          });
+        }
+
+        await tx.log.create({
+          data: {
+            orgId,
+            type: LogType.USER,
+            actor: "ORG_HUB",
+            message: `${access.actor.email} added ${email} to the organization as ${toRoleLabel(memberRole)}.`
+          }
+        });
+
+        return {
+          userId: membership.userId,
+          username: user.username,
+          email: user.email,
+          role: membership.role,
+          roleLabel: toRoleLabel(membership.role),
+          joinedAt: membership.createdAt,
+          isActiveOrganization: user.activeOrgId === orgId
+        };
+      });
+
+      return NextResponse.json({
+        ok: true,
+        member: created
+      });
     }
 
     if (collaborationAction === "SAVE_MEMBER_PROFILE") {

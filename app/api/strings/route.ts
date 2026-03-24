@@ -47,7 +47,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as
-    | {
+      | {
         orgId?: string;
         id?: string;
         title?: string;
@@ -59,6 +59,7 @@ export async function POST(request: NextRequest) {
         selectedTeamId?: string | null;
         selectedTeamLabel?: string | null;
         source?: "workspace" | "direction" | "plan";
+        workspaceState?: Record<string, unknown> | null;
         messages?: unknown;
       }
     | null;
@@ -91,6 +92,12 @@ export async function POST(request: NextRequest) {
       selectedTeamId: body?.selectedTeamId,
       selectedTeamLabel: body?.selectedTeamLabel,
       source: body?.source,
+      workspaceState:
+        body?.workspaceState &&
+        typeof body.workspaceState === "object" &&
+        !Array.isArray(body.workspaceState)
+          ? body.workspaceState
+          : undefined,
       messages: Array.isArray(body?.messages) ? (body.messages as ChatMessage[]) : undefined
     });
 

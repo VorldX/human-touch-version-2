@@ -20,7 +20,8 @@ type MemoryEntryClient = Pick<Prisma.TransactionClient, "memoryEntry"> | typeof 
 
 export interface PersistedStringRecord extends ChatString {
   orgId: string;
-  userId: string;
+  createdByUserId: string | null;
+  updatedByUserId: string | null;
 }
 
 interface SaveStringInput {
@@ -35,6 +36,7 @@ interface SaveStringInput {
   selectedTeamLabel?: string | null;
   source?: ChatString["source"];
   messages?: ChatMessage[];
+  workspaceState?: ChatString["workspaceState"] | null;
 }
 
 const STRING_PREFIX = "string.record.";
@@ -227,6 +229,51 @@ function normalizeMessages(value: unknown, fallbackCreatedAt: string) {
     .filter((item) => item.content.length > 0 || item.direction);
 }
 
+function normalizeWorkspaceState(
+  value: unknown
+): ChatString["workspaceState"] | undefined {
+  const record = asRecord(value);
+  const editableDraft =
+    record.editableDraft &&
+    typeof record.editableDraft === "object" &&
+    !Array.isArray(record.editableDraft)
+      ? (record.editableDraft as Record<string, unknown>)
+      : undefined;
+  const scoreRecords = Array.isArray(record.scoreRecords)
+    ? record.scoreRecords.filter(
+        (item): item is Record<string, unknown> =>
+          Boolean(item) && typeof item === "object" && !Array.isArray(item)
+      )
+    : [];
+  const steerDecisionsSource =
+    record.steerDecisions &&
+    typeof record.steerDecisions === "object" &&
+    !Array.isArray(record.steerDecisions)
+      ? (record.steerDecisions as Record<string, unknown>)
+      : {};
+  const steerDecisions = Object.fromEntries(
+    Object.entries(steerDecisionsSource).filter(
+      ([key, value]) =>
+        key.trim().length > 0 &&
+        (value === "CENTER" || value === "APPROVED" || value === "RETHINK")
+    )
+  ) as Record<string, "CENTER" | "APPROVED" | "RETHINK">;
+
+  if (
+    !editableDraft &&
+    scoreRecords.length === 0 &&
+    Object.keys(steerDecisions).length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...(editableDraft ? { editableDraft } : {}),
+    ...(scoreRecords.length > 0 ? { scoreRecords } : {}),
+    ...(Object.keys(steerDecisions).length > 0 ? { steerDecisions } : {})
+  };
+}
+
 function keyFromStringId(stringId: string) {
   return `${STRING_PREFIX}${stringId}`;
 }
@@ -241,7 +288,7 @@ function sortStrings(strings: PersistedStringRecord[]) {
 
 function parseStringRecord(
   orgId: string,
-  userId: string,
+  fallbackUserId: string | null,
   value: unknown
 ): PersistedStringRecord {
   const record = asRecord(value);
@@ -251,11 +298,11 @@ function parseStringRecord(
   const updatedAt = asText(record.updatedAt) || createdAt;
   const directionId = asNullableText(record.directionId);
   const planId = asNullableText(record.planId);
+  const workspaceState = normalizeWorkspaceState(record.workspaceState);
 
   return {
     id,
     orgId,
-    userId,
     title: asText(record.title) || DEFAULT_TITLE,
     mode: normalizeMode(record.mode),
     updatedAt,
@@ -268,18 +315,41 @@ function parseStringRecord(
       record.source,
       planId ? "plan" : directionId ? "direction" : "workspace"
     ),
+    ...(workspaceState ? { workspaceState } : {}),
+    createdByUserId:
+      asNullableText(record.createdByUserId) ?? fallbackUserId ?? null,
+    updatedByUserId:
+      asNullableText(record.updatedByUserId) ?? fallbackUserId ?? null,
     persisted: true,
     messages: normalizeMessages(record.messages, createdAt)
   };
 }
 
-export async function listStrings(
+async function listSharedStringEntries(orgId: string, client?: MemoryEntryClient) {
+  const db = client ?? prisma;
+  return db.memoryEntry.findMany({
+    where: {
+      orgId,
+      tier: MemoryTier.ORG,
+      key: {
+        startsWith: STRING_PREFIX
+      },
+      redactedAt: null
+    },
+    orderBy: {
+      updatedAt: "desc"
+    },
+    take: 300
+  });
+}
+
+async function listLegacyUserStringEntries(
   orgId: string,
   userId: string,
   client?: MemoryEntryClient
 ) {
   const db = client ?? prisma;
-  const rows = await db.memoryEntry.findMany({
+  return db.memoryEntry.findMany({
     where: {
       orgId,
       userId,
@@ -292,20 +362,34 @@ export async function listStrings(
     orderBy: {
       updatedAt: "desc"
     },
-    take: 200
+    take: 300
   });
-
-  return sortStrings(rows.map((row) => parseStringRecord(orgId, userId, row.value)));
 }
 
-export async function getString(
+async function findSharedStringEntry(
+  orgId: string,
+  stringId: string,
+  client?: MemoryEntryClient
+) {
+  const db = client ?? prisma;
+  return db.memoryEntry.findFirst({
+    where: {
+      orgId,
+      tier: MemoryTier.ORG,
+      key: keyFromStringId(stringId),
+      redactedAt: null
+    }
+  });
+}
+
+async function findLegacyUserStringEntry(
   orgId: string,
   userId: string,
   stringId: string,
   client?: MemoryEntryClient
 ) {
   const db = client ?? prisma;
-  const row = await db.memoryEntry.findFirst({
+  return db.memoryEntry.findFirst({
     where: {
       orgId,
       userId,
@@ -314,12 +398,51 @@ export async function getString(
       redactedAt: null
     }
   });
+}
 
-  if (!row) {
+export async function listStrings(
+  orgId: string,
+  userId: string,
+  client?: MemoryEntryClient
+) {
+  const [sharedRows, legacyRows] = await Promise.all([
+    listSharedStringEntries(orgId, client),
+    listLegacyUserStringEntries(orgId, userId, client)
+  ]);
+  const merged = new Map<string, PersistedStringRecord>();
+
+  for (const row of sharedRows) {
+    const parsed = parseStringRecord(orgId, row.userId ?? userId, row.value);
+    merged.set(parsed.id, parsed);
+  }
+
+  for (const row of legacyRows) {
+    const parsed = parseStringRecord(orgId, row.userId ?? userId, row.value);
+    if (!merged.has(parsed.id)) {
+      merged.set(parsed.id, parsed);
+    }
+  }
+
+  return sortStrings([...merged.values()]);
+}
+
+export async function getString(
+  orgId: string,
+  userId: string,
+  stringId: string,
+  client?: MemoryEntryClient
+) {
+  const shared = await findSharedStringEntry(orgId, stringId, client);
+  if (shared) {
+    return parseStringRecord(orgId, shared.userId ?? userId, shared.value);
+  }
+
+  const legacy = await findLegacyUserStringEntry(orgId, userId, stringId, client);
+  if (!legacy) {
     return null;
   }
 
-  return parseStringRecord(orgId, userId, row.value);
+  return parseStringRecord(orgId, legacy.userId ?? userId, legacy.value);
 }
 
 export async function saveString(
@@ -332,17 +455,14 @@ export async function saveString(
   const now = new Date().toISOString();
   const requestedId = asText(input.id);
   const stringId = requestedId || randomUUID();
-  const existing = await db.memoryEntry.findFirst({
-    where: {
-      orgId,
-      userId,
-      tier: MemoryTier.USER,
-      key: keyFromStringId(stringId),
-      redactedAt: null
-    }
-  });
-
-  const current = existing ? parseStringRecord(orgId, userId, existing.value) : null;
+  const [sharedExisting, legacyExisting] = await Promise.all([
+    findSharedStringEntry(orgId, stringId, client),
+    findLegacyUserStringEntry(orgId, userId, stringId, client)
+  ]);
+  const existing = sharedExisting ?? legacyExisting;
+  const current = existing
+    ? parseStringRecord(orgId, existing.userId ?? userId, existing.value)
+    : null;
   const createdAt = asText(input.createdAt) || current?.createdAt || now;
   const directionId =
     input.directionId !== undefined ? asNullableText(input.directionId) : current?.directionId ?? null;
@@ -351,7 +471,6 @@ export async function saveString(
   const nextRecord: PersistedStringRecord = {
     id: stringId,
     orgId,
-    userId,
     title: asText(input.title) || current?.title || DEFAULT_TITLE,
     mode: input.mode ? normalizeMode(input.mode) : current?.mode ?? "discussion",
     createdAt,
@@ -370,6 +489,15 @@ export async function saveString(
       input.source,
       current?.source ?? (planId ? "plan" : directionId ? "direction" : "workspace")
     ),
+    ...(input.workspaceState !== undefined
+      ? input.workspaceState
+        ? { workspaceState: input.workspaceState }
+        : {}
+      : current?.workspaceState
+        ? { workspaceState: current.workspaceState }
+        : {}),
+    createdByUserId: current?.createdByUserId ?? userId,
+    updatedByUserId: userId,
     persisted: true,
     messages:
       input.messages !== undefined
@@ -377,12 +505,13 @@ export async function saveString(
         : current?.messages ?? []
   };
 
-  if (existing) {
+  if (sharedExisting) {
     await db.memoryEntry.update({
       where: {
-        id: existing.id
+        id: sharedExisting.id
       },
       data: {
+        userId,
         value: nextRecord as unknown as Prisma.InputJsonValue,
         redactedAt: null
       }
@@ -392,9 +521,21 @@ export async function saveString(
       data: {
         orgId,
         userId,
-        tier: MemoryTier.USER,
+        tier: MemoryTier.ORG,
         key: keyFromStringId(nextRecord.id),
         value: nextRecord as unknown as Prisma.InputJsonValue
+      }
+    });
+  }
+
+  if (legacyExisting) {
+    await db.memoryEntry.update({
+      where: {
+        id: legacyExisting.id
+      },
+      data: {
+        redactedAt: new Date(),
+        value: Prisma.DbNull
       }
     });
   }
@@ -409,29 +550,29 @@ export async function deleteString(
   client?: MemoryEntryClient
 ) {
   const db = client ?? prisma;
-  const row = await db.memoryEntry.findFirst({
-    where: {
-      orgId,
-      userId,
-      tier: MemoryTier.USER,
-      key: keyFromStringId(stringId),
-      redactedAt: null
-    }
-  });
+  const [shared, legacy] = await Promise.all([
+    findSharedStringEntry(orgId, stringId, client),
+    findLegacyUserStringEntry(orgId, userId, stringId, client)
+  ]);
+  const rows = [shared, legacy].filter(Boolean);
 
-  if (!row) {
+  if (rows.length === 0) {
     return false;
   }
 
-  await db.memoryEntry.update({
-    where: {
-      id: row.id
-    },
-    data: {
-      redactedAt: new Date(),
-      value: Prisma.DbNull
-    }
-  });
+  await Promise.all(
+    rows.map((row) =>
+      db.memoryEntry.update({
+        where: {
+          id: row!.id
+        },
+        data: {
+          redactedAt: new Date(),
+          value: Prisma.DbNull
+        }
+      })
+    )
+  );
 
   return true;
 }

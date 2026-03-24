@@ -67,6 +67,7 @@ import { FlowSidebarRail } from "@/components/vorldx-shell/surfaces/flow-sidebar
 import { FlowStringsSurface } from "@/components/vorldx-shell/surfaces/flow-strings-surface";
 import { ScanConsoleSurface } from "@/components/vorldx-shell/surfaces/scan-console-surface";
 import { SteerDetailsEditorSurface } from "@/components/vorldx-shell/surfaces/steer-details-editor-surface";
+import { StringBlueprintCanvasSurface } from "@/components/vorldx-shell/surfaces/string-blueprint-canvas-surface";
 import { useFlowScope } from "@/components/vorldx-shell/hooks/use-flow-scope";
 import { StringChatShell } from "@/components/chat-ui/string-chat-shell";
 import type { ChatMessage, ChatString, StringMode } from "@/components/chat-ui/types";
@@ -101,7 +102,6 @@ import {
   EditableWorkflowDraft,
   FLOW_STRING_DETAILS_SUBTABS,
   FlowExecutionSurfaceTab,
-  FlowGovernanceSurfaceTab,
   FlowStringDetailsSubtab,
   FlowStringsSurfaceTab,
   HumanInputRequest,
@@ -157,6 +157,8 @@ import {
   formatDraftForChat,
   formatRelativeTimeShort,
   formatToolkitList,
+  getScopedApprovalCheckpointsForString,
+  getScopedPermissionRequestsForString,
   getPrimaryWorkspaceTabForNavItem,
   inferToolkitsFromDirectionPrompt,
   inferTurnTimestamp,
@@ -168,6 +170,7 @@ import {
   makeDirectionTurnId,
   makeLocalDraftId,
   normalizeDeliverableId,
+  normalizeEditableStringDraft,
   normalizeHumanInputReason,
   normalizePlanAnalysisText,
   normalizeToolkitAlias,
@@ -176,6 +179,7 @@ import {
   primaryWorkspaceScopeLabel,
   parseJsonBody,
   randomPresence,
+  resolveEditableStringDraft,
   shouldDirectWorkflowLaunch,
   shouldForceDirectionPlanRoute,
   sleep,
@@ -190,6 +194,7 @@ interface WorkspaceStringsResponse {
   ok?: boolean;
   message?: string;
   strings?: ChatString[];
+  string?: ChatString;
 }
 
 interface WorkspaceDirectionRecord {
@@ -575,6 +580,232 @@ function buildWorkspaceLoadError(
   return `${fallback} (${status}).`;
 }
 
+function mapControlModeToStringMode(mode: ControlMode): StringMode {
+  return mode === "DIRECTION" ? "direction" : "discussion";
+}
+
+function parsePersistedSteerDecisions(
+  value: unknown
+): Record<string, SteerLaneTab> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const parsed = value as Record<string, unknown>;
+  const next: Record<string, SteerLaneTab> = {};
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (
+      key.trim().length > 0 &&
+      (entry === "CENTER" || entry === "APPROVED" || entry === "RETHINK")
+    ) {
+      next[key] = entry;
+    }
+  }
+  return next;
+}
+
+function parsePersistedScoreRecords(value: unknown): StringScoreRecord[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+      const record = entry as Record<string, unknown>;
+      const id = trimWorkspaceText(typeof record.id === "string" ? record.id : "");
+      const metric = trimWorkspaceText(typeof record.metric === "string" ? record.metric : "");
+      const score =
+        typeof record.score === "number" && Number.isFinite(record.score)
+          ? record.score
+          : null;
+      const maxScore =
+        typeof record.maxScore === "number" && Number.isFinite(record.maxScore)
+          ? record.maxScore
+          : null;
+      const createdAt =
+        typeof record.createdAt === "number" && Number.isFinite(record.createdAt)
+          ? record.createdAt
+          : null;
+      const scoredByType =
+        record.scoredByType === "AI" ||
+        record.scoredByType === "HUMAN" ||
+        record.scoredByType === "SYSTEM"
+          ? record.scoredByType
+          : null;
+
+      if (!id || !metric || score === null || maxScore === null || createdAt === null || !scoredByType) {
+        return null;
+      }
+
+      return {
+        id,
+        metric,
+        score,
+        maxScore,
+        scoredByType,
+        scoredBy:
+          trimWorkspaceText(typeof record.scoredBy === "string" ? record.scoredBy : "") ||
+          "System",
+        note: trimWorkspaceText(typeof record.note === "string" ? record.note : ""),
+        createdAt
+      } satisfies StringScoreRecord;
+    })
+    .filter((item): item is StringScoreRecord => Boolean(item));
+}
+
+function extractWorkspaceStateFromStrings(strings: ChatString[]) {
+  const drafts: Record<string, EditableStringDraft> = {};
+  const scores: Record<string, StringScoreRecord[]> = {};
+  const steer: Record<string, SteerLaneTab> = {};
+
+  for (const string of strings) {
+    const state = string.workspaceState;
+    if (!state || typeof state !== "object") {
+      continue;
+    }
+
+    if (state.editableDraft && typeof state.editableDraft === "object" && !Array.isArray(state.editableDraft)) {
+      drafts[string.id] = normalizeEditableStringDraft(state.editableDraft);
+    }
+
+    const scoreRecords = parsePersistedScoreRecords(state.scoreRecords);
+    if (scoreRecords.length > 0) {
+      scores[string.id] = scoreRecords;
+    }
+
+    Object.assign(steer, parsePersistedSteerDecisions(state.steerDecisions));
+  }
+
+  return { drafts, scores, steer };
+}
+
+function buildWorkspaceChatMessagesFromTurns(
+  item: ControlThreadHistoryItem
+): ChatMessage[] {
+  const fallbackBaseTs = Math.max(1, item.updatedAt - item.turns.length - 1);
+  return item.turns.map((turn, index) => {
+    const timestamp = inferTurnTimestamp(turn, index, fallbackBaseTs);
+    return {
+      id: turn.id,
+      role: turn.role === "owner" ? "user" : "assistant",
+      content: turn.content,
+      createdAt: new Date(timestamp).toISOString(),
+      ...(turn.role === "organization"
+        ? {
+            authorName: turn.modelLabel || "Organization",
+            authorRole: "Organization"
+          }
+        : {
+            authorName: "Owner",
+            authorRole: "Owner"
+          })
+    } satisfies ChatMessage;
+  });
+}
+
+function buildPersistableWorkspaceState(input: {
+  stringItem: ControlThreadHistoryItem;
+  draftsByString: Record<string, EditableStringDraft>;
+  scoreByString: Record<string, StringScoreRecord[]>;
+  steerDecisions: Record<string, SteerLaneTab>;
+}): ChatString["workspaceState"] | undefined {
+  const draft = input.draftsByString[input.stringItem.id];
+  const normalizedDraft = draft ? normalizeEditableStringDraft(draft) : undefined;
+  const scoreRecords = input.scoreByString[input.stringItem.id] ?? [];
+  const cards = normalizedDraft
+    ? buildDraftDeliverableCards({
+        stringItem: input.stringItem,
+        draft: normalizedDraft
+      })
+    : buildThreadDeliverableCards(input.stringItem);
+  const scopedSteerDecisions = Object.fromEntries(
+    cards
+      .map((card) => [card.id, input.steerDecisions[card.id]] as const)
+      .filter((entry): entry is [string, SteerLaneTab] => Boolean(entry[1]))
+  );
+
+  if (!normalizedDraft && scoreRecords.length === 0 && Object.keys(scopedSteerDecisions).length === 0) {
+    return undefined;
+  }
+
+  const nextState: NonNullable<ChatString["workspaceState"]> = {};
+  if (normalizedDraft) {
+    nextState.editableDraft = normalizedDraft as unknown as Record<string, unknown>;
+  }
+  if (scoreRecords.length > 0) {
+    nextState.scoreRecords = scoreRecords as unknown as Array<Record<string, unknown>>;
+  }
+  if (Object.keys(scopedSteerDecisions).length > 0) {
+    nextState.steerDecisions = scopedSteerDecisions;
+  }
+  return nextState;
+}
+
+function buildSharedStringPayloadFromWorkspaceItem(input: {
+  orgId: string;
+  stringItem: ControlThreadHistoryItem;
+  draftsByString: Record<string, EditableStringDraft>;
+  scoreByString: Record<string, StringScoreRecord[]>;
+  steerDecisions: Record<string, SteerLaneTab>;
+  includeMessages?: boolean;
+}) {
+  const { stringItem } = input;
+  const directionId =
+    trimWorkspaceText(stringItem.launchScope?.directionId) ||
+    trimWorkspaceText(stringItem.planningResult?.directionRecord?.id) ||
+    null;
+  const planId =
+    trimWorkspaceText(stringItem.launchScope?.planId) ||
+    trimWorkspaceText(stringItem.planningResult?.planRecord?.id) ||
+    null;
+  const workspaceState = buildPersistableWorkspaceState(input);
+  const payload = {
+    orgId: input.orgId,
+    id: stringItem.id,
+    title: stringItem.title,
+    mode: mapControlModeToStringMode(stringItem.mode),
+    updatedAt: new Date(stringItem.updatedAt).toISOString(),
+    createdAt:
+      stringItem.turns.length > 0
+        ? new Date(
+            inferTurnTimestamp(
+              stringItem.turns[0],
+              0,
+              Math.max(1, stringItem.updatedAt - stringItem.turns.length - 1)
+            )
+          ).toISOString()
+        : new Date(stringItem.updatedAt).toISOString(),
+    directionId,
+    planId,
+    source: (planId ? "plan" : directionId ? "direction" : "workspace") as ChatString["source"],
+    ...(workspaceState ? { workspaceState } : {})
+  };
+
+  if (!input.includeMessages) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    messages: buildWorkspaceChatMessagesFromTurns(stringItem)
+  };
+}
+
+function hasPersistableThreadContent(item: ControlThreadHistoryItem) {
+  return (
+    item.turns.length > 0 ||
+    trimWorkspaceText(item.directionGiven).length > 0 ||
+    Boolean(item.planningResult) ||
+    Boolean(item.pendingPlanLaunchApproval) ||
+    Boolean(item.pendingToolkitApproval) ||
+    Boolean(item.pendingEmailApproval) ||
+    Boolean(item.agentRunResult)
+  );
+}
+
 function normalizeOperationTabId(
   value: string | null | undefined,
   primaryTab: PrimaryWorkspaceTabId
@@ -619,7 +850,6 @@ export function VorldXShell() {
   const [flowSelectedStringId, setFlowSelectedStringId] = useState<string | null>(null);
   const [flowStringsTab, setFlowStringsTab] = useState<FlowStringsSurfaceTab>("DETAILS");
   const [flowExecutionTab, setFlowExecutionTab] = useState<FlowExecutionSurfaceTab>("DETAILS");
-  const [flowGovernanceTab, setFlowGovernanceTab] = useState<FlowGovernanceSurfaceTab>("SCAN");
   const [steerTab, setSteerTab] = useState<SteerLaneTab>("CENTER");
   const [steerDecisions, setSteerDecisions] = useState<Record<string, SteerLaneTab>>({});
   const [editableDraftsByString, setEditableDraftsByString] = useState<
@@ -631,6 +861,8 @@ export function VorldXShell() {
   >(DEFAULT_PRIMARY_TAB_SUBTAB);
   const [showOrgSwitcher, setShowOrgSwitcher] = useState(false);
   const [showUtilityMenu, setShowUtilityMenu] = useState(false);
+  const [showCompassStringPanel, setShowCompassStringPanel] = useState(false);
+  const [showCompassCollaborationPanel, setShowCompassCollaborationPanel] = useState(false);
   const [squadLaunchIntent, setSquadLaunchIntent] = useState<{
     action: "ADD_MEMBER" | "CREATE_TEAM";
     nonce: number;
@@ -662,6 +894,7 @@ export function VorldXShell() {
   const [controlEngaged, setControlEngaged] = useState(false);
   const [controlThreadHistory, setControlThreadHistory] = useState<ControlThreadHistoryItem[]>([]);
   const [backendStringHistory, setBackendStringHistory] = useState<ControlThreadHistoryItem[]>([]);
+  const [workspaceStateHydrated, setWorkspaceStateHydrated] = useState(false);
   const [activeControlThreadId, setActiveControlThreadId] = useState<string | null>(null);
   const [controlHistoryHydrated, setControlHistoryHydrated] = useState(false);
   const [humanPlanDraft, setHumanPlanDraft] = useState("");
@@ -720,6 +953,7 @@ export function VorldXShell() {
   const approvalCheckpointsInFlightRef = useRef(false);
   const pipelinePolicyInFlightRef = useRef(false);
   const backendStringHistorySeqRef = useRef(0);
+  const workspacePersistSnapshotRef = useRef<Record<string, string>>({});
   const pendingPlanRouteHandledKeyRef = useRef<string | null>(null);
   const requestedTabHandledRef = useRef<string | null>(null);
   const workflowSnapshotTimersRef = useRef<Map<string, number>>(new Map());
@@ -1538,6 +1772,11 @@ export function VorldXShell() {
   const loadBackendStringHistory = useCallback(async () => {
     if (!resolvedOrg?.id || !user?.uid) {
       setBackendStringHistory([]);
+      setEditableDraftsByString({});
+      setScoreByString({});
+      setSteerDecisions({});
+      setWorkspaceStateHydrated(false);
+      workspacePersistSnapshotRef.current = {};
       return;
     }
 
@@ -1608,17 +1847,25 @@ export function VorldXShell() {
         return;
       }
 
+      const backendStrings = Array.isArray(stringsPayload.strings) ? stringsPayload.strings : [];
+      const persistedWorkspaceState = extractWorkspaceStateFromStrings(backendStrings);
+      setEditableDraftsByString(persistedWorkspaceState.drafts);
+      setScoreByString(persistedWorkspaceState.scores);
+      setSteerDecisions(persistedWorkspaceState.steer);
       setBackendStringHistory(
         buildWorkspaceStringHistory({
-          strings: Array.isArray(stringsPayload.strings) ? stringsPayload.strings : [],
+          strings: backendStrings,
           directions: Array.isArray(directionsPayload.directions) ? directionsPayload.directions : [],
           plans: Array.isArray(plansPayload.plans) ? plansPayload.plans : []
         })
       );
+      setWorkspaceStateHydrated(true);
+      workspacePersistSnapshotRef.current = {};
     } catch (error) {
       if (backendStringHistorySeqRef.current !== loadId) {
         return;
       }
+      setWorkspaceStateHydrated(false);
       console.error("[VorldXShell] Failed to sync workspace strings into Flow.", error);
     }
   }, [resolvedOrg?.id, user?.uid]);
@@ -1759,9 +2006,12 @@ export function VorldXShell() {
     setFlowSelectedStringId(null);
     setFlowStringsTab("DETAILS");
     setFlowExecutionTab("DETAILS");
-    setFlowGovernanceTab("SCAN");
     setSteerTab("CENTER");
     setSteerDecisions({});
+    setEditableDraftsByString({});
+    setScoreByString({});
+    setWorkspaceStateHydrated(false);
+    workspacePersistSnapshotRef.current = {};
     setControlConversationDetail("REASONING_MIN");
     setControlThreadHistory([]);
     setActiveControlThreadId(null);
@@ -1808,6 +2058,14 @@ export function VorldXShell() {
     }
     setWorkspaceMode("COMPASS");
   }, [activeTab, workspaceMode]);
+
+  useEffect(() => {
+    if (activeTab === "control" && resolvedOrg?.id) {
+      return;
+    }
+    setShowCompassStringPanel(false);
+    setShowCompassCollaborationPanel(false);
+  }, [activeTab, resolvedOrg?.id]);
 
   const controlHistoryStorageKey = useMemo(
     () => (resolvedOrg?.id ? `vx-control-history:${resolvedOrg.id}` : ""),
@@ -1971,60 +2229,6 @@ export function VorldXShell() {
       // Local history persistence should never break core chat behavior.
     }
   }, [controlHistoryHydrated, controlHistoryStorageKey, controlThreadHistory]);
-
-  const steerDecisionsStorageKey = useMemo(
-    () => (resolvedOrg?.id ? `vx-steer-decisions:${resolvedOrg.id}` : ""),
-    [resolvedOrg?.id]
-  );
-  const legacySteerDecisionsStorageKey = useMemo(
-    () => (resolvedOrg?.id ? `vx-stair-decisions:${resolvedOrg.id}` : ""),
-    [resolvedOrg?.id]
-  );
-
-  useEffect(() => {
-    if (!steerDecisionsStorageKey || typeof window === "undefined") {
-      return;
-    }
-    try {
-      const raw =
-        window.localStorage.getItem(steerDecisionsStorageKey) ??
-        (legacySteerDecisionsStorageKey
-          ? window.localStorage.getItem(legacySteerDecisionsStorageKey)
-          : null);
-      if (!raw) {
-        setSteerDecisions({});
-        return;
-      }
-      const parsed = JSON.parse(raw) as unknown;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        setSteerDecisions({});
-        return;
-      }
-      const sanitized: Record<string, SteerLaneTab> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (
-          typeof key === "string" &&
-          (value === "CENTER" || value === "APPROVED" || value === "RETHINK")
-        ) {
-          sanitized[key] = value;
-        }
-      }
-      setSteerDecisions(sanitized);
-    } catch {
-      setSteerDecisions({});
-    }
-  }, [legacySteerDecisionsStorageKey, steerDecisionsStorageKey]);
-
-  useEffect(() => {
-    if (!steerDecisionsStorageKey || typeof window === "undefined") {
-      return;
-    }
-    try {
-      window.localStorage.setItem(steerDecisionsStorageKey, JSON.stringify(steerDecisions));
-    } catch {
-      // Steer decisions persistence is best-effort.
-    }
-  }, [steerDecisions, steerDecisionsStorageKey]);
 
   useEffect(() => {
     if (!activeControlThreadId) {
@@ -2450,6 +2654,162 @@ export function VorldXShell() {
       return changed ? next : previous;
     });
   }, [workspaceStringHistory]);
+
+  useEffect(() => {
+    if (!workspaceStateHydrated || workspaceStringHistory.length === 0) {
+      return;
+    }
+
+    setEditableDraftsByString((previous) => {
+      let changed = false;
+      const next = { ...previous };
+
+      for (const item of workspaceStringHistory) {
+        if (next[item.id]) {
+          continue;
+        }
+        if (!trimWorkspaceText(item.directionGiven) && !item.planningResult) {
+          continue;
+        }
+
+        next[item.id] = resolveEditableStringDraft({
+          stringItem: item,
+          permissionRequests: getScopedPermissionRequestsForString(item, permissionRequests),
+          approvalCheckpoints: getScopedApprovalCheckpointsForString(
+            item,
+            approvalCheckpoints
+          )
+        });
+        changed = true;
+      }
+
+      return changed ? next : previous;
+    });
+  }, [
+    approvalCheckpoints,
+    permissionRequests,
+    workspaceStateHydrated,
+    workspaceStringHistory
+  ]);
+
+  const persistSharedStringRecord = useCallback(
+    async (
+      payload:
+        | ReturnType<typeof buildSharedStringPayloadFromWorkspaceItem>
+        | (ReturnType<typeof buildSharedStringPayloadFromWorkspaceItem> & {
+            workspaceState?: null;
+          })
+    ) => {
+      const response = await fetch("/api/strings", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      const { payload: parsed, rawText } = await parseJsonBody<WorkspaceStringsResponse>(response);
+      if (!response.ok || !parsed?.ok) {
+        throw new Error(
+          buildWorkspaceLoadError(response.status, "Failed to persist string workspace state", parsed?.message, rawText)
+        );
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!resolvedOrg?.id || !workspaceStateHydrated) {
+      return;
+    }
+
+    const nextPayloads = new Map<
+      string,
+      ReturnType<typeof buildSharedStringPayloadFromWorkspaceItem>
+    >();
+
+    for (const item of workspaceStringHistory) {
+      const workspaceState = buildPersistableWorkspaceState({
+        stringItem: item,
+        draftsByString: editableDraftsByString,
+        scoreByString,
+        steerDecisions
+      });
+      const isControlThread = item.id.startsWith("thread-");
+      const isDerivedThread =
+        item.id.startsWith("direction:") || item.id.startsWith("plan:");
+
+      if (!isControlThread && !workspaceState) {
+        continue;
+      }
+      if (isControlThread && !workspaceState && !hasPersistableThreadContent(item)) {
+        continue;
+      }
+      if (isDerivedThread && !workspaceState) {
+        continue;
+      }
+
+      const payload = buildSharedStringPayloadFromWorkspaceItem({
+        orgId: resolvedOrg.id,
+        stringItem: item,
+        draftsByString: editableDraftsByString,
+        scoreByString,
+        steerDecisions,
+        includeMessages: isControlThread
+      });
+      nextPayloads.set(item.id, payload);
+    }
+
+    const changedPayloads = [...nextPayloads.entries()].filter(([id, payload]) => {
+      const snapshot = JSON.stringify(payload);
+      return workspacePersistSnapshotRef.current[id] !== snapshot;
+    });
+
+    if (changedPayloads.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        for (const [id, payload] of changedPayloads) {
+          try {
+            await persistSharedStringRecord(payload);
+            if (cancelled) {
+              return;
+            }
+            workspacePersistSnapshotRef.current[id] = JSON.stringify(payload);
+          } catch (error) {
+            if (cancelled) {
+              return;
+            }
+            console.error("[VorldXShell] Failed to persist shared string state.", error);
+            setControlMessage({
+              tone: "error",
+              text:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to persist shared string state."
+            });
+            return;
+          }
+        }
+      })();
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    editableDraftsByString,
+    persistSharedStringRecord,
+    resolvedOrg?.id,
+    scoreByString,
+    steerDecisions,
+    workspaceStateHydrated,
+    workspaceStringHistory
+  ]);
 
   useEffect(() => {
     if (signatureApprovals > requiredSignatures) {
@@ -2935,12 +3295,11 @@ export function VorldXShell() {
     (nextTab: PrimaryWorkspaceTabId) => {
       if (nextTab === "GOVERNANCE") {
         handleOperationTabChange("memory");
-        setFlowGovernanceTab("SCAN");
         return;
       }
       handleOperationTabChange(normalizeOperationTabId(primaryTabLastSubtab[nextTab], nextTab));
     },
-    [handleOperationTabChange, handleTabChange, primaryTabLastSubtab]
+    [handleOperationTabChange, primaryTabLastSubtab]
   );
 
   const handleWorkspaceModeSwitch = useCallback(
@@ -2963,6 +3322,7 @@ export function VorldXShell() {
   const isSettingsTabActive = activeTab === "settings";
   const isUtilityMenuActive = showUtilityMenu;
   const isCompassModeActive = activeTab === "control";
+  const isCompassCollaborationPanelActive = activeTab === "control" && showCompassCollaborationPanel;
   const isFlowModeActive = OPERATION_TAB_SET.has(activeTab);
   const isHubModeActive = activeTab === "hub";
 
@@ -2986,23 +3346,10 @@ export function VorldXShell() {
     }
   }, [activeTab, primaryWorkspaceTab]);
 
-  useEffect(() => {
-    if (primaryWorkspaceTab !== "GOVERNANCE") {
-      return;
-    }
-    if (activeTab === "memory") {
-      setFlowGovernanceTab("SCAN");
-      return;
-    }
-    if (activeTab === "settings") {
-      setFlowGovernanceTab("SETTINGS");
-    }
-  }, [activeTab, primaryWorkspaceTab]);
-
   const handleEditableDraftChange = useCallback((stringId: string, nextDraft: EditableStringDraft) => {
     setEditableDraftsByString((previous) => ({
       ...previous,
-      [stringId]: nextDraft
+      [stringId]: normalizeEditableStringDraft(nextDraft)
     }));
   }, []);
 
@@ -4787,6 +5134,8 @@ export function VorldXShell() {
                 setShowOrgSwitcher((prev) => !prev);
                 setShowRequestCenter(false);
                 setShowUtilityMenu(false);
+                setShowCompassStringPanel(false);
+                setShowCompassCollaborationPanel(false);
               }}
             >
               <Shield size={20} className={themeStyle.accent} />
@@ -4890,30 +5239,214 @@ export function VorldXShell() {
               ) : null}
 
               {resolvedOrg ? (
-                <button
-                  onClick={() => {
-                    setShowRequestCenter((prev) => !prev);
-                    setShowOrgSwitcher(false);
-                    setShowUtilityMenu(false);
-                    void Promise.all([
-                      loadPermissionRequests({ force: true }),
-                      loadApprovalCheckpoints({ force: true })
-                    ]);
-                  }}
-                  className={`relative inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
-                    isRequestCenterActive
-                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
-                      : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
-                  }`}
-                >
-                  <Bell size={14} />
-                  <span className="hidden sm:inline">Requests</span>
-                  {requestCenterPendingCount > 0 ? (
-                    <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[11px] font-bold text-white">
-                      {requestCenterPendingCount}
-                    </span>
+                <div className="relative">
+                  <button
+                    onClick={() => {
+                      setShowRequestCenter((prev) => !prev);
+                      setShowOrgSwitcher(false);
+                      setShowUtilityMenu(false);
+                      setShowCompassStringPanel(false);
+                      setShowCompassCollaborationPanel(false);
+                      void Promise.all([
+                        loadPermissionRequests({ force: true }),
+                        loadApprovalCheckpoints({ force: true })
+                      ]);
+                    }}
+                    className={`relative inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                      isRequestCenterActive
+                        ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                        : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                    }`}
+                  >
+                    <Bell size={14} />
+                    <span className="hidden sm:inline">Requests</span>
+                    {requestCenterPendingCount > 0 ? (
+                      <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[11px] font-bold text-white">
+                        {requestCenterPendingCount}
+                      </span>
+                    ) : null}
+                  </button>
+
+                  {showRequestCenter ? (
+                    <div className="vx-scrollbar absolute right-0 top-[calc(100%+0.5rem)] z-50 w-[min(26.25rem,calc(100vw-1rem))] max-h-[80vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:max-h-[75vh]">
+                      <div className="mb-2 flex items-center justify-between px-2 py-1">
+                        <div>
+                          <p className="text-xs font-medium text-slate-500">Request center</p>
+                          <p className="text-xs text-slate-600">
+                            Pending {requestCenterPendingCount} (Permissions {requestCenterPermissionPendingCount} | Checkpoints {requestCenterCheckpointPendingCount})
+                          </p>
+                          <p className="text-[10px] text-slate-500">
+                            {isRequestCenterScopedToCommand
+                              ? "Scope: current direction string"
+                              : "Scope: organization"}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {canReviewPermissionRequests &&
+                          requestCenterPermissionRequests.length > 0 &&
+                          !isRequestCenterScopedToCommand ? (
+                            <button
+                              onClick={() => setShowClearPermissionRequestsConfirm(true)}
+                              disabled={clearPermissionRequestsInFlight}
+                              className="rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                            >
+                              {clearPermissionRequestsInFlight ? "Clearing..." : "Clear all"}
+                            </button>
+                          ) : null}
+
+                          <button
+                            onClick={() => setShowRequestCenter(false)}
+                            className="rounded-md p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </div>
+
+                      {permissionRequestsLoading || approvalCheckpointsLoading ? (
+                        <div className="inline-flex items-center gap-2 px-2 py-3 text-xs text-slate-400">
+                          <Loader2 size={13} className="animate-spin" />
+                          Loading requests...
+                        </div>
+                      ) : requestCenterPermissionRequests.length === 0 &&
+                        requestCenterApprovalCheckpoints.length === 0 ? (
+                        <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-4 text-xs text-slate-500">
+                          No permission requests or checkpoints right now.
+                        </p>
+                      ) : (
+                        <div className="vx-scrollbar max-h-[55vh] space-y-2 overflow-y-auto pr-1">
+                          {requestCenterPermissionRequests.length > 0 ? (
+                            <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/8 p-2">
+                              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-cyan-200">
+                                Permission Requests
+                              </p>
+                            </div>
+                          ) : null}
+                          {requestCenterPermissionRequests.map((item) => (
+                            <div
+                              key={item.id}
+                              className="rounded-2xl border border-white/10 bg-black/25 p-3"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="truncate text-sm font-semibold text-white">{item.area}</p>
+                                  <p className="text-xs text-slate-500">{item.status} | Target {item.targetRole}</p>
+                                </div>
+                                {item.status === "PENDING" ? (
+                                  <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
+                                    Pending
+                                  </span>
+                                ) : (
+                                  <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
+                                    {item.status}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
+                              <p className="mt-1 text-xs text-slate-500">
+                                Workflow: {item.workflowTitle || "N/A"} | Task:{" "}
+                                {item.taskTitle || "N/A"}
+                              </p>
+                              <p className="mt-1 text-xs text-slate-500">
+                                Requested by {item.requestedByEmail}
+                              </p>
+
+                              {canReviewPermissionRequests && item.status === "PENDING" ? (
+                                <div className="mt-2 flex items-center gap-2">
+                                  <button
+                                    onClick={() =>
+                                      void handlePermissionRequestDecision(item.id, "APPROVE")
+                                    }
+                                    disabled={
+                                      permissionRequestActionId === item.id ||
+                                      clearPermissionRequestsInFlight
+                                    }
+                                    className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                                  >
+                                    {permissionRequestActionId === item.id
+                                      ? "Working..."
+                                      : "Approve"}
+                                  </button>
+                                  <button
+                                    onClick={() =>
+                                      void handlePermissionRequestDecision(item.id, "REJECT")
+                                    }
+                                    disabled={
+                                      permissionRequestActionId === item.id ||
+                                      clearPermissionRequestsInFlight
+                                    }
+                                    className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ))}
+
+                          {requestCenterApprovalCheckpoints.length > 0 ? (
+                            <div className="rounded-xl border border-violet-500/25 bg-violet-500/8 p-2">
+                              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-violet-200">
+                                Approval Checkpoints
+                              </p>
+                            </div>
+                          ) : null}
+                          {requestCenterApprovalCheckpoints.map((item) => (
+                            <div key={item.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <p className="truncate text-sm font-semibold text-white">Checkpoint {item.id.slice(0, 8)}</p>
+                                  <p className="text-xs text-slate-500">
+                                    {item.status} | Flow {item.flowId ? item.flowId.slice(0, 8) : "N/A"} | Task {item.taskId ? item.taskId.slice(0, 8) : "N/A"}
+                                  </p>
+                                </div>
+                                {item.status === "PENDING" ? (
+                                  <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
+                                    Pending
+                                  </span>
+                                ) : (
+                                  <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
+                                    {item.status}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
+                              <p className="mt-1 text-xs text-slate-500">
+                                Requested {new Date(item.requestedAt).toLocaleString()}
+                              </p>
+                              {item.resolutionNote ? (
+                                <p className="mt-1 text-xs text-slate-400">Resolution note: {item.resolutionNote}</p>
+                              ) : null}
+
+                              {item.status === "PENDING" ? (
+                                <div className="mt-2 flex items-center gap-2">
+                                  <button
+                                    onClick={() =>
+                                      void handleApprovalCheckpointDecision(item.id, "APPROVE")
+                                    }
+                                    disabled={approvalCheckpointActionId === item.id}
+                                    className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
+                                  >
+                                    {approvalCheckpointActionId === item.id ? "Working..." : "Approve"}
+                                  </button>
+                                  <button
+                                    onClick={() =>
+                                      void handleApprovalCheckpointDecision(item.id, "REJECT")
+                                    }
+                                    disabled={approvalCheckpointActionId === item.id}
+                                    className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   ) : null}
-                </button>
+                </div>
               ) : null}
 
               {resolvedOrg || isEarthWorkspaceActive ? (
@@ -4923,6 +5456,8 @@ export function VorldXShell() {
                     setShowRequestCenter(false);
                     setShowOrgSwitcher(false);
                     setShowUtilityMenu(false);
+                    setShowCompassStringPanel(false);
+                    setShowCompassCollaborationPanel(false);
                   }}
                   className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
                     isWorkforceTabActive
@@ -4942,6 +5477,8 @@ export function VorldXShell() {
                     setShowRequestCenter(false);
                     setShowOrgSwitcher(false);
                     setShowUtilityMenu(false);
+                    setShowCompassStringPanel(false);
+                    setShowCompassCollaborationPanel(false);
                   }}
                   className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
                     isSettingsTabActive
@@ -4954,22 +5491,45 @@ export function VorldXShell() {
                 </button>
               ) : null}
 
-              <button
-                onClick={() => {
-                  setShowUtilityMenu((prev) => !prev);
-                  setShowRequestCenter(false);
-                  setShowOrgSwitcher(false);
-                }}
-                className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
-                  isUtilityMenuActive
+              {resolvedOrg && activeTab === "control" ? (
+                <button
+                  onClick={() => {
+                    setShowCompassCollaborationPanel((prev) => !prev);
+                    setShowCompassStringPanel(false);
+                    setShowRequestCenter(false);
+                    setShowOrgSwitcher(false);
+                    setShowUtilityMenu(false);
+                  }}
+                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                    isCompassCollaborationPanelActive
+                      ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
+                      : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
+                  }`}
+                >
+                  <Users size={14} />
+                  <span className="hidden sm:inline">Collaborators</span>
+                </button>
+              ) : null}
+
+                <button
+                  onClick={() => {
+                    setShowUtilityMenu((prev) => !prev);
+                    setShowRequestCenter(false);
+                    setShowOrgSwitcher(false);
+                    setShowCompassStringPanel(false);
+                    setShowCompassCollaborationPanel(false);
+                  }}
+                  className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold transition ${
+                    isUtilityMenuActive
                     ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
                     : "border-white/20 bg-white/5 text-slate-200 hover:bg-white/10"
                 }`}
-              >
-                <Activity size={14} />
-                <span className="hidden sm:inline">Utilities</span>
-              </button>
-            </div>
+                >
+                  <Activity size={14} />
+                  <span className="hidden sm:inline">Utilities</span>
+                </button>
+
+              </div>
 
             {showUtilityMenu ? (
               <div className="vx-scrollbar absolute right-2 top-[calc(100%+0.5rem)] z-50 w-[min(20rem,calc(100vw-1rem))] max-h-[70vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:right-10 md:top-20 md:w-[320px] md:max-h-[75vh]">
@@ -5086,183 +5646,6 @@ export function VorldXShell() {
               </div>
             )}
 
-            {showRequestCenter && resolvedOrg && (
-              <div className="vx-scrollbar absolute left-2 right-2 top-[calc(100%+0.5rem)] z-50 w-auto max-h-[80vh] overflow-y-auto rounded-3xl border border-white/10 bg-[#0d1117] p-3 shadow-vx md:left-auto md:right-10 md:top-20 md:w-[420px] md:max-h-[75vh]">
-                <div className="mb-2 flex items-center justify-between px-2 py-1">
-                  <div>
-                    <p className="text-xs font-medium text-slate-500">Request center</p>
-                    <p className="text-xs text-slate-600">
-                      Pending {requestCenterPendingCount} (Permissions {requestCenterPermissionPendingCount} | Checkpoints {requestCenterCheckpointPendingCount})
-                    </p>
-                    <p className="text-[10px] text-slate-500">
-                      {isRequestCenterScopedToCommand ? "Scope: current direction string" : "Scope: organization"}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {canReviewPermissionRequests &&
-                    requestCenterPermissionRequests.length > 0 &&
-                    !isRequestCenterScopedToCommand ? (
-                      <button
-                        onClick={() => setShowClearPermissionRequestsConfirm(true)}
-                        disabled={clearPermissionRequestsInFlight}
-                        className="rounded-lg border border-red-500/35 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                      >
-                        {clearPermissionRequestsInFlight ? "Clearing..." : "Clear all"}
-                      </button>
-                    ) : null}
-
-                    <button
-                      onClick={() => setShowRequestCenter(false)}
-                      className="rounded-md p-1 text-slate-500 transition hover:bg-white/10 hover:text-slate-200"
-                    >
-                      <X size={14} />
-                    </button>
-                  </div>
-                </div>
-
-                {permissionRequestsLoading || approvalCheckpointsLoading ? (
-                  <div className="inline-flex items-center gap-2 px-2 py-3 text-xs text-slate-400">
-                    <Loader2 size={13} className="animate-spin" />
-                    Loading requests...
-                  </div>
-                ) : requestCenterPermissionRequests.length === 0 &&
-                  requestCenterApprovalCheckpoints.length === 0 ? (
-                  <p className="rounded-xl border border-white/10 bg-black/20 px-3 py-4 text-xs text-slate-500">
-                    No permission requests or checkpoints right now.
-                  </p>
-                ) : (
-                  <div className="vx-scrollbar max-h-[55vh] space-y-2 overflow-y-auto pr-1">
-                    {requestCenterPermissionRequests.length > 0 ? (
-                      <div className="rounded-xl border border-cyan-500/25 bg-cyan-500/8 p-2">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-cyan-200">
-                          Permission Requests
-                        </p>
-                      </div>
-                    ) : null}
-                    {requestCenterPermissionRequests.map((item) => (
-                      <div
-                        key={item.id}
-                        className="rounded-2xl border border-white/10 bg-black/25 p-3"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-white">{item.area}</p>
-                            <p className="text-xs text-slate-500">{item.status} | Target {item.targetRole}</p>
-                          </div>
-                          {item.status === "PENDING" ? (
-                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
-                              Pending
-                            </span>
-                          ) : (
-                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
-                              {item.status}
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
-                        <p className="mt-1 text-xs text-slate-500">
-                          Workflow: {item.workflowTitle || "N/A"} | Task:{" "}
-                          {item.taskTitle || "N/A"}
-                        </p>
-                        <p className="mt-1 text-xs text-slate-500">
-                          Requested by {item.requestedByEmail}
-                        </p>
-
-                        {canReviewPermissionRequests && item.status === "PENDING" ? (
-                          <div className="mt-2 flex items-center gap-2">
-                            <button
-                              onClick={() =>
-                                void handlePermissionRequestDecision(item.id, "APPROVE")
-                              }
-                              disabled={
-                                permissionRequestActionId === item.id ||
-                                clearPermissionRequestsInFlight
-                              }
-                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
-                            >
-                              {permissionRequestActionId === item.id
-                                ? "Working..."
-                                : "Approve"}
-                            </button>
-                            <button
-                              onClick={() =>
-                                void handlePermissionRequestDecision(item.id, "REJECT")
-                              }
-                              disabled={
-                                permissionRequestActionId === item.id ||
-                                clearPermissionRequestsInFlight
-                              }
-                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-
-                    {requestCenterApprovalCheckpoints.length > 0 ? (
-                      <div className="rounded-xl border border-violet-500/25 bg-violet-500/8 p-2">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-violet-200">
-                          Approval Checkpoints
-                        </p>
-                      </div>
-                    ) : null}
-                    {requestCenterApprovalCheckpoints.map((item) => (
-                      <div key={item.id} className="rounded-2xl border border-white/10 bg-black/25 p-3">
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-white">Checkpoint {item.id.slice(0, 8)}</p>
-                            <p className="text-xs text-slate-500">
-                              {item.status} | Flow {item.flowId ? item.flowId.slice(0, 8) : "N/A"} | Task {item.taskId ? item.taskId.slice(0, 8) : "N/A"}
-                            </p>
-                          </div>
-                          {item.status === "PENDING" ? (
-                            <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-300">
-                              Pending
-                            </span>
-                          ) : (
-                            <span className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs font-semibold text-emerald-300">
-                              {item.status}
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-2 text-xs text-slate-300">{item.reason}</p>
-                        <p className="mt-1 text-xs text-slate-500">
-                          Requested {new Date(item.requestedAt).toLocaleString()}
-                        </p>
-                        {item.resolutionNote ? (
-                          <p className="mt-1 text-xs text-slate-400">Resolution note: {item.resolutionNote}</p>
-                        ) : null}
-
-                        {item.status === "PENDING" ? (
-                          <div className="mt-2 flex items-center gap-2">
-                            <button
-                              onClick={() =>
-                                void handleApprovalCheckpointDecision(item.id, "APPROVE")
-                              }
-                              disabled={approvalCheckpointActionId === item.id}
-                              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-60"
-                            >
-                              {approvalCheckpointActionId === item.id ? "Working..." : "Approve"}
-                            </button>
-                            <button
-                              onClick={() =>
-                                void handleApprovalCheckpointDecision(item.id, "REJECT")
-                              }
-                              disabled={approvalCheckpointActionId === item.id}
-                              className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-500/20 disabled:opacity-60"
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
           </header>
 
           <section
@@ -5333,6 +5716,10 @@ export function VorldXShell() {
                 orgId={resolvedOrg?.id ?? null}
                 onOpenAddMember={() => handleOpenSquadIntent("ADD_MEMBER")}
                 onOpenCreateTeam={() => handleOpenSquadIntent("CREATE_TEAM")}
+                stringPanelOpen={showCompassStringPanel}
+                onStringPanelOpenChange={setShowCompassStringPanel}
+                collaborationPanelOpen={showCompassCollaborationPanel}
+                onCollaborationPanelOpenChange={setShowCompassCollaborationPanel}
               />
             ) : resolvedOrg && workspaceMode === "FLOW" ? (
               <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[clamp(240px,22vw,320px)_minmax(0,1fr)] [@media(min-width:1920px)]:grid-cols-[clamp(260px,18vw,360px)_minmax(0,1fr)]">
@@ -5431,10 +5818,9 @@ export function VorldXShell() {
                             type="button"
                             onClick={() => {
                               handleOperationTabChange("memory");
-                              setFlowGovernanceTab("SCAN");
                             }}
                             className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition ${
-                              flowGovernanceTab === "SCAN"
+                              activeTab === "memory"
                                 ? "border-cyan-400/45 bg-cyan-500/15 text-cyan-100"
                                 : "border-white/20 bg-white/5 text-slate-300 hover:bg-white/10"
                             }`}
@@ -5490,21 +5876,29 @@ export function VorldXShell() {
                         permissionRequests={flowScopedPermissionRequests}
                         approvalCheckpoints={flowScopedApprovalCheckpoints}
                         draftsByString={editableDraftsByString}
-                        onDraftChange={handleEditableDraftChange}
                         scoreByString={scoreByString}
                         steerDecisions={steerDecisions}
                         onSteerDecision={handleSteerDecision}
-                        surfaceTab={flowStringsTab}
+                        initialDetailsTab="OVERVIEW"
                       />
                     ) : primaryWorkspaceTab === "FOCUS" && flowStringsTab === "BLUEPRINT" ? (
-                      <BlueprintConsole
+                      <StringBlueprintCanvasSurface
                         key={`strings-blueprint-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
-                        orgId={resolvedOrg.id}
                         themeStyle={{
                           accent: themeStyle.accent,
                           accentSoft: themeStyle.accentSoft,
                           border: themeStyle.border
                         }}
+                        calendarDate={flowCalendarSelectedDate}
+                        stringItem={flowSelectedString}
+                        allStringItems={flowVisibleStringItems}
+                        permissionRequests={flowScopedPermissionRequests}
+                        approvalCheckpoints={flowScopedApprovalCheckpoints}
+                        draftsByString={editableDraftsByString}
+                        scoreByString={scoreByString}
+                        steerDecisions={steerDecisions}
+                        selectedStringId={flowSelectedStringId}
+                        onSelectedStringChange={setFlowSelectedStringId}
                       />
                     ) : primaryWorkspaceTab === "EXECUTION" &&
                       (flowExecutionTab === "STEER" || flowExecutionTab === "DETAILS") ? (
@@ -5550,7 +5944,7 @@ export function VorldXShell() {
                         flowIdFilter={flowSelectedStringFlowIds}
                         stringItems={flowCalendarStringItems}
                       />
-                    ) : primaryWorkspaceTab === "GOVERNANCE" && flowGovernanceTab === "SCAN" ? (
+                    ) : primaryWorkspaceTab === "GOVERNANCE" ? (
                       <ScanConsoleSurface
                         stringItem={flowSelectedString}
                         allStringItems={flowVisibleStringItems}
@@ -5564,25 +5958,6 @@ export function VorldXShell() {
                         onCheckpointDecision={(checkpointId, decision) => {
                           void handleApprovalCheckpointDecision(checkpointId, decision);
                         }}
-                      />
-                    ) : primaryWorkspaceTab === "GOVERNANCE" && flowGovernanceTab === "SETTINGS" ? (
-                      <SettingsConsole
-                        key={`settings-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
-                        orgId={resolvedOrg.id}
-                        canManageRuntime={canManageOrgRuntime}
-                        themeStyle={{
-                          accent: themeStyle.accent,
-                          accentSoft: themeStyle.accentSoft,
-                          border: themeStyle.border
-                        }}
-                        initialLane={
-                          requestedSettingsLane === "webhooks" ||
-                          requestedSettingsLane === "identity" ||
-                          requestedSettingsLane === "rails" ||
-                          requestedSettingsLane === "orchestration"
-                            ? requestedSettingsLane
-                            : undefined
-                        }
                       />
                     ) : activeTab === "flow" ? (
                       <WorkflowConsole

@@ -66,6 +66,13 @@ export interface ChatString {
   selectedTeamId?: string | null;
   selectedTeamLabel?: string | null;
   source?: "workspace" | "direction" | "plan";
+  workspaceState?: {
+    editableDraft?: Record<string, unknown>;
+    scoreRecords?: Array<Record<string, unknown>>;
+    steerDecisions?: Record<string, "CENTER" | "APPROVED" | "RETHINK">;
+  };
+  createdByUserId?: string | null;
+  updatedByUserId?: string | null;
   persisted?: boolean;
   messages: ChatMessage[];
 }

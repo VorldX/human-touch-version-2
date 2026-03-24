@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ChatHeader } from "@/components/chat-ui/chat-header";
 import { ChatInput } from "@/components/chat-ui/chat-input";
 import { ChatWindow } from "@/components/chat-ui/chat-window";
 import { CollaborationPanel } from "@/components/chat-ui/collaboration-panel";
 import { Sidebar } from "@/components/chat-ui/sidebar";
+import { StringPanel } from "@/components/chat-ui/string-panel";
 import type {
   ChatMessage,
   ChatString,
@@ -109,6 +110,16 @@ interface HubOrganizationResponse extends JsonEnvelope {
   collaboration?: {
     teams?: HubTeamRecord[];
   };
+}
+
+interface StringActionApiResponse extends JsonEnvelope {
+  result?: {
+    flowIds?: string[];
+    flowsAborted?: number;
+    tasksAborted?: number;
+    locksReleased?: number;
+  };
+  activeFlowIds?: string[];
 }
 
 interface DirectionChatApiResponse extends JsonEnvelope {
@@ -363,6 +374,7 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
   return {
     collaborators,
     teams,
+    actorUserId: payload.actor?.userId?.trim() || null,
     actorMemberId: payload.actor?.userId ? memberKey(payload.actor.userId) : null,
     activeTeamId: payload.actor?.activeTeamId ?? null
   };
@@ -490,16 +502,52 @@ function normalizeChatString(value: ChatString): ChatString {
   };
 }
 
+function normalizeText(value: string | null | undefined) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function buildStringDescription(chat: ChatString | null) {
+  if (!chat) {
+    return "";
+  }
+
+  const directionSummary = [...chat.messages]
+    .reverse()
+    .map((message) => normalizeText(message.direction?.summary))
+    .find(Boolean);
+  const directionObjective = [...chat.messages]
+    .reverse()
+    .map((message) => normalizeText(message.direction?.objective))
+    .find(Boolean);
+  const latestOrganizationTurn = [...chat.messages]
+    .reverse()
+    .map((message) => normalizeText(message.content))
+    .find(Boolean);
+  const firstOwnerTurn = chat.messages
+    .map((message) => (message.role === "user" ? normalizeText(message.content) : ""))
+    .find(Boolean);
+
+  return directionSummary || directionObjective || firstOwnerTurn || latestOrganizationTurn || "";
+}
+
 export function StringChatShell({
   embedded = false,
   orgId = null,
   onOpenAddMember,
-  onOpenCreateTeam
+  onOpenCreateTeam,
+  stringPanelOpen,
+  onStringPanelOpenChange,
+  collaborationPanelOpen,
+  onCollaborationPanelOpenChange
 }: {
   embedded?: boolean;
   orgId?: string | null;
   onOpenAddMember?: () => void;
   onOpenCreateTeam?: () => void;
+  stringPanelOpen?: boolean;
+  onStringPanelOpenChange?: (open: boolean) => void;
+  collaborationPanelOpen?: boolean;
+  onCollaborationPanelOpenChange?: (open: boolean) => void;
 }) {
   const [chats, setChats] = useState<ChatString[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -509,17 +557,29 @@ export function StringChatShell({
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [currentActorUserId, setCurrentActorUserId] = useState<string | null>(null);
   const [actorMemberId, setActorMemberId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [collaborationOpen, setCollaborationOpen] = useState(false);
+  const [internalStringPanelOpen, setInternalStringPanelOpen] = useState(false);
+  const [internalCollaborationPanelOpen, setInternalCollaborationPanelOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
+  const [stringActionInFlight, setStringActionInFlight] = useState<"delete" | "kill" | null>(null);
 
   const loadVersionRef = useRef(0);
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0] ?? null;
   const selectedTeam = teams.find((team) => team.id === selectedTeamId) ?? null;
+  const isStringPanelControlled = typeof stringPanelOpen === "boolean";
+  const resolvedStringPanelOpen = isStringPanelControlled
+    ? Boolean(stringPanelOpen)
+    : internalStringPanelOpen;
+  const dockStringPanel = embedded;
+  const isCollaborationPanelControlled = typeof collaborationPanelOpen === "boolean";
+  const resolvedCollaborationPanelOpen = isCollaborationPanelControlled
+    ? Boolean(collaborationPanelOpen)
+    : internalCollaborationPanelOpen;
   const filteredChats = chats.filter((chat) => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) {
@@ -531,6 +591,137 @@ export function StringChatShell({
       chat.messages.some((message) => message.content.toLowerCase().includes(query))
     );
   });
+  const activeStringDescription = useMemo(
+    () => buildStringDescription(activeChat),
+    [activeChat]
+  );
+  const canManageActiveString = Boolean(
+    activeChat?.persisted &&
+      currentActorUserId &&
+      activeChat.createdByUserId &&
+      activeChat.createdByUserId === currentActorUserId
+  );
+  const canKillActiveStringProcess = Boolean(
+    canManageActiveString && (activeChat?.directionId || activeChat?.planId)
+  );
+  const stringParticipants = useMemo(() => {
+    const byParticipant = new Map<string, Collaborator>();
+    const addParticipant = (participant: Collaborator | null | undefined) => {
+      if (!participant) {
+        return;
+      }
+      const key =
+        participant.id ||
+        participant.email.trim().toLowerCase() ||
+        participant.name.trim().toLowerCase();
+      if (!key || byParticipant.has(key)) {
+        return;
+      }
+      byParticipant.set(key, participant);
+    };
+    const routedTeam =
+      teams.find((team) => team.id === activeChat?.selectedTeamId) ?? selectedTeam ?? null;
+
+    routedTeam?.memberIds.forEach((memberId) => {
+      addParticipant(collaborators.find((participant) => participant.id === memberId));
+    });
+    addParticipant(
+      actorMemberId ? collaborators.find((participant) => participant.id === actorMemberId) : null
+    );
+
+    activeChat?.messages.forEach((message) => {
+      if (message.role === "user") {
+        if (!actorMemberId) {
+          addParticipant({
+            id: "string-owner",
+            name: "You",
+            email: "",
+            role: "Owner",
+            kind: "HUMAN",
+            online: true,
+            source: "system"
+          });
+        }
+        return;
+      }
+
+      const authorName = normalizeText(message.authorName);
+      if (!authorName) {
+        return;
+      }
+
+      const matchedCollaborator =
+        collaborators.find(
+          (participant) => participant.name.trim().toLowerCase() === authorName.toLowerCase()
+        ) ??
+        collaborators.find(
+          (participant) => participant.email.trim().toLowerCase() === authorName.toLowerCase()
+        );
+
+      if (matchedCollaborator) {
+        addParticipant(matchedCollaborator);
+        return;
+      }
+
+      addParticipant({
+        id: `string-participant:${authorName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+        name: authorName,
+        email: "",
+        role:
+          normalizeText(message.authorRole) ||
+          (message.role === "assistant" ? "AI collaborator" : "Workspace system"),
+        kind: message.role === "assistant" ? "AI" : "HUMAN",
+        online: true,
+        source: "system"
+      });
+    });
+
+    return [...byParticipant.values()].sort((left, right) =>
+      left.name.localeCompare(right.name)
+    );
+  }, [activeChat, actorMemberId, collaborators, selectedTeam, teams]);
+
+  const handleStringPanelOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (!isStringPanelControlled) {
+        setInternalStringPanelOpen(nextOpen);
+      }
+      if (nextOpen) {
+        if (!isCollaborationPanelControlled) {
+          setInternalCollaborationPanelOpen(false);
+        }
+        onCollaborationPanelOpenChange?.(false);
+      }
+      onStringPanelOpenChange?.(nextOpen);
+    },
+    [
+      isCollaborationPanelControlled,
+      isStringPanelControlled,
+      onCollaborationPanelOpenChange,
+      onStringPanelOpenChange
+    ]
+  );
+
+  const handleCollaborationPanelOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (!isCollaborationPanelControlled) {
+        setInternalCollaborationPanelOpen(nextOpen);
+      }
+      if (nextOpen) {
+        if (!isStringPanelControlled) {
+          setInternalStringPanelOpen(false);
+        }
+        onStringPanelOpenChange?.(false);
+      }
+      onCollaborationPanelOpenChange?.(nextOpen);
+    },
+    [
+      isCollaborationPanelControlled,
+      isStringPanelControlled,
+      onCollaborationPanelOpenChange,
+      onStringPanelOpenChange
+    ]
+  );
 
   useEffect(() => {
     if (!activeChat) {
@@ -567,160 +758,167 @@ export function StringChatShell({
     }
   }, [selectedTeamId, teams]);
 
-  useEffect(() => {
-    const loadWorkspace = async () => {
-      const currentLoadId = loadVersionRef.current + 1;
-      loadVersionRef.current = currentLoadId;
+  const loadWorkspace = useCallback(async () => {
+    const currentLoadId = loadVersionRef.current + 1;
+    loadVersionRef.current = currentLoadId;
 
-      if (!orgId) {
-        setChats([]);
-        setActiveChatId(null);
-        setTeams([]);
-        setCollaborators([]);
-        setActorMemberId(null);
-        setSelectedTeamId(null);
-        setLoading(false);
-        setSending(false);
-        setError(null);
-        setStatusText(null);
-        return;
-      }
-
-      setLoading(true);
-      setError(null);
-      setStatusText("Switching string workspace...");
+    if (!orgId) {
       setChats([]);
       setActiveChatId(null);
       setTeams([]);
       setCollaborators([]);
+      setCurrentActorUserId(null);
       setActorMemberId(null);
       setSelectedTeamId(null);
-      setMode("discussion");
-      setDraft("");
-      setSearchQuery("");
-      setSidebarOpen(false);
-      setCollaborationOpen(false);
+      setLoading(false);
       setSending(false);
+      setStringActionInFlight(null);
+      setError(null);
+      setStatusText(null);
+      return;
+    }
 
-      try {
-        const [stringsResponse, directionsResponse, plansResponse, hubResponse] =
-          await Promise.all([
-            fetch(`/api/strings?orgId=${encodeURIComponent(orgId)}`, {
-              cache: "no-store",
-              credentials: "include"
-            }),
-            fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, {
-              cache: "no-store",
-              credentials: "include"
-            }),
-            fetch(`/api/plans?orgId=${encodeURIComponent(orgId)}`, {
-              cache: "no-store",
-              credentials: "include"
-            }),
-            fetch(`/api/hub/organization?orgId=${encodeURIComponent(orgId)}`, {
-              cache: "no-store",
-              credentials: "include"
-            })
-          ]);
+    setLoading(true);
+    setError(null);
+    setStatusText("Switching string workspace...");
+    setChats([]);
+    setActiveChatId(null);
+    setTeams([]);
+    setCollaborators([]);
+    setCurrentActorUserId(null);
+    setActorMemberId(null);
+    setSelectedTeamId(null);
+    setMode("discussion");
+    setDraft("");
+    setSearchQuery("");
+    setSidebarOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
+    setSending(false);
+    setStringActionInFlight(null);
 
-        const [
-          { payload: stringsPayload, rawText: stringsRaw },
-          { payload: directionsPayload, rawText: directionsRaw },
-          { payload: plansPayload, rawText: plansRaw },
-          { payload: hubPayload, rawText: hubRaw }
-        ] = await Promise.all([
-          parseResponse<StringApiResponse>(stringsResponse),
-          parseResponse<DirectionsResponse>(directionsResponse),
-          parseResponse<PlansResponse>(plansResponse),
-          parseResponse<HubOrganizationResponse>(hubResponse)
+    try {
+      const [stringsResponse, directionsResponse, plansResponse, hubResponse] =
+        await Promise.all([
+          fetch(`/api/strings?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store",
+            credentials: "include"
+          }),
+          fetch(`/api/directions?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store",
+            credentials: "include"
+          }),
+          fetch(`/api/plans?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store",
+            credentials: "include"
+          }),
+          fetch(`/api/hub/organization?orgId=${encodeURIComponent(orgId)}`, {
+            cache: "no-store",
+            credentials: "include"
+          })
         ]);
 
-        if (!stringsResponse.ok || !stringsPayload?.ok) {
-          throw new Error(
-            failMsg(stringsResponse.status, "Failed to load strings", stringsPayload?.message, stringsRaw)
-          );
-        }
-        if (!directionsResponse.ok || !directionsPayload?.ok) {
-          throw new Error(
-            failMsg(
-              directionsResponse.status,
-              "Failed to load directions",
-              directionsPayload?.message,
-              directionsRaw
-            )
-          );
-        }
-        if (!plansResponse.ok || !plansPayload?.ok) {
-          throw new Error(
-            failMsg(plansResponse.status, "Failed to load plans", plansPayload?.message, plansRaw)
-          );
-        }
-        if (!hubResponse.ok || !hubPayload?.ok) {
-          throw new Error(
-            failMsg(hubResponse.status, "Failed to load collaboration", hubPayload?.message, hubRaw)
-          );
-        }
+      const [
+        { payload: stringsPayload, rawText: stringsRaw },
+        { payload: directionsPayload, rawText: directionsRaw },
+        { payload: plansPayload, rawText: plansRaw },
+        { payload: hubPayload, rawText: hubRaw }
+      ] = await Promise.all([
+        parseResponse<StringApiResponse>(stringsResponse),
+        parseResponse<DirectionsResponse>(directionsResponse),
+        parseResponse<PlansResponse>(plansResponse),
+        parseResponse<HubOrganizationResponse>(hubResponse)
+      ]);
 
-        if (loadVersionRef.current !== currentLoadId) {
-          return;
-        }
-
-        const persistedStrings = Array.isArray(stringsPayload.strings)
-          ? stringsPayload.strings.map((item) => normalizeChatString(item))
-          : [];
-        const directions = Array.isArray(directionsPayload.directions)
-          ? directionsPayload.directions
-          : [];
-        const plans = Array.isArray(plansPayload.plans) ? plansPayload.plans : [];
-        const collaborationWorkspace = mapCollaborationWorkspace(hubPayload);
-        const hydratedStrings = buildDerivedStrings(persistedStrings, directions, plans);
-        const initialTeam =
-          collaborationWorkspace.teams.find(
-            (team) => team.id === collaborationWorkspace.activeTeamId
-          ) ??
-          collaborationWorkspace.teams[0] ??
-          null;
-        const nextStrings =
-          hydratedStrings.length > 0 ? hydratedStrings : [createEmptyChat(initialTeam)];
-
-        setCollaborators(collaborationWorkspace.collaborators);
-        setTeams(collaborationWorkspace.teams);
-        setActorMemberId(collaborationWorkspace.actorMemberId);
-        setChats(nextStrings);
-        setActiveChatId((current) =>
-          current && nextStrings.some((item) => item.id === current)
-            ? current
-            : nextStrings[0]?.id ?? null
+      if (!stringsResponse.ok || !stringsPayload?.ok) {
+        throw new Error(
+          failMsg(stringsResponse.status, "Failed to load strings", stringsPayload?.message, stringsRaw)
         );
-        setSelectedTeamId(
-          collaborationWorkspace.activeTeamId ?? nextStrings[0]?.selectedTeamId ?? initialTeam?.id ?? null
-        );
-        setStatusText(
-          `Synced ${nextStrings.length} strings, ${collaborationWorkspace.collaborators.length} collaborators, and ${collaborationWorkspace.teams.length} teams.`
-        );
-      } catch (nextError) {
-        if (loadVersionRef.current !== currentLoadId) {
-          return;
-        }
-
-        const fallbackChat = createEmptyChat(null);
-        setChats([fallbackChat]);
-        setActiveChatId(fallbackChat.id);
-        setTeams([]);
-        setCollaborators([]);
-        setActorMemberId(null);
-        setSelectedTeamId(null);
-        setError(nextError instanceof Error ? nextError.message : "Failed to load string workspace.");
-        setStatusText(null);
-      } finally {
-        if (loadVersionRef.current === currentLoadId) {
-          setLoading(false);
-        }
       }
-    };
+      if (!directionsResponse.ok || !directionsPayload?.ok) {
+        throw new Error(
+          failMsg(
+            directionsResponse.status,
+            "Failed to load directions",
+            directionsPayload?.message,
+            directionsRaw
+          )
+        );
+      }
+      if (!plansResponse.ok || !plansPayload?.ok) {
+        throw new Error(
+          failMsg(plansResponse.status, "Failed to load plans", plansPayload?.message, plansRaw)
+        );
+      }
+      if (!hubResponse.ok || !hubPayload?.ok) {
+        throw new Error(
+          failMsg(hubResponse.status, "Failed to load collaboration", hubPayload?.message, hubRaw)
+        );
+      }
 
+      if (loadVersionRef.current !== currentLoadId) {
+        return;
+      }
+
+      const persistedStrings = Array.isArray(stringsPayload.strings)
+        ? stringsPayload.strings.map((item) => normalizeChatString(item))
+        : [];
+      const directions = Array.isArray(directionsPayload.directions)
+        ? directionsPayload.directions
+        : [];
+      const plans = Array.isArray(plansPayload.plans) ? plansPayload.plans : [];
+      const collaborationWorkspace = mapCollaborationWorkspace(hubPayload);
+      const hydratedStrings = buildDerivedStrings(persistedStrings, directions, plans);
+      const initialTeam =
+        collaborationWorkspace.teams.find(
+          (team) => team.id === collaborationWorkspace.activeTeamId
+        ) ??
+        collaborationWorkspace.teams[0] ??
+        null;
+      const nextStrings =
+        hydratedStrings.length > 0 ? hydratedStrings : [createEmptyChat(initialTeam)];
+
+      setCollaborators(collaborationWorkspace.collaborators);
+      setTeams(collaborationWorkspace.teams);
+      setCurrentActorUserId(collaborationWorkspace.actorUserId);
+      setActorMemberId(collaborationWorkspace.actorMemberId);
+      setChats(nextStrings);
+      setActiveChatId((current) =>
+        current && nextStrings.some((item) => item.id === current)
+          ? current
+          : nextStrings[0]?.id ?? null
+      );
+      setSelectedTeamId(
+        collaborationWorkspace.activeTeamId ?? nextStrings[0]?.selectedTeamId ?? initialTeam?.id ?? null
+      );
+      setStatusText(
+        `Synced ${nextStrings.length} strings, ${collaborationWorkspace.collaborators.length} collaborators, and ${collaborationWorkspace.teams.length} teams.`
+      );
+    } catch (nextError) {
+      if (loadVersionRef.current !== currentLoadId) {
+        return;
+      }
+
+      const fallbackChat = createEmptyChat(null);
+      setChats([fallbackChat]);
+      setActiveChatId(fallbackChat.id);
+      setTeams([]);
+      setCollaborators([]);
+      setCurrentActorUserId(null);
+      setActorMemberId(null);
+      setSelectedTeamId(null);
+      setError(nextError instanceof Error ? nextError.message : "Failed to load string workspace.");
+      setStatusText(null);
+    } finally {
+      if (loadVersionRef.current === currentLoadId) {
+        setLoading(false);
+      }
+    }
+  }, [handleCollaborationPanelOpenChange, handleStringPanelOpenChange, orgId]);
+
+  useEffect(() => {
     void loadWorkspace();
-  }, [orgId]);
+  }, [loadWorkspace]);
 
   async function persistChat(chat: ChatString) {
     if (!orgId) {
@@ -811,6 +1009,8 @@ export function StringChatShell({
   function handleSelectChat(chatId: string) {
     setActiveChatId(chatId);
     setSidebarOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
   }
 
   function handleNewChat() {
@@ -821,6 +1021,8 @@ export function StringChatShell({
     setMode("discussion");
     setDraft("");
     setSidebarOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
     setError(null);
     void persistChat(nextChat).catch((nextError) => {
       setError(nextError instanceof Error ? nextError.message : "Failed to save string.");
@@ -936,7 +1138,8 @@ export function StringChatShell({
     replaceChat(optimisticChat);
     setDraft("");
     setSending(true);
-    setCollaborationOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
     setError(null);
 
     const userPersistPromise = persistChat(optimisticChat).catch((nextError) => {
@@ -1139,7 +1342,8 @@ export function StringChatShell({
 
   function handleDiscussWithTeam() {
     handleModeChange("discussion");
-    setCollaborationOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
 
     if (!draft.trim() && selectedTeam) {
       setDraft(`Discuss with ${selectedTeam.name}: `);
@@ -1148,7 +1352,8 @@ export function StringChatShell({
 
   function handleSetDirection() {
     handleModeChange("direction");
-    setCollaborationOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
 
     if (!draft.trim() && selectedTeam) {
       setDraft(`Direction for ${selectedTeam.name}: `);
@@ -1156,29 +1361,108 @@ export function StringChatShell({
   }
 
   function handleOpenAddMember() {
-    setCollaborationOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
     onOpenAddMember?.();
   }
 
   function handleOpenCreateTeam() {
-    setCollaborationOpen(false);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
     onOpenCreateTeam?.();
   }
 
-  const statusBanner =
-    error || statusText || loading ? (
-      <div className="border-b border-white/10 px-4 py-3 sm:px-6">
-        <div
-          className={`rounded-2xl border px-3 py-2 text-xs ${
-            error
-              ? "border-rose-500/35 bg-rose-500/10 text-rose-200"
-              : "border-white/10 bg-black/15 text-slate-400"
-          }`}
-        >
-          {error ?? (loading ? "Syncing string workspace..." : statusText)}
-        </div>
-      </div>
-    ) : null;
+  async function handleDeleteString() {
+    if (!orgId || !activeChat || stringActionInFlight) {
+      return;
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm("Delete this string? If it has a linked running process, kill that process first.")
+    ) {
+      return;
+    }
+
+    setStringActionInFlight("delete");
+    setError(null);
+
+    try {
+      const response = await fetch(
+        `/api/strings/${encodeURIComponent(activeChat.id)}?orgId=${encodeURIComponent(orgId)}`,
+        {
+          method: "DELETE",
+          credentials: "include"
+        }
+      );
+      const { payload, rawText } = await parseResponse<StringActionApiResponse>(response);
+
+      if (!response.ok || !payload?.ok) {
+        throw new Error(failMsg(response.status, "Failed to delete string", payload?.message, rawText));
+      }
+
+      await loadWorkspace();
+      setStatusText("String deleted.");
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed to delete string.");
+    } finally {
+      setStringActionInFlight(null);
+    }
+  }
+
+  async function handleKillStringProcess() {
+    if (!orgId || !activeChat || stringActionInFlight) {
+      return;
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm("Kill the linked process for this string?")
+    ) {
+      return;
+    }
+
+    setStringActionInFlight("kill");
+    setError(null);
+
+    try {
+      const response = await fetch(`/api/strings/${encodeURIComponent(activeChat.id)}`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          orgId,
+          action: "KILL_PROCESS"
+        })
+      });
+      const { payload, rawText } = await parseResponse<StringActionApiResponse>(response);
+
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          failMsg(response.status, "Failed to kill linked process", payload?.message, rawText)
+        );
+      }
+
+      setStatusText(
+        payload.message ??
+          `Aborted ${payload.result?.flowsAborted ?? 0} linked process(es) for this string.`
+      );
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed to kill linked process.");
+    } finally {
+      setStringActionInFlight(null);
+    }
+  }
+
+  const headerStatusText = error
+    ? error
+    : loading
+      ? "Syncing workspace..."
+      : statusText?.startsWith("Synced ")
+        ? null
+        : statusText;
 
   if (!orgId) {
     return (
@@ -1204,14 +1488,13 @@ export function StringChatShell({
     <div
       className={`relative overflow-hidden bg-[#0a0f1c] text-slate-100 ${
         embedded
-          ? "flex h-full min-h-0 flex-1 rounded-[28px] border border-white/10 sm:rounded-[32px]"
+          ? "flex h-full min-h-0 flex-1 rounded-[24px] border border-white/[0.06]"
           : "h-[100dvh]"
       }`}
     >
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(251,191,36,0.12),transparent_28%),linear-gradient(180deg,#0a0f1c_0%,#0b1220_48%,#09111d_100%)]" />
-      <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.015)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.015)_1px,transparent_1px)] bg-[size:28px_28px] opacity-40" />
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.08),transparent_24%),linear-gradient(180deg,#0a0f1c_0%,#0c1321_100%)]" />
 
-      <div className="relative mx-auto flex h-full min-h-0 w-full max-w-[1760px] justify-center gap-2.5 p-2.5 sm:gap-3 sm:p-3 lg:gap-4 lg:p-4">
+      <div className="relative flex h-full min-h-0 w-full">
         <Sidebar
           open={sidebarOpen}
           searchQuery={searchQuery}
@@ -1223,20 +1506,34 @@ export function StringChatShell({
           onClose={() => setSidebarOpen(false)}
         />
 
-        <main className="min-w-0 flex-1 overflow-hidden rounded-[28px] border border-white/10 bg-[#0f172a]/80 shadow-[0_24px_80px_rgba(0,0,0,0.28)] backdrop-blur sm:rounded-[32px]">
-          <div className="flex h-full min-h-0 flex-col">
+        <main
+          className={`grid min-w-0 flex-1 overflow-hidden ${
+            dockStringPanel
+              ? "xl:grid-cols-[minmax(0,1fr)_clamp(320px,28vw,420px)] xl:gap-3 xl:p-3"
+              : ""
+          }`}
+        >
+          <div
+            className={`flex h-full min-h-0 flex-1 flex-col bg-[#0f172a]/92 ${
+              dockStringPanel
+                ? "xl:overflow-hidden xl:rounded-[24px] xl:border xl:border-white/[0.06]"
+                : ""
+            }`}
+          >
             <ChatHeader
               title={activeChat?.title ?? DEFAULT_CHAT_TITLE}
               mode={mode}
+              stringPanelOpen={resolvedStringPanelOpen}
+              stringPanelPinned={dockStringPanel}
               selectedTeamLabel={selectedTeam?.name ?? activeChat?.selectedTeamLabel ?? null}
+              statusText={headerStatusText}
+              statusTone={error ? "error" : "neutral"}
               onTitleChange={handleTitleChange}
               onTitleBlur={handleTitleBlur}
               onModeChange={handleModeChange}
+              onToggleStringPanel={() => handleStringPanelOpenChange(!resolvedStringPanelOpen)}
               onOpenSidebar={() => setSidebarOpen(true)}
-              onOpenCollaboration={() => setCollaborationOpen(true)}
             />
-
-            {statusBanner}
 
             <ChatWindow
               mode={mode}
@@ -1253,15 +1550,68 @@ export function StringChatShell({
               onSend={() => void sendMessage()}
             />
           </div>
+
+          {dockStringPanel ? (
+            <StringPanel
+              open
+              variant="docked"
+              className="hidden xl:block"
+              showCloseButton={false}
+              chat={activeChat}
+              stringDescription={activeStringDescription}
+              stringParticipants={stringParticipants}
+              collaborators={collaborators}
+              teams={teams}
+              selectedTeamId={selectedTeamId}
+              onSelectTeam={handleSelectTeam}
+              onClose={() => handleStringPanelOpenChange(false)}
+              canManageString={canManageActiveString}
+              canKillProcess={canKillActiveStringProcess}
+              actionInFlight={stringActionInFlight}
+              onDeleteString={() => void handleDeleteString()}
+              onKillProcess={() => void handleKillStringProcess()}
+              onSendToTeam={() => void sendMessage(selectedTeamId)}
+              onDiscussWithTeam={handleDiscussWithTeam}
+              onSetDirection={handleSetDirection}
+              onOpenAddMember={handleOpenAddMember}
+              onOpenCreateTeam={handleOpenCreateTeam}
+              canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
+              sending={sending}
+            />
+          ) : null}
         </main>
 
-        <CollaborationPanel
-          open={collaborationOpen}
+        <StringPanel
+          open={resolvedStringPanelOpen}
+          className={dockStringPanel ? "xl:hidden" : ""}
+          chat={activeChat}
+          stringDescription={activeStringDescription}
+          stringParticipants={stringParticipants}
           collaborators={collaborators}
           teams={teams}
           selectedTeamId={selectedTeamId}
           onSelectTeam={handleSelectTeam}
-          onClose={() => setCollaborationOpen(false)}
+          onClose={() => handleStringPanelOpenChange(false)}
+          canManageString={canManageActiveString}
+          canKillProcess={canKillActiveStringProcess}
+          actionInFlight={stringActionInFlight}
+          onDeleteString={() => void handleDeleteString()}
+          onKillProcess={() => void handleKillStringProcess()}
+          onSendToTeam={() => void sendMessage(selectedTeamId)}
+          onDiscussWithTeam={handleDiscussWithTeam}
+          onSetDirection={handleSetDirection}
+          onOpenAddMember={handleOpenAddMember}
+          onOpenCreateTeam={handleOpenCreateTeam}
+          canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
+          sending={sending}
+        />
+        <CollaborationPanel
+          open={resolvedCollaborationPanelOpen}
+          collaborators={collaborators}
+          teams={teams}
+          selectedTeamId={selectedTeamId}
+          onSelectTeam={handleSelectTeam}
+          onClose={() => handleCollaborationPanelOpenChange(false)}
           onSendToTeam={() => void sendMessage(selectedTeamId)}
           onDiscussWithTeam={handleDiscussWithTeam}
           onSetDirection={handleSetDirection}

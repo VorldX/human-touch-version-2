@@ -340,7 +340,7 @@ export interface ControlThreadHistoryItem {
 }
 
 export type FlowExecutionSurfaceTab = "STEER" | "DETAILS" | "BLUEPRINT" | "CALENDAR";
-export type FlowGovernanceSurfaceTab = "SCAN" | "SETTINGS";
+export type FlowGovernanceSurfaceTab = "SCAN";
 export type FlowStringsSurfaceTab = "DETAILS" | "BLUEPRINT";
 export type SteerLaneTab = "CENTER" | "APPROVED" | "RETHINK";
 export type SteerSurfaceTab = SteerLaneTab | "DETAILS";
@@ -836,6 +836,54 @@ export function buildStringDiscussionTurns(stringItem: ControlThreadHistoryItem 
     .sort((left, right) => left.timestamp - right.timestamp);
 }
 
+export function buildStringCollaborationSnapshot(input: {
+  draft: EditableStringDraft | null | undefined;
+  stringItem: ControlThreadHistoryItem | null | undefined;
+}) {
+  const participantsByKey = new Map<
+    string,
+    { id: string; actorType: ActorType; actorLabel: string; turnCount: number }
+  >();
+
+  input.draft?.discussion.forEach((entry, index) => {
+    const actorLabel =
+      entry.actorLabel.trim() || (entry.actorType === "HUMAN" ? "Owner" : "Participant");
+    const key = `${entry.actorType}:${actorLabel.toLowerCase()}`;
+    const existing = participantsByKey.get(key);
+    if (existing) {
+      existing.turnCount += 1;
+      return;
+    }
+    participantsByKey.set(key, {
+      id: `participant-${index}`,
+      actorType: entry.actorType,
+      actorLabel,
+      turnCount: 1
+    });
+  });
+
+  const participants = [...participantsByKey.values()];
+  const workforce = input.stringItem?.planningResult?.primaryPlan?.resourcePlan ?? [];
+  const autoSquad = input.stringItem?.planningResult?.autoSquad ?? null;
+  const totalCount =
+    participants.length +
+    workforce.length +
+    (autoSquad?.created?.length ?? 0) +
+    (autoSquad?.requestedRoles?.length ?? 0);
+
+  return {
+    participants,
+    workforce,
+    autoSquad,
+    totalCount,
+    summary:
+      workforce[0]?.role ||
+      participants[0]?.actorLabel ||
+      autoSquad?.created?.[0]?.name ||
+      "No collaboration context yet."
+  };
+}
+
 export function buildEditableStringDraft(input: {
   stringItem: ControlThreadHistoryItem;
   permissionRequests: PermissionRequestItem[];
@@ -912,6 +960,371 @@ export function buildEditableStringDraft(input: {
     scoring: {
       detailScore: detailScore === null ? "" : String(detailScore),
       note: stringItem.planningResult?.analysis?.trim() || ""
+    }
+  };
+}
+
+function draftText(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function draftId(value: unknown, fallback: string) {
+  const normalized = draftText(value).trim();
+  return normalized || fallback;
+}
+
+function draftActorType(value: unknown): ActorType {
+  return value === "AI" || value === "HUMAN" || value === "SYSTEM" ? value : "SYSTEM";
+}
+
+function draftExecutionMode(
+  value: unknown
+): EditablePathwayDraft["executionMode"] {
+  return value === "AGENT" || value === "HYBRID" || value === "HUMAN" ? value : "HUMAN";
+}
+
+function hasDraftText(value: string) {
+  return value.trim().length > 0;
+}
+
+function preferGeneratedDraftText(generated: string, existing: string) {
+  return hasDraftText(generated) ? generated : existing;
+}
+
+function hasDiscussionDraftContent(entries: EditableDiscussionDraft[]) {
+  return entries.some(
+    (entry) => hasDraftText(entry.actorLabel) || hasDraftText(entry.content)
+  );
+}
+
+function hasWorkflowDraftContent(entries: EditableWorkflowDraft[]) {
+  return entries.some(
+    (entry) =>
+      hasDraftText(entry.title) ||
+      hasDraftText(entry.ownerRole) ||
+      hasDraftText(entry.goal) ||
+      hasDraftText(entry.deliverablesText) ||
+      hasDraftText(entry.taskSummary)
+  );
+}
+
+function hasPathwayDraftContent(entries: EditablePathwayDraft[]) {
+  return entries.some(
+    (entry) =>
+      hasDraftText(entry.workflowTitle) ||
+      hasDraftText(entry.taskTitle) ||
+      hasDraftText(entry.ownerRole) ||
+      hasDraftText(entry.trigger) ||
+      hasDraftText(entry.dueWindow)
+  );
+}
+
+function hasApprovalDraftContent(entries: EditableApprovalDraft[]) {
+  return entries.some(
+    (entry) =>
+      hasDraftText(entry.title) ||
+      hasDraftText(entry.owner) ||
+      hasDraftText(entry.reason) ||
+      hasDraftText(entry.status)
+  );
+}
+
+function hasMilestoneDraftContent(entries: EditableMilestoneDraft[]) {
+  return entries.some(
+    (entry) =>
+      hasDraftText(entry.title) ||
+      hasDraftText(entry.ownerRole) ||
+      hasDraftText(entry.dueWindow) ||
+      hasDraftText(entry.deliverable) ||
+      hasDraftText(entry.successSignal)
+  );
+}
+
+function mergeDiscussionDrafts(
+  generated: EditableDiscussionDraft[],
+  existing: EditableDiscussionDraft[]
+) {
+  const existingById = new Map(existing.map((entry) => [entry.id, entry] as const));
+  const merged = generated.map((entry) => ({
+    ...entry,
+    ...(existingById.get(entry.id) ?? {})
+  }));
+  const generatedIds = new Set(generated.map((entry) => entry.id));
+  existing.forEach((entry) => {
+    if (!generatedIds.has(entry.id)) {
+      merged.push(entry);
+    }
+  });
+  return merged;
+}
+
+function mergeWorkflowDrafts(
+  generated: EditableWorkflowDraft[],
+  existing: EditableWorkflowDraft[]
+) {
+  const existingById = new Map(existing.map((entry) => [entry.id, entry] as const));
+  const merged = generated.map((entry) => {
+    const existingEntry = existingById.get(entry.id);
+    if (!existingEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      title: preferGeneratedDraftText(entry.title, existingEntry.title),
+      ownerRole: preferGeneratedDraftText(entry.ownerRole, existingEntry.ownerRole),
+      goal: preferGeneratedDraftText(entry.goal, existingEntry.goal),
+      deliverablesText: preferGeneratedDraftText(
+        entry.deliverablesText,
+        existingEntry.deliverablesText
+      ),
+      taskSummary: preferGeneratedDraftText(entry.taskSummary, existingEntry.taskSummary)
+    };
+  });
+  const generatedIds = new Set(generated.map((entry) => entry.id));
+  existing.forEach((entry) => {
+    if (!generatedIds.has(entry.id) && hasWorkflowDraftContent([entry])) {
+      merged.push(entry);
+    }
+  });
+  return merged;
+}
+
+function mergePathwayDrafts(
+  generated: EditablePathwayDraft[],
+  existing: EditablePathwayDraft[]
+) {
+  const existingById = new Map(existing.map((entry) => [entry.id, entry] as const));
+  const merged = generated.map((entry) => {
+    const existingEntry = existingById.get(entry.id);
+    if (!existingEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      workflowTitle: preferGeneratedDraftText(entry.workflowTitle, existingEntry.workflowTitle),
+      taskTitle: preferGeneratedDraftText(entry.taskTitle, existingEntry.taskTitle),
+      ownerRole: preferGeneratedDraftText(entry.ownerRole, existingEntry.ownerRole),
+      executionMode: entry.executionMode,
+      trigger: preferGeneratedDraftText(entry.trigger, existingEntry.trigger),
+      dueWindow: preferGeneratedDraftText(entry.dueWindow, existingEntry.dueWindow)
+    };
+  });
+  const generatedIds = new Set(generated.map((entry) => entry.id));
+  existing.forEach((entry) => {
+    if (!generatedIds.has(entry.id) && hasPathwayDraftContent([entry])) {
+      merged.push(entry);
+    }
+  });
+  return merged;
+}
+
+function mergeApprovalDrafts(
+  generated: EditableApprovalDraft[],
+  existing: EditableApprovalDraft[]
+) {
+  const existingById = new Map(existing.map((entry) => [entry.id, entry] as const));
+  const merged = generated.map((entry) => {
+    const existingEntry = existingById.get(entry.id);
+    if (!existingEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      title: preferGeneratedDraftText(entry.title, existingEntry.title),
+      owner: preferGeneratedDraftText(entry.owner, existingEntry.owner),
+      reason: preferGeneratedDraftText(entry.reason, existingEntry.reason),
+      status: preferGeneratedDraftText(entry.status, existingEntry.status)
+    };
+  });
+  const generatedIds = new Set(generated.map((entry) => entry.id));
+  existing.forEach((entry) => {
+    if (!generatedIds.has(entry.id) && hasApprovalDraftContent([entry])) {
+      merged.push(entry);
+    }
+  });
+  return merged;
+}
+
+function mergeMilestoneDrafts(
+  generated: EditableMilestoneDraft[],
+  existing: EditableMilestoneDraft[]
+) {
+  const existingById = new Map(existing.map((entry) => [entry.id, entry] as const));
+  const merged = generated.map((entry) => {
+    const existingEntry = existingById.get(entry.id);
+    if (!existingEntry) {
+      return entry;
+    }
+    return {
+      ...entry,
+      title: preferGeneratedDraftText(entry.title, existingEntry.title),
+      ownerRole: preferGeneratedDraftText(entry.ownerRole, existingEntry.ownerRole),
+      dueWindow: preferGeneratedDraftText(entry.dueWindow, existingEntry.dueWindow),
+      deliverable: preferGeneratedDraftText(entry.deliverable, existingEntry.deliverable),
+      successSignal: preferGeneratedDraftText(entry.successSignal, existingEntry.successSignal)
+    };
+  });
+  const generatedIds = new Set(generated.map((entry) => entry.id));
+  existing.forEach((entry) => {
+    if (!generatedIds.has(entry.id) && hasMilestoneDraftContent([entry])) {
+      merged.push(entry);
+    }
+  });
+  return merged;
+}
+
+export function normalizeEditableStringDraft(value: unknown): EditableStringDraft {
+  const record =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const plan =
+    record.plan && typeof record.plan === "object" && !Array.isArray(record.plan)
+      ? (record.plan as Record<string, unknown>)
+      : {};
+  const scoring =
+    record.scoring && typeof record.scoring === "object" && !Array.isArray(record.scoring)
+      ? (record.scoring as Record<string, unknown>)
+      : {};
+
+  return {
+    discussion: Array.isArray(record.discussion)
+      ? record.discussion.map((entry, index) => {
+          const item =
+            entry && typeof entry === "object" && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>)
+              : {};
+          return {
+            id: draftId(item.id, `discussion-${index}`),
+            actorType: draftActorType(item.actorType),
+            actorLabel: draftText(item.actorLabel),
+            content: draftText(item.content)
+          };
+        })
+      : [],
+    direction: draftText(record.direction),
+    plan: {
+      summary: draftText(plan.summary),
+      deliverablesText: draftText(plan.deliverablesText)
+    },
+    workflows: Array.isArray(record.workflows)
+      ? record.workflows.map((entry, index) => {
+          const item =
+            entry && typeof entry === "object" && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>)
+              : {};
+          return {
+            id: draftId(item.id, `workflow-${index}`),
+            title: draftText(item.title),
+            ownerRole: draftText(item.ownerRole),
+            goal: draftText(item.goal),
+            deliverablesText: draftText(item.deliverablesText),
+            taskSummary: draftText(item.taskSummary)
+          };
+        })
+      : [],
+    pathway: Array.isArray(record.pathway)
+      ? record.pathway.map((entry, index) => {
+          const item =
+            entry && typeof entry === "object" && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>)
+              : {};
+          return {
+            id: draftId(item.id, `pathway-${index}`),
+            workflowTitle: draftText(item.workflowTitle),
+            taskTitle: draftText(item.taskTitle),
+            ownerRole: draftText(item.ownerRole),
+            executionMode: draftExecutionMode(item.executionMode),
+            trigger: draftText(item.trigger),
+            dueWindow: draftText(item.dueWindow)
+          };
+        })
+      : [],
+    approvals: Array.isArray(record.approvals)
+      ? record.approvals.map((entry, index) => {
+          const item =
+            entry && typeof entry === "object" && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>)
+              : {};
+          return {
+            id: draftId(item.id, `approval-${index}`),
+            title: draftText(item.title),
+            owner: draftText(item.owner),
+            reason: draftText(item.reason),
+            status: draftText(item.status)
+          };
+        })
+      : [],
+    milestones: Array.isArray(record.milestones)
+      ? record.milestones.map((entry, index) => {
+          const item =
+            entry && typeof entry === "object" && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>)
+              : {};
+          return {
+            id: draftId(item.id, `milestone-${index}`),
+            title: draftText(item.title),
+            ownerRole: draftText(item.ownerRole),
+            dueWindow: draftText(item.dueWindow),
+            deliverable: draftText(item.deliverable),
+            successSignal: draftText(item.successSignal)
+          };
+        })
+      : [],
+    scoring: {
+      detailScore: draftText(scoring.detailScore),
+      note: draftText(scoring.note)
+    }
+  };
+}
+
+export function resolveEditableStringDraft(input: {
+  draft?: unknown;
+  stringItem: ControlThreadHistoryItem;
+  permissionRequests: PermissionRequestItem[];
+  approvalCheckpoints: ApprovalCheckpointItem[];
+}): EditableStringDraft {
+  const generated = buildEditableStringDraft({
+    stringItem: input.stringItem,
+    permissionRequests: input.permissionRequests,
+    approvalCheckpoints: input.approvalCheckpoints
+  });
+  const existing = normalizeEditableStringDraft(input.draft);
+
+  return {
+    discussion: hasDiscussionDraftContent(existing.discussion)
+      ? mergeDiscussionDrafts(generated.discussion, existing.discussion)
+      : generated.discussion,
+    direction: hasDraftText(existing.direction) ? existing.direction : generated.direction,
+    plan: {
+      summary: hasDraftText(existing.plan.summary)
+        ? existing.plan.summary
+        : generated.plan.summary,
+      deliverablesText: hasDraftText(existing.plan.deliverablesText)
+        ? existing.plan.deliverablesText
+        : generated.plan.deliverablesText
+    },
+    workflows:
+      generated.workflows.length > 0 || hasWorkflowDraftContent(existing.workflows)
+        ? mergeWorkflowDrafts(generated.workflows, existing.workflows)
+        : existing.workflows,
+    pathway:
+      generated.pathway.length > 0 || hasPathwayDraftContent(existing.pathway)
+        ? mergePathwayDrafts(generated.pathway, existing.pathway)
+        : existing.pathway,
+    approvals:
+      generated.approvals.length > 0 || hasApprovalDraftContent(existing.approvals)
+        ? mergeApprovalDrafts(generated.approvals, existing.approvals)
+        : existing.approvals,
+    milestones:
+      generated.milestones.length > 0 || hasMilestoneDraftContent(existing.milestones)
+        ? mergeMilestoneDrafts(generated.milestones, existing.milestones)
+        : existing.milestones,
+    scoring: {
+      detailScore: hasDraftText(existing.scoring.detailScore)
+        ? existing.scoring.detailScore
+        : generated.scoring.detailScore,
+      note: hasDraftText(existing.scoring.note) ? existing.scoring.note : generated.scoring.note
     }
   };
 }

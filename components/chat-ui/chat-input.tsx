@@ -34,13 +34,13 @@ export function ChatInput({
       return;
     }
     textareaRef.current.style.height = "0px";
-    textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 160)}px`;
+    textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 180)}px`;
   };
 
   return (
-    <div className="shrink-0 border-t border-white/10 px-3 py-3 sm:px-6 sm:py-5">
-      <div className="mx-auto max-w-4xl rounded-[24px] border border-white/10 bg-[#111827]/90 p-2.5 shadow-[0_18px_50px_rgba(0,0,0,0.18)] sm:rounded-[28px] sm:p-3">
-        <div className="flex items-end gap-2.5 sm:gap-3">
+    <div className="sticky bottom-0 z-10 shrink-0 border-t border-white/[0.06] bg-[#0f172a]/96 px-4 py-4 backdrop-blur sm:px-5">
+      <div className="w-full rounded-[22px] border border-white/[0.08] bg-[#0b1220] p-3 shadow-[0_10px_24px_rgba(2,6,23,0.18)]">
+        <div className="flex items-end gap-3">
           <textarea
             ref={textareaRef}
             value={value}
@@ -54,19 +54,19 @@ export function ChatInput({
             disabled={disabled}
             placeholder={placeholder}
             rows={1}
-            className="max-h-40 min-h-11 w-full resize-none bg-transparent px-3 py-2 text-[13px] text-slate-100 outline-none placeholder:text-slate-500 sm:min-h-12 sm:text-sm"
+            className="max-h-44 min-h-[60px] w-full resize-none bg-transparent px-4 py-4 text-sm leading-6 text-slate-100 outline-none placeholder:text-slate-500"
           />
           <button
             type="button"
             disabled={disabled || !value.trim()}
             onClick={onSend}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-slate-950 transition hover:scale-[1.01] disabled:opacity-50 sm:h-11 sm:w-11"
+            className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white text-slate-950 transition duration-200 hover:bg-slate-100 disabled:opacity-50"
             aria-label="Send message"
           >
             {sending ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}
           </button>
         </div>
-        <p className="px-3 pt-2 text-[11px] text-slate-500 sm:text-xs">
+        <p className="px-4 pt-2 text-[11px] text-slate-500">
           Press Enter to send, Shift + Enter for a new line.
         </p>
       </div>

@@ -14,36 +14,42 @@ function formatTime(iso: string) {
 export function MessageBubble({ message, mode }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const wrapperClass = isUser ? "justify-end" : "justify-start";
-  const bubbleClass = isUser
-    ? mode === "direction"
-      ? "border-amber-200/30 bg-[linear-gradient(145deg,rgba(251,191,36,0.22),rgba(120,53,15,0.18))] text-amber-50"
-      : "border-cyan-300/25 bg-[linear-gradient(145deg,rgba(34,211,238,0.18),rgba(15,23,42,0.75))] text-slate-50"
-    : "border-white/10 bg-[rgba(15,23,42,0.65)] text-slate-200";
+  const bubbleClass = message.error
+    ? "border-rose-500/20 bg-rose-500/10 text-rose-100"
+    : isUser
+      ? mode === "direction"
+        ? "border-amber-300/18 bg-amber-300/10 text-amber-50"
+        : "border-cyan-400/18 bg-cyan-400/10 text-slate-50"
+      : "border-white/[0.06] bg-white/[0.04] text-slate-200";
   const roleLabel = isUser
     ? "You"
     : message.authorName || (message.error ? "System" : "Co-Founder Manager");
 
   return (
     <div className={`flex w-full ${wrapperClass}`}>
-      <div
-        className={`max-w-[min(100%,42rem)] rounded-[26px] border px-4 py-3 shadow-[0_14px_40px_rgba(0,0,0,0.14)] ${bubbleClass}`}
+      <article
+        className={`max-w-[88%] rounded-[20px] border px-4 py-3.5 sm:max-w-[72%] xl:max-w-[68%] ${bubbleClass}`}
       >
-        <div className="flex flex-wrap items-center gap-2 text-[11px] font-medium text-slate-400">
-          <span className={isUser ? "text-slate-200" : "text-slate-400"}>{roleLabel}</span>
-          {!isUser && message.authorRole ? (
-            <span className="text-[10px] text-slate-500">{message.authorRole}</span>
-          ) : null}
-          {message.teamLabel ? (
-            <span className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] text-slate-300">
-              {message.teamLabel}
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className={`text-[11px] font-semibold ${isUser ? "text-slate-100" : "text-slate-300"}`}>
+              {roleLabel}
             </span>
-          ) : null}
+            {!isUser && message.authorRole ? (
+              <span className="text-[10px] text-slate-500">{message.authorRole}</span>
+            ) : null}
+            {message.teamLabel ? (
+              <span className="rounded-full border border-white/[0.08] bg-black/10 px-2 py-0.5 text-[10px] text-slate-300">
+                {message.teamLabel}
+              </span>
+            ) : null}
+          </div>
+          <time className="shrink-0 text-[10px] text-slate-500">{formatTime(message.createdAt)}</time>
         </div>
         <p className="whitespace-pre-wrap text-sm leading-6 [overflow-wrap:anywhere]">
           {message.content}
         </p>
-        <p className="mt-1 text-right text-[11px] text-slate-500">{formatTime(message.createdAt)}</p>
-      </div>
+      </article>
     </div>
   );
 }
