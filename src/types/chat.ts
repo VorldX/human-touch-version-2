@@ -60,10 +60,28 @@ export interface AssistantWorkflowEventMeta {
   timestamp?: number;
 }
 
+export type AssistantThreadEventScope =
+  | "MODE"
+  | "MEMBERSHIP"
+  | "PLANNING"
+  | "EXECUTION"
+  | "COLLABORATION";
+
+export interface AssistantThreadEventMeta {
+  kind: "thread_event";
+  title: string;
+  message: string;
+  eventName?: string;
+  scope?: AssistantThreadEventScope;
+  status?: string;
+  timestamp?: number;
+}
+
 export type AssistantMessageMeta =
   | AssistantPlanCardMeta
   | AssistantWorkflowGraphMeta
-  | AssistantWorkflowEventMeta;
+  | AssistantWorkflowEventMeta
+  | AssistantThreadEventMeta;
 
 export interface ChatMessage {
   id: string;

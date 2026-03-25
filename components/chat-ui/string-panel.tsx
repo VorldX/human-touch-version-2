@@ -1,16 +1,9 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
+
 import { AnimatePresence, motion } from "framer-motion";
-import {
-  ArrowUpRight,
-  Clock3,
-  FileText,
-  MessageSquareText,
-  Target,
-  UserPlus,
-  Users,
-  X
-} from "lucide-react";
+import { Clock3, FileText, Plus, Users, X } from "lucide-react";
 
 import { ParticipantList } from "@/components/chat-ui/participant-list";
 import { TeamSelector } from "@/components/chat-ui/team-selector";
@@ -24,15 +17,13 @@ interface StringPanelProps {
   collaborators: Collaborator[];
   teams: Team[];
   selectedTeamId: string | null;
-  onSelectTeam: (teamId: string) => void;
+  linkedTeamIds: string[];
+  linkedParticipantIds: string[];
+  onAddTeam: (teamId: string) => void;
+  onRemoveTeam: (teamId: string) => void;
+  onAddParticipant: (participantId: string) => void;
+  onRemoveParticipant: (participantId: string) => void;
   onClose: () => void;
-  onSendToTeam: () => void;
-  onDiscussWithTeam: () => void;
-  onSetDirection: () => void;
-  onOpenAddMember: () => void;
-  onOpenCreateTeam: () => void;
-  canSendToTeam: boolean;
-  sending: boolean;
   canManageString?: boolean;
   canKillProcess?: boolean;
   actionInFlight?: "delete" | "kill" | null;
@@ -61,8 +52,23 @@ function sourceLabel(source?: ChatString["source"]) {
   return "Workspace";
 }
 
-function modeLabel(mode?: ChatString["mode"]) {
-  return mode === "direction" ? "Direction" : "Discussion";
+function statusLabel(chat: ChatString | null) {
+  if (!chat) {
+    return "Draft";
+  }
+  if (chat.planId) {
+    return "Planning";
+  }
+  if (chat.directionId) {
+    return "Direction Ready";
+  }
+  if (chat.mode === "direction") {
+    return "Direction Draft";
+  }
+  if (chat.messages.length > 0) {
+    return "Discussion";
+  }
+  return "Draft";
 }
 
 function StringPanelContent({
@@ -72,14 +78,12 @@ function StringPanelContent({
   collaborators,
   teams,
   selectedTeamId,
-  onSelectTeam,
-  onSendToTeam,
-  onDiscussWithTeam,
-  onSetDirection,
-  onOpenAddMember,
-  onOpenCreateTeam,
-  canSendToTeam,
-  sending,
+  linkedTeamIds,
+  linkedParticipantIds,
+  onAddTeam,
+  onRemoveTeam,
+  onAddParticipant,
+  onRemoveParticipant,
   canManageString = false,
   canKillProcess = false,
   actionInFlight = null,
@@ -88,19 +92,68 @@ function StringPanelContent({
   onClose,
   showCloseButton = true
 }: StringPanelProps) {
-  const selectedTeam = teams.find((team) => team.id === selectedTeamId) ?? null;
-  const teamParticipants = selectedTeam
-    ? collaborators.filter((participant) => selectedTeam.memberIds.includes(participant.id))
-    : [];
+  const currentTeam = teams.find((team) => team.id === selectedTeamId) ?? null;
+  const linkedTeams = useMemo(
+    () =>
+      linkedTeamIds
+        .map((teamId) => teams.find((team) => team.id === teamId) ?? null)
+        .filter((team): team is Team => Boolean(team)),
+    [linkedTeamIds, teams]
+  );
+  const directParticipants = useMemo(
+    () =>
+      linkedParticipantIds
+        .map((participantId) =>
+          collaborators.find((participant) => participant.id === participantId) ?? null
+        )
+        .filter((participant): participant is Collaborator => Boolean(participant)),
+    [collaborators, linkedParticipantIds]
+  );
+  const availableParticipants = useMemo(
+    () =>
+      collaborators.filter((participant) => !linkedParticipantIds.includes(participant.id)),
+    [collaborators, linkedParticipantIds]
+  );
+  const [teamPickerId, setTeamPickerId] = useState<string>("");
+  const [participantPickerId, setParticipantPickerId] = useState<string>("");
   const messageCount = chat?.messages.length ?? 0;
+  const stringStatus = statusLabel(chat);
   const details = [
     { label: "Created", value: formatTimestamp(chat?.createdAt) },
     { label: "Updated", value: formatTimestamp(chat?.updatedAt) },
-    { label: "Mode", value: modeLabel(chat?.mode) },
+    { label: "Status", value: stringStatus },
     { label: "Source", value: sourceLabel(chat?.source) },
-    { label: "Routed Team", value: selectedTeam?.name ?? chat?.selectedTeamLabel ?? "Not assigned" },
+    { label: "Team", value: currentTeam?.name ?? chat?.selectedTeamLabel ?? "Not assigned" },
+    {
+      label: "Conversation Target",
+      value:
+        chat?.activeAudience?.kind && chat.activeAudience.kind !== "everyone"
+          ? chat.activeAudience.label ?? chat.activeAudience.kind
+          : "Everyone"
+    },
     { label: "Messages", value: `${messageCount}` }
   ];
+
+  useEffect(() => {
+    const fallbackTeamId = selectedTeamId ?? linkedTeams[0]?.id ?? teams[0]?.id ?? "";
+    if (!fallbackTeamId) {
+      setTeamPickerId("");
+      return;
+    }
+    if (!teams.some((team) => team.id === teamPickerId)) {
+      setTeamPickerId(fallbackTeamId);
+    }
+  }, [linkedTeams, selectedTeamId, teamPickerId, teams]);
+
+  useEffect(() => {
+    if (!availableParticipants.some((participant) => participant.id === participantPickerId)) {
+      setParticipantPickerId(availableParticipants[0]?.id ?? "");
+    }
+  }, [availableParticipants, participantPickerId]);
+
+  const selectedPickerTeam = teams.find((team) => team.id === teamPickerId) ?? null;
+  const canAddSelectedTeam =
+    Boolean(selectedPickerTeam) && !linkedTeamIds.includes(selectedPickerTeam?.id ?? "");
 
   return (
     <div className="flex h-full min-h-0 flex-col rounded-[22px] border border-white/[0.06] bg-[#0f172a] p-4 shadow-[0_14px_36px_rgba(2,6,23,0.3)]">
@@ -113,7 +166,7 @@ function StringPanelContent({
             {chat?.title || "Untitled string"}
           </h2>
           <p className="mt-1 text-sm leading-6 text-slate-400">
-            Review this string, its description, participants, and routing controls in one place.
+            Review this string, its description, participants, and collaboration context in one place.
           </p>
         </div>
         {showCloseButton ? (
@@ -136,7 +189,7 @@ function StringPanelContent({
           {messageCount} message{messageCount === 1 ? "" : "s"}
         </span>
         <span className="rounded-full border border-cyan-400/18 bg-cyan-400/10 px-3 py-1 text-[11px] text-cyan-100">
-          {selectedTeam?.name ?? "No team routed"}
+          {currentTeam?.name ?? chat?.selectedTeamLabel ?? "No team selected"}
         </span>
       </div>
 
@@ -147,7 +200,7 @@ function StringPanelContent({
               <Clock3 size={12} />
               String Details
             </p>
-            <span className="text-xs text-slate-500">{modeLabel(chat?.mode)}</span>
+            <span className="text-xs text-slate-500">{stringStatus}</span>
           </div>
           <div className="space-y-2">
             <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
@@ -201,100 +254,148 @@ function StringPanelContent({
             </p>
             <span className="text-xs text-slate-500">{stringParticipants.length}</span>
           </div>
-          <ParticipantList participants={stringParticipants} />
+          <ParticipantList
+            participants={stringParticipants}
+            onRemoveParticipant={onRemoveParticipant}
+          />
+          <p className="mt-2 text-[11px] leading-5 text-slate-500">
+            Remove a participant here to hide that person from this string, even if they came from a linked team.
+          </p>
         </section>
 
         <section>
           <div className="mb-3 flex items-center justify-between gap-2">
             <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500">
-              WorkForce Routing
+              Workforce Collaborations
             </p>
-            <span className="text-xs text-slate-500">{teams.length} teams</span>
+            <span className="text-xs text-slate-500">{linkedTeams.length} linked team{linkedTeams.length === 1 ? "" : "s"}</span>
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={onOpenAddMember}
-              className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2.5 text-xs font-semibold text-slate-100 transition duration-200 hover:bg-white/[0.08]"
-            >
-              <UserPlus size={14} />
-              Add Member
-            </button>
-            <button
-              type="button"
-              onClick={onOpenCreateTeam}
-              className="inline-flex items-center justify-center gap-2 rounded-xl border border-cyan-400/18 bg-cyan-400/10 px-3 py-2.5 text-xs font-semibold text-cyan-100 transition duration-200 hover:bg-cyan-400/15"
-            >
-              <Users size={14} />
-              Create Team
-            </button>
-          </div>
-
-          <div className="mt-4 rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500">
-                Teams
-              </p>
-              <span className="text-xs text-slate-500">{teams.length}</span>
-            </div>
-            <div className="mt-3">
-              <TeamSelector teams={teams} selectedTeamId={selectedTeamId} onSelect={onSelectTeam} />
-            </div>
-          </div>
-
-          {selectedTeam ? (
-            <div className="mt-4 rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
+          <div className="space-y-4">
+            <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
               <div className="flex items-center justify-between gap-2">
                 <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500">
-                  Routed Team Participants
+                  Teams
                 </p>
-                <span className="text-xs text-slate-500">{teamParticipants.length}</span>
+                <span className="text-xs text-slate-500">{teams.length}</span>
               </div>
-              <p className="mt-2 text-sm text-slate-300">
-                {selectedTeam.focus || "Route discussion or direction through this team."}
-              </p>
               <div className="mt-3">
-                <ParticipantList participants={teamParticipants} />
+                <TeamSelector
+                  teams={teams}
+                  selectedTeamId={teamPickerId || null}
+                  onSelect={setTeamPickerId}
+                />
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (teamPickerId) {
+                    onAddTeam(teamPickerId);
+                  }
+                }}
+                disabled={!canAddSelectedTeam}
+                className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2.5 text-xs font-semibold text-cyan-100 transition duration-200 hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Plus size={14} />
+                {selectedPickerTeam && linkedTeamIds.includes(selectedPickerTeam.id)
+                  ? "Team Already Added"
+                  : "Add Selected Team"}
+              </button>
             </div>
-          ) : null}
 
-          <div className="mt-4 rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
-            <p className="text-sm font-semibold text-slate-100">
-              {selectedTeam?.name ?? "Select a team"}
-            </p>
-            <p className="mt-1 text-sm leading-6 text-slate-400">
-              {selectedTeam?.focus ||
-                "Choose a team when you want to route this string for discussion or direction."}
-            </p>
+            <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                  Linked Teams
+                </p>
+                <span className="text-xs text-slate-500">{linkedTeams.length}</span>
+              </div>
+              {linkedTeams.length > 0 ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {linkedTeams.map((team) => (
+                    <span
+                      key={team.id}
+                      className="inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-[11px] text-cyan-100"
+                    >
+                      {team.name}
+                      <button
+                        type="button"
+                        onClick={() => onRemoveTeam(team.id)}
+                        className="rounded-full border border-cyan-400/20 bg-black/10 p-0.5 text-cyan-100 transition duration-200 hover:bg-black/20"
+                        aria-label={`Remove ${team.name} from string`}
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm leading-6 text-slate-500">
+                  No teams linked to this string yet.
+                </p>
+              )}
+            </div>
 
-            <div className="mt-4 grid gap-2.5">
-              <button
-                type="button"
-                onClick={onSendToTeam}
-                disabled={!canSendToTeam || sending}
-                className="inline-flex items-center justify-between rounded-xl border border-white/[0.08] bg-white px-4 py-3 text-sm font-semibold text-slate-950 transition duration-200 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <span>Send to Team</span>
-                <ArrowUpRight size={16} />
-              </button>
-              <button
-                type="button"
-                onClick={onDiscussWithTeam}
-                className="inline-flex items-center justify-between rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3 text-sm font-semibold text-slate-100 transition duration-200 hover:bg-white/[0.08]"
-              >
-                <span>Discuss with Team</span>
-                <MessageSquareText size={16} />
-              </button>
-              <button
-                type="button"
-                onClick={onSetDirection}
-                className="inline-flex items-center justify-between rounded-xl border border-amber-300/18 bg-amber-300/10 px-4 py-3 text-sm font-semibold text-amber-50 transition duration-200 hover:bg-amber-300/15"
-              >
-                <span>Set Direction</span>
-                <Target size={16} />
-              </button>
+            <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] p-4">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-slate-500">
+                  Direct Members
+                </p>
+                <span className="text-xs text-slate-500">{directParticipants.length}</span>
+              </div>
+              <div className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                <select
+                  value={participantPickerId}
+                  onChange={(event) => setParticipantPickerId(event.target.value)}
+                  className="min-w-0 rounded-xl border border-white/[0.08] bg-[#0b1220] px-3 py-2.5 text-sm text-slate-100 outline-none transition duration-200 focus:border-cyan-400/30"
+                >
+                  {availableParticipants.length === 0 ? (
+                    <option value="">No members available</option>
+                  ) : null}
+                  {availableParticipants.map((participant) => (
+                    <option key={participant.id} value={participant.id}>
+                      {participant.name} | {participant.role || "Contributor"}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (participantPickerId) {
+                      onAddParticipant(participantPickerId);
+                    }
+                  }}
+                  disabled={!participantPickerId}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-400/20 bg-emerald-400/10 px-3 py-2.5 text-xs font-semibold text-emerald-100 transition duration-200 hover:bg-emerald-400/15 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Plus size={14} />
+                  Add Member
+                </button>
+              </div>
+              {directParticipants.length > 0 ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {directParticipants.map((participant) => (
+                    <span
+                      key={participant.id}
+                      className="inline-flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1.5 text-[11px] text-emerald-100"
+                    >
+                      {participant.name}
+                      <button
+                        type="button"
+                        onClick={() => onRemoveParticipant(participant.id)}
+                        className="rounded-full border border-emerald-400/20 bg-black/10 p-0.5 text-emerald-100 transition duration-200 hover:bg-black/20"
+                        aria-label={`Remove ${participant.name} from string`}
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm leading-6 text-slate-500">
+                  No direct members linked yet.
+                </p>
+              )}
             </div>
           </div>
         </section>

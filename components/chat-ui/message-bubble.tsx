@@ -23,7 +23,12 @@ export function MessageBubble({ message, mode }: MessageBubbleProps) {
       : "border-white/[0.06] bg-white/[0.04] text-slate-200";
   const roleLabel = isUser
     ? "You"
-    : message.authorName || (message.error ? "System" : "Co-Founder Manager");
+    : message.authorName || (message.error ? "System" : "Main Agent");
+  const audienceLabel =
+    message.audience && message.audience.kind !== "everyone"
+      ? message.audience.label || message.audience.kind
+      : null;
+  const showTeamLabel = Boolean(message.teamLabel && message.teamLabel !== audienceLabel);
 
   return (
     <div className={`flex w-full ${wrapperClass}`}>
@@ -38,7 +43,7 @@ export function MessageBubble({ message, mode }: MessageBubbleProps) {
             {!isUser && message.authorRole ? (
               <span className="text-[10px] text-slate-500">{message.authorRole}</span>
             ) : null}
-            {message.teamLabel ? (
+            {showTeamLabel ? (
               <span className="rounded-full border border-white/[0.08] bg-black/10 px-2 py-0.5 text-[10px] text-slate-300">
                 {message.teamLabel}
               </span>
@@ -46,6 +51,23 @@ export function MessageBubble({ message, mode }: MessageBubbleProps) {
           </div>
           <time className="shrink-0 text-[10px] text-slate-500">{formatTime(message.createdAt)}</time>
         </div>
+        {audienceLabel || (message.mentions?.length ?? 0) > 0 ? (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            {audienceLabel ? (
+              <span className="rounded-full border border-white/[0.08] bg-black/10 px-2 py-0.5 text-[10px] text-slate-300">
+                To {audienceLabel}
+              </span>
+            ) : null}
+            {message.mentions?.map((mention) => (
+              <span
+                key={`${message.id}:${mention.kind}:${mention.id}`}
+                className="rounded-full border border-white/[0.08] bg-black/10 px-2 py-0.5 text-[10px] text-slate-300"
+              >
+                @{mention.handle}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <p className="whitespace-pre-wrap text-sm leading-6 [overflow-wrap:anywhere]">
           {message.content}
         </p>

@@ -2,10 +2,13 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 
-import { MemoryTier, Prisma } from "@prisma/client";
+import { HubFileType, MemoryTier, OrgRole, Prisma } from "@prisma/client";
 
 import type {
+  ChatAudience,
   ChatMessage,
+  ChatMention,
+  CollaboratorKind,
   ChatString,
   DirectionPayload,
   DirectionStep,
@@ -14,9 +17,19 @@ import type {
   MessageRouting,
   StringMode
 } from "@/components/chat-ui/types";
+import type {
+  AssistantMessageMeta,
+  WorkflowTaskStatus
+} from "@/src/types/chat";
 import { prisma } from "@/lib/db/prisma";
+import { readOrganizationCollaboration } from "@/lib/hub/organization-hub";
 
-type MemoryEntryClient = Pick<Prisma.TransactionClient, "memoryEntry"> | typeof prisma;
+type MemoryEntryClient = Pick<Prisma.TransactionClient, "memoryEntry" | "file"> | typeof prisma;
+
+interface StringAccessActor {
+  userId: string;
+  role?: OrgRole | "INTERNAL" | null;
+}
 
 export interface PersistedStringRecord extends ChatString {
   orgId: string;
@@ -34,6 +47,7 @@ interface SaveStringInput {
   planId?: string | null;
   selectedTeamId?: string | null;
   selectedTeamLabel?: string | null;
+  activeAudience?: ChatString["activeAudience"];
   source?: ChatString["source"];
   messages?: ChatMessage[];
   workspaceState?: ChatString["workspaceState"] | null;
@@ -41,6 +55,7 @@ interface SaveStringInput {
 
 const STRING_PREFIX = "string.record.";
 const DEFAULT_TITLE = "New string";
+const COMPANY_DATA_FILE_NAME = "Company Data";
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -90,6 +105,66 @@ function normalizeSource(
     return value;
   }
   return fallback ?? "workspace";
+}
+
+function normalizeCollaboratorKind(value: unknown): CollaboratorKind | undefined {
+  if (value === "AI") return "AI";
+  if (value === "HUMAN") return "HUMAN";
+  return undefined;
+}
+
+function normalizeAudience(value: unknown): ChatAudience | undefined {
+  const record = asRecord(value);
+  const kind =
+    record.kind === "team" || record.kind === "person" || record.kind === "everyone"
+      ? record.kind
+      : "";
+  const id = asNullableText(record.id);
+  const label = asNullableText(record.label);
+
+  if (!kind) {
+    return undefined;
+  }
+
+  return {
+    kind,
+    ...(id !== null ? { id } : {}),
+    ...(label !== null ? { label } : {})
+  };
+}
+
+function normalizeMention(value: unknown): ChatMention | null {
+  const record = asRecord(value);
+  const id = asText(record.id);
+  const label = asText(record.label);
+  const handle = asText(record.handle);
+  const kind = record.kind === "team" || record.kind === "person" ? record.kind : "";
+  const collaboratorKind = normalizeCollaboratorKind(record.collaboratorKind);
+
+  if (!id || !label || !handle || !kind) {
+    return null;
+  }
+
+  return {
+    id,
+    label,
+    handle,
+    kind,
+    ...(collaboratorKind ? { collaboratorKind } : {})
+  };
+}
+
+function normalizeMentions(value: unknown): ChatMention[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const mentions = value
+    .map((item) => normalizeMention(item))
+    .filter((item): item is ChatMention => Boolean(item))
+    .slice(0, 24);
+
+  return mentions.length > 0 ? mentions : undefined;
 }
 
 function normalizeMetrics(value: unknown): MessageMetrics | undefined {
@@ -192,28 +267,233 @@ function normalizeDirection(value: unknown): DirectionPayload | undefined {
   };
 }
 
+function normalizeWorkflowTaskStatus(value: unknown): WorkflowTaskStatus {
+  const normalized = asText(value).toUpperCase();
+  if (
+    normalized === "QUEUED" ||
+    normalized === "RUNNING" ||
+    normalized === "PAUSED" ||
+    normalized === "COMPLETED" ||
+    normalized === "FAILED" ||
+    normalized === "ABORTED" ||
+    normalized === "DRAFT" ||
+    normalized === "ACTIVE"
+  ) {
+    return normalized;
+  }
+  return "UNKNOWN";
+}
+
+function normalizeMessageMeta(value: unknown): AssistantMessageMeta | undefined {
+  const record = asRecord(value);
+  const kind = asText(record.kind);
+
+  if (kind === "thread_event") {
+    const title = asText(record.title);
+    const message = asText(record.message);
+    const eventName = asText(record.eventName);
+    const scope =
+      record.scope === "MODE" ||
+      record.scope === "MEMBERSHIP" ||
+      record.scope === "PLANNING" ||
+      record.scope === "EXECUTION" ||
+      record.scope === "COLLABORATION"
+        ? record.scope
+        : undefined;
+    const status = asText(record.status);
+    const timestamp = Number(record.timestamp);
+
+    if (!title && !message) {
+      return undefined;
+    }
+
+    return {
+      kind,
+      title: title || "Thread Update",
+      message: message || title,
+      ...(eventName ? { eventName } : {}),
+      ...(scope ? { scope } : {}),
+      ...(status ? { status } : {}),
+      ...(Number.isFinite(timestamp) && timestamp > 0 ? { timestamp: Math.round(timestamp) } : {})
+    };
+  }
+
+  if (kind === "workflow_event") {
+    const title = asText(record.title);
+    const message = asText(record.message);
+    const eventName = asText(record.eventName);
+    const flowId = asText(record.flowId);
+    const taskId = asText(record.taskId);
+    const status = asText(record.status);
+    const agentLabel = asText(record.agentLabel);
+    const timestamp = Number(record.timestamp);
+
+    if (!title && !message) {
+      return undefined;
+    }
+
+    return {
+      kind,
+      title: title || "Workflow Update",
+      message: message || title,
+      ...(eventName ? { eventName } : {}),
+      ...(flowId ? { flowId } : {}),
+      ...(taskId ? { taskId } : {}),
+      ...(status ? { status } : {}),
+      ...(agentLabel ? { agentLabel } : {}),
+      ...(Number.isFinite(timestamp) && timestamp > 0 ? { timestamp: Math.round(timestamp) } : {})
+    };
+  }
+
+  if (kind === "workflow_graph") {
+    const title = asText(record.title);
+    const flowId = asText(record.flowId);
+    const status = asText(record.status);
+    const updatedAt = asText(record.updatedAt);
+    const progress = Number(record.progress);
+    const taskCount = Number(record.taskCount);
+    const completedCount = Number(record.completedCount);
+    const tasks = (Array.isArray(record.tasks) ? record.tasks : [])
+      .map((item, index) => {
+        const task = asRecord(item);
+        const id = asText(task.id) || `task-${index + 1}`;
+        const title = asText(task.title);
+        if (!title) {
+          return null;
+        }
+        const agentLabel = asText(task.agentLabel);
+        const dependsOn = asStringArray(task.dependsOn, 8);
+        return {
+          id,
+          title,
+          status: normalizeWorkflowTaskStatus(task.status),
+          ...(agentLabel ? { agentLabel } : {}),
+          ...(dependsOn.length > 0 ? { dependsOn } : {})
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .slice(0, 20);
+
+    if (!title || !flowId) {
+      return undefined;
+    }
+
+    return {
+      kind,
+      title,
+      flowId,
+      ...(status ? { status } : {}),
+      ...(updatedAt ? { updatedAt } : {}),
+      ...(Number.isFinite(progress) ? { progress: Math.max(0, Math.min(100, Math.round(progress))) } : {}),
+      ...(Number.isFinite(taskCount) && taskCount >= 0 ? { taskCount: Math.round(taskCount) } : {}),
+      ...(Number.isFinite(completedCount) && completedCount >= 0
+        ? { completedCount: Math.round(completedCount) }
+        : {}),
+      tasks
+    };
+  }
+
+  if (kind === "plan_card") {
+    const title = asText(record.title);
+    const summary = asText(record.summary);
+    const detailScore = Number(record.detailScore);
+    const requiredToolkits = asStringArray(record.requiredToolkits, 20);
+    const workflows = (Array.isArray(record.workflows) ? record.workflows : [])
+      .map((item, workflowIndex) => {
+        const workflow = asRecord(item);
+        const workflowTitle = asText(workflow.title);
+        const tasks = (Array.isArray(workflow.tasks) ? workflow.tasks : [])
+          .map((taskValue, taskIndex) => {
+            const task = asRecord(taskValue);
+            const taskTitle = asText(task.title);
+            if (!taskTitle) {
+              return null;
+            }
+            const id = asText(task.id) || `wf${workflowIndex + 1}-task${taskIndex + 1}`;
+            const agentLabel = asText(task.agentLabel);
+            const dependsOn = asStringArray(task.dependsOn, 8);
+            return {
+              id,
+              title: taskTitle,
+              status: normalizeWorkflowTaskStatus(task.status),
+              ...(agentLabel ? { agentLabel } : {}),
+              ...(dependsOn.length > 0 ? { dependsOn } : {})
+            };
+          })
+          .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+          .slice(0, 20);
+
+        if (!workflowTitle) {
+          return null;
+        }
+
+        return {
+          title: workflowTitle,
+          ...(asText(workflow.goal) ? { goal: asText(workflow.goal) } : {}),
+          ...(asText(workflow.ownerRole) ? { ownerRole: asText(workflow.ownerRole) } : {}),
+          tasks
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .slice(0, 8);
+
+    if (!title && workflows.length === 0) {
+      return undefined;
+    }
+
+    return {
+      kind,
+      title: title || "Execution Plan",
+      ...(summary ? { summary } : {}),
+      ...(Number.isFinite(detailScore) ? { detailScore: Math.round(detailScore) } : {}),
+      ...(requiredToolkits.length > 0 ? { requiredToolkits } : {}),
+      workflows
+    };
+  }
+
+  return undefined;
+}
+
 function normalizeMessage(value: unknown, fallbackId: string, fallbackCreatedAt: string): ChatMessage {
   const record = asRecord(value);
   const content = asText(record.content);
   const metrics = normalizeMetrics(record.metrics);
   const routing = normalizeRouting(record.routing);
   const direction = normalizeDirection(record.direction);
+  const audience = normalizeAudience(record.audience);
+  const mentions = normalizeMentions(record.mentions);
+  const authorKind = normalizeCollaboratorKind(record.authorKind);
+  const meta = normalizeMessageMeta(record.meta);
+  const authorId = asText(record.authorId);
+  const authorName = asText(record.authorName);
+  const authorRole = asText(record.authorRole);
+  const teamId = audience?.kind === "person" ? null : asNullableText(record.teamId);
+  const teamLabel = audience?.kind === "person" ? null : asNullableText(record.teamLabel);
+  const normalizedAuthorName =
+    authorId === "main-agent" && authorName === "Co-Founder Manager" ? "Main Agent" : authorName;
+  const normalizedAuthorRole =
+    authorId === "main-agent" && authorRole === "Organization lead"
+      ? "Organization interface"
+      : authorRole;
 
   return {
     id: asText(record.id) || fallbackId,
     role: normalizeRole(record.role),
     content,
     createdAt: asText(record.createdAt) || fallbackCreatedAt,
-    ...(asText(record.authorName) ? { authorName: asText(record.authorName) } : {}),
-    ...(asText(record.authorRole) ? { authorRole: asText(record.authorRole) } : {}),
-    ...(asNullableText(record.teamId) !== null ? { teamId: asNullableText(record.teamId) } : {}),
-    ...(asNullableText(record.teamLabel) !== null
-      ? { teamLabel: asNullableText(record.teamLabel) }
-      : {}),
+    ...(authorId ? { authorId } : {}),
+    ...(normalizedAuthorName ? { authorName: normalizedAuthorName } : {}),
+    ...(normalizedAuthorRole ? { authorRole: normalizedAuthorRole } : {}),
+    ...(authorKind ? { authorKind } : {}),
+    ...(teamId !== null ? { teamId } : {}),
+    ...(teamLabel !== null ? { teamLabel } : {}),
+    ...(audience ? { audience } : {}),
+    ...(mentions ? { mentions } : {}),
     ...(record.error === true ? { error: true } : {}),
     ...(metrics ? { metrics } : {}),
     ...(routing ? { routing } : {}),
-    ...(direction ? { direction } : {})
+    ...(direction ? { direction } : {}),
+    ...(meta ? { meta } : {})
   };
 }
 
@@ -226,7 +506,11 @@ function normalizeMessages(value: unknown, fallbackCreatedAt: string) {
     .map((item, index) =>
       normalizeMessage(item, `message-${index + 1}`, fallbackCreatedAt)
     )
-    .filter((item) => item.content.length > 0 || item.direction);
+    .filter((item) => item.content.length > 0 || item.direction || item.meta);
+}
+
+function memberKey(userId: string) {
+  return `member:${userId}`;
 }
 
 function normalizeWorkspaceState(
@@ -258,11 +542,17 @@ function normalizeWorkspaceState(
         (value === "CENTER" || value === "APPROVED" || value === "RETHINK")
     )
   ) as Record<string, "CENTER" | "APPROVED" | "RETHINK">;
+  const linkedTeamIds = [...new Set(asStringArray(record.linkedTeamIds, 40))];
+  const linkedParticipantIds = [...new Set(asStringArray(record.linkedParticipantIds, 80))];
+  const excludedParticipantIds = [...new Set(asStringArray(record.excludedParticipantIds, 80))];
 
   if (
     !editableDraft &&
     scoreRecords.length === 0 &&
-    Object.keys(steerDecisions).length === 0
+    Object.keys(steerDecisions).length === 0 &&
+    linkedTeamIds.length === 0 &&
+    linkedParticipantIds.length === 0 &&
+    excludedParticipantIds.length === 0
   ) {
     return undefined;
   }
@@ -270,7 +560,10 @@ function normalizeWorkspaceState(
   return {
     ...(editableDraft ? { editableDraft } : {}),
     ...(scoreRecords.length > 0 ? { scoreRecords } : {}),
-    ...(Object.keys(steerDecisions).length > 0 ? { steerDecisions } : {})
+    ...(Object.keys(steerDecisions).length > 0 ? { steerDecisions } : {}),
+    ...(linkedTeamIds.length > 0 ? { linkedTeamIds } : {}),
+    ...(linkedParticipantIds.length > 0 ? { linkedParticipantIds } : {}),
+    ...(excludedParticipantIds.length > 0 ? { excludedParticipantIds } : {})
   };
 }
 
@@ -283,6 +576,110 @@ function sortStrings(strings: PersistedStringRecord[]) {
     const leftMs = new Date(left.updatedAt).getTime();
     const rightMs = new Date(right.updatedAt).getTime();
     return rightMs - leftMs;
+  });
+}
+
+async function listViewerTeamIds(
+  orgId: string,
+  userId: string,
+  client?: MemoryEntryClient
+) {
+  const db = client ?? prisma;
+  const companyDataFile = await db.file.findFirst({
+    where: {
+      orgId,
+      type: HubFileType.INPUT,
+      name: COMPANY_DATA_FILE_NAME
+    },
+    orderBy: {
+      updatedAt: "desc"
+    },
+    select: {
+      metadata: true
+    }
+  });
+
+  if (!companyDataFile) {
+    return new Set<string>();
+  }
+
+  const collaboration = readOrganizationCollaboration(companyDataFile.metadata);
+  return new Set(
+    collaboration.teams
+      .filter((team) => team.memberUserIds.includes(userId))
+      .map((team) => team.id)
+  );
+}
+
+function isViewerTeamParticipant(
+  teamId: string | null | undefined,
+  viewerTeamIds: Set<string>
+) {
+  return Boolean(teamId && viewerTeamIds.has(teamId));
+}
+
+function canActorAccessString(
+  record: PersistedStringRecord,
+  actor: StringAccessActor,
+  viewerTeamIds: Set<string>
+) {
+  if (actor.role === OrgRole.FOUNDER || actor.role === "INTERNAL") {
+    return true;
+  }
+
+  const viewerMemberId = memberKey(actor.userId);
+  const linkedParticipantIds = record.workspaceState?.linkedParticipantIds ?? [];
+  const linkedTeamIds = record.workspaceState?.linkedTeamIds ?? [];
+  const excludedParticipantIds = new Set(record.workspaceState?.excludedParticipantIds ?? []);
+
+  if (excludedParticipantIds.has(viewerMemberId)) {
+    return false;
+  }
+
+  if (record.createdByUserId === actor.userId || record.updatedByUserId === actor.userId) {
+    return true;
+  }
+
+  if (record.activeAudience?.kind === "person" && record.activeAudience.id === viewerMemberId) {
+    return true;
+  }
+
+  if (linkedParticipantIds.includes(viewerMemberId)) {
+    return true;
+  }
+
+  if (isViewerTeamParticipant(record.selectedTeamId, viewerTeamIds)) {
+    return true;
+  }
+
+  if (
+    record.activeAudience?.kind === "team" &&
+    isViewerTeamParticipant(record.activeAudience.id, viewerTeamIds)
+  ) {
+    return true;
+  }
+
+  if (linkedTeamIds.some((teamId) => viewerTeamIds.has(teamId))) {
+    return true;
+  }
+
+  return record.messages.some((message) => {
+    if (message.authorId === viewerMemberId) {
+      return true;
+    }
+
+    if (message.audience?.kind === "person" && message.audience.id === viewerMemberId) {
+      return true;
+    }
+
+    if (
+      message.audience?.kind === "team" &&
+      isViewerTeamParticipant(message.audience.id, viewerTeamIds)
+    ) {
+      return true;
+    }
+
+    return isViewerTeamParticipant(message.teamId, viewerTeamIds);
   });
 }
 
@@ -299,6 +696,7 @@ function parseStringRecord(
   const directionId = asNullableText(record.directionId);
   const planId = asNullableText(record.planId);
   const workspaceState = normalizeWorkspaceState(record.workspaceState);
+  const activeAudience = normalizeAudience(record.activeAudience);
 
   return {
     id,
@@ -311,6 +709,7 @@ function parseStringRecord(
     planId,
     selectedTeamId: asNullableText(record.selectedTeamId),
     selectedTeamLabel: asNullableText(record.selectedTeamLabel),
+    ...(activeAudience ? { activeAudience } : {}),
     source: normalizeSource(
       record.source,
       planId ? "plan" : directionId ? "direction" : "workspace"
@@ -402,52 +801,72 @@ async function findLegacyUserStringEntry(
 
 export async function listStrings(
   orgId: string,
-  userId: string,
+  actor: StringAccessActor,
   client?: MemoryEntryClient
 ) {
   const [sharedRows, legacyRows] = await Promise.all([
     listSharedStringEntries(orgId, client),
-    listLegacyUserStringEntries(orgId, userId, client)
+    listLegacyUserStringEntries(orgId, actor.userId, client)
   ]);
   const merged = new Map<string, PersistedStringRecord>();
 
   for (const row of sharedRows) {
-    const parsed = parseStringRecord(orgId, row.userId ?? userId, row.value);
+    const parsed = parseStringRecord(orgId, row.userId ?? actor.userId, row.value);
     merged.set(parsed.id, parsed);
   }
 
   for (const row of legacyRows) {
-    const parsed = parseStringRecord(orgId, row.userId ?? userId, row.value);
+    const parsed = parseStringRecord(orgId, row.userId ?? actor.userId, row.value);
     if (!merged.has(parsed.id)) {
       merged.set(parsed.id, parsed);
     }
   }
 
-  return sortStrings([...merged.values()]);
+  const allStrings = [...merged.values()];
+  if (actor.role === OrgRole.FOUNDER || actor.role === "INTERNAL") {
+    return sortStrings(allStrings);
+  }
+
+  const viewerTeamIds = await listViewerTeamIds(orgId, actor.userId, client);
+  return sortStrings(
+    allStrings.filter((record) => canActorAccessString(record, actor, viewerTeamIds))
+  );
 }
 
 export async function getString(
   orgId: string,
-  userId: string,
+  actor: StringAccessActor,
   stringId: string,
   client?: MemoryEntryClient
 ) {
   const shared = await findSharedStringEntry(orgId, stringId, client);
   if (shared) {
-    return parseStringRecord(orgId, shared.userId ?? userId, shared.value);
+    const record = parseStringRecord(orgId, shared.userId ?? actor.userId, shared.value);
+    if (actor.role === OrgRole.FOUNDER || actor.role === "INTERNAL") {
+      return record;
+    }
+
+    const viewerTeamIds = await listViewerTeamIds(orgId, actor.userId, client);
+    return canActorAccessString(record, actor, viewerTeamIds) ? record : null;
   }
 
-  const legacy = await findLegacyUserStringEntry(orgId, userId, stringId, client);
+  const legacy = await findLegacyUserStringEntry(orgId, actor.userId, stringId, client);
   if (!legacy) {
     return null;
   }
 
-  return parseStringRecord(orgId, legacy.userId ?? userId, legacy.value);
+  const record = parseStringRecord(orgId, legacy.userId ?? actor.userId, legacy.value);
+  if (actor.role === OrgRole.FOUNDER || actor.role === "INTERNAL") {
+    return record;
+  }
+
+  const viewerTeamIds = await listViewerTeamIds(orgId, actor.userId, client);
+  return canActorAccessString(record, actor, viewerTeamIds) ? record : null;
 }
 
 export async function saveString(
   orgId: string,
-  userId: string,
+  actor: StringAccessActor,
   input: SaveStringInput,
   client?: MemoryEntryClient
 ) {
@@ -457,12 +876,18 @@ export async function saveString(
   const stringId = requestedId || randomUUID();
   const [sharedExisting, legacyExisting] = await Promise.all([
     findSharedStringEntry(orgId, stringId, client),
-    findLegacyUserStringEntry(orgId, userId, stringId, client)
+    findLegacyUserStringEntry(orgId, actor.userId, stringId, client)
   ]);
   const existing = sharedExisting ?? legacyExisting;
   const current = existing
-    ? parseStringRecord(orgId, existing.userId ?? userId, existing.value)
+    ? parseStringRecord(orgId, existing.userId ?? actor.userId, existing.value)
     : null;
+  if (current && actor.role !== OrgRole.FOUNDER && actor.role !== "INTERNAL") {
+    const viewerTeamIds = await listViewerTeamIds(orgId, actor.userId, client);
+    if (!canActorAccessString(current, actor, viewerTeamIds)) {
+      throw new Error("String not found.");
+    }
+  }
   const createdAt = asText(input.createdAt) || current?.createdAt || now;
   const directionId =
     input.directionId !== undefined ? asNullableText(input.directionId) : current?.directionId ?? null;
@@ -485,6 +910,13 @@ export async function saveString(
       input.selectedTeamLabel !== undefined
         ? asNullableText(input.selectedTeamLabel)
         : current?.selectedTeamLabel ?? null,
+    ...(input.activeAudience !== undefined
+      ? normalizeAudience(input.activeAudience)
+        ? { activeAudience: normalizeAudience(input.activeAudience) }
+        : {}
+      : current?.activeAudience
+        ? { activeAudience: current.activeAudience }
+        : {}),
     source: normalizeSource(
       input.source,
       current?.source ?? (planId ? "plan" : directionId ? "direction" : "workspace")
@@ -496,8 +928,8 @@ export async function saveString(
       : current?.workspaceState
         ? { workspaceState: current.workspaceState }
         : {}),
-    createdByUserId: current?.createdByUserId ?? userId,
-    updatedByUserId: userId,
+    createdByUserId: current?.createdByUserId ?? actor.userId,
+    updatedByUserId: actor.userId,
     persisted: true,
     messages:
       input.messages !== undefined
@@ -511,7 +943,7 @@ export async function saveString(
         id: sharedExisting.id
       },
       data: {
-        userId,
+        userId: actor.userId,
         value: nextRecord as unknown as Prisma.InputJsonValue,
         redactedAt: null
       }
@@ -520,7 +952,7 @@ export async function saveString(
     await db.memoryEntry.create({
       data: {
         orgId,
-        userId,
+        userId: actor.userId,
         tier: MemoryTier.ORG,
         key: keyFromStringId(nextRecord.id),
         value: nextRecord as unknown as Prisma.InputJsonValue

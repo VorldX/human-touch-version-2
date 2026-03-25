@@ -134,6 +134,7 @@ import {
   initials,
   isApprovalReply,
   isGmailDirectionPrompt,
+  isTimelineEventMeta,
   isRecurringTaskPrompt,
   isRejectReply,
   makeDirectionTurnId,
@@ -154,6 +155,7 @@ import {
   workflowAgentLabelFromTaskTrace
 } from "@/components/vorldx-shell/shared";
 import { classifyEmailDraftReply } from "@/lib/agent/run/email-request-parser";
+import { TimelineEvent } from "@/components/system/timeline-event";
 import { SteerDetailsEditorSurface } from "@/components/vorldx-shell/surfaces/steer-details-editor-surface";
 import { StringCollaborationPanel } from "@/components/vorldx-shell/surfaces/string-collaboration-panel";
 
@@ -330,6 +332,10 @@ export function ControlDeckSurface({
     Number(Boolean(pendingEmailApproval)) +
     Number(agentRunResult?.status === "needs_input");
   const showCommandDraftPanel = false;
+  const turnTimestampFallback = useMemo(
+    () => Date.now() - Math.max(turns.length, 1),
+    [turns.length]
+  );
   const stringItems = useMemo(() => historyItems, [historyItems]);
   const isStringsView = surfaceTab === "STRINGS";
   const activeStringItem = useMemo(() => {
@@ -2178,28 +2184,39 @@ export function ControlDeckSurface({
             ) : null}
 
             <div className="vx-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#050910]/72 p-2.5 pb-24 pr-0 sm:p-3 sm:pb-28 sm:pr-1">
-              {turns.map((turn) => (
-                <div
-                  key={turn.id}
-                  className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.35)] backdrop-blur sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
-                    turn.role === "owner"
-                      ? "ml-auto border-cyan-300/55 bg-cyan-500/22 text-white shadow-[0_14px_34px_rgba(34,211,238,0.2)]"
-                      : "mr-auto border-slate-500/55 bg-[#0b1220] text-slate-100"
-                  }`}
-                >
-                  <p
-                    className={`text-xs font-semibold ${
-                      turn.role === "owner" ? "text-cyan-100" : "text-slate-300"
+              {turns.map((turn, index) =>
+                isTimelineEventMeta(turn.meta) ? (
+                  <TimelineEvent
+                    key={turn.id}
+                    meta={turn.meta}
+                    fallbackText={turn.content}
+                    timestampLabel={new Date(
+                      inferTurnTimestamp(turn, index, turnTimestampFallback)
+                    ).toLocaleString()}
+                  />
+                ) : (
+                  <div
+                    key={turn.id}
+                    className={`max-w-full rounded-2xl border px-3 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.35)] backdrop-blur sm:max-w-[94%] sm:px-4 sm:py-3.5 ${
+                      turn.role === "owner"
+                        ? "ml-auto border-cyan-300/55 bg-cyan-500/22 text-white shadow-[0_14px_34px_rgba(34,211,238,0.2)]"
+                        : "mr-auto border-slate-500/55 bg-[#0b1220] text-slate-100"
                     }`}
                   >
-                    {turn.role === "owner" ? "You" : "Organization"}
-                    {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
-                  </p>
-                  <p className="mt-1.5 whitespace-pre-wrap break-words font-sans text-[12px] leading-5 tracking-normal text-slate-50 [overflow-wrap:anywhere]">
-                    {turn.content}
-                  </p>
-                </div>
-              ))}
+                    <p
+                      className={`text-xs font-semibold ${
+                        turn.role === "owner" ? "text-cyan-100" : "text-slate-300"
+                      }`}
+                    >
+                      {turn.role === "owner" ? "You" : "Organization"}
+                      {turn.modelLabel ? ` | ${turn.modelLabel}` : ""}
+                    </p>
+                    <p className="mt-1.5 whitespace-pre-wrap break-words font-sans text-[12px] leading-5 tracking-normal text-slate-50 [overflow-wrap:anywhere]">
+                      {turn.content}
+                    </p>
+                  </div>
+                )
+              )}
             </div>
           </div>
         )}

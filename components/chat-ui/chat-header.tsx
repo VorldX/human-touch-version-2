@@ -11,6 +11,8 @@ interface ChatHeaderProps {
   stringPanelOpen: boolean;
   stringPanelPinned?: boolean;
   selectedTeamLabel: string | null;
+  audienceLabel?: string | null;
+  audienceKind?: "everyone" | "team" | "person";
   statusText?: string | null;
   statusTone?: "neutral" | "error";
   onTitleChange: (value: string) => void;
@@ -26,6 +28,8 @@ export function ChatHeader({
   stringPanelOpen,
   stringPanelPinned = false,
   selectedTeamLabel,
+  audienceLabel,
+  audienceKind = "everyone",
   statusText,
   statusTone = "neutral",
   onTitleChange,
@@ -36,7 +40,7 @@ export function ChatHeader({
 }: ChatHeaderProps) {
   return (
     <header className="shrink-0 border-b border-white/[0.06] bg-[#0f172a]/96 px-3 sm:px-4">
-      <div className="grid h-14 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3">
+      <div className="grid h-14 grid-cols-[minmax(0,1fr)_minmax(140px,280px)_minmax(0,1fr)] items-center gap-2 sm:gap-3">
         <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           <button
             type="button"
@@ -47,18 +51,10 @@ export function ChatHeader({
             <Menu size={16} />
           </button>
 
-          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
-            <input
-              value={title}
-              onBlur={onTitleBlur}
-              onChange={(event) => onTitleChange(event.target.value)}
-              placeholder="Untitled string"
-              className="h-9 w-full min-w-0 max-w-[220px] rounded-xl border border-transparent bg-transparent px-2.5 text-sm font-medium text-slate-200 outline-none transition duration-200 placeholder:text-slate-500 focus:border-white/[0.08] focus:bg-white/[0.04]"
-            />
-
+          <div className="hidden min-w-0 flex-1 items-center gap-2 lg:flex">
             {statusText ? (
               <span
-                className={`hidden max-w-[220px] truncate rounded-full border px-2.5 py-1 text-[11px] xl:inline-flex ${
+                className={`max-w-[220px] truncate rounded-full border px-2.5 py-1 text-[11px] ${
                   statusTone === "error"
                     ? "border-rose-500/20 bg-rose-500/10 text-rose-200"
                     : "border-white/[0.08] bg-white/[0.04] text-slate-400"
@@ -67,15 +63,33 @@ export function ChatHeader({
                 {statusText}
               </span>
             ) : null}
+
+            {audienceLabel || selectedTeamLabel ? (
+              <span
+                className={`max-w-[220px] truncate rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+                  audienceKind === "person"
+                    ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-100"
+                    : "border-cyan-400/20 bg-cyan-400/10 text-cyan-100"
+                }`}
+              >
+                {audienceLabel
+                  ? `To ${audienceLabel}`
+                  : selectedTeamLabel
+                    ? `Team ${selectedTeamLabel}`
+                    : null}
+              </span>
+            ) : null}
           </div>
         </div>
 
-        <div className="flex items-center justify-center px-2">
-          {selectedTeamLabel ? (
-            <span className="hidden max-w-[220px] truncate rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-1 text-[11px] font-medium text-cyan-100 sm:inline-flex">
-              {selectedTeamLabel}
-            </span>
-          ) : null}
+        <div className="flex min-w-0 items-center justify-center px-1">
+          <input
+            value={title}
+            onBlur={onTitleBlur}
+            onChange={(event) => onTitleChange(event.target.value)}
+            placeholder="Untitled string"
+            className="h-9 w-full min-w-0 rounded-xl border border-transparent bg-transparent px-2 text-center text-sm font-semibold text-slate-100 outline-none transition duration-200 placeholder:text-slate-500 focus:border-white/[0.08] focus:bg-white/[0.04]"
+          />
         </div>
 
         <div className="flex min-w-0 items-center justify-end gap-2">

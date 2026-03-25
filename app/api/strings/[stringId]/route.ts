@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import { FlowStatus, LogType, MemoryTier, TaskStatus } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 
-import type { ChatMessage } from "@/components/chat-ui/types";
+import type { ChatAudience, ChatMessage } from "@/components/chat-ui/types";
 import { prisma } from "@/lib/db/prisma";
 import { listDirectionFlowLinksByDirection } from "@/lib/direction/directions";
 import { publishRealtimeEvent } from "@/lib/realtime/publish";
@@ -133,7 +133,14 @@ export async function GET(
   }
 
   try {
-    const record = await getString(orgId, access.actor.userId, stringId);
+    const record = await getString(
+      orgId,
+      {
+        userId: access.actor.userId,
+        role: access.actor.role ?? null
+      },
+      stringId
+    );
     if (!record) {
       return NextResponse.json(
         {
@@ -176,6 +183,7 @@ export async function PATCH(
         planId?: string | null;
         selectedTeamId?: string | null;
         selectedTeamLabel?: string | null;
+        activeAudience?: ChatAudience | null;
         source?: "workspace" | "direction" | "plan";
         workspaceState?: Record<string, unknown> | null;
         messages?: unknown;
@@ -199,7 +207,13 @@ export async function PATCH(
   }
 
   try {
-    const record = await saveString(orgId, access.actor.userId, {
+    const record = await saveString(
+      orgId,
+      {
+        userId: access.actor.userId,
+        role: access.actor.role ?? null
+      },
+      {
       id: stringId,
       title: body?.title,
       mode: body?.mode,
@@ -209,6 +223,7 @@ export async function PATCH(
       planId: body?.planId,
       selectedTeamId: body?.selectedTeamId,
       selectedTeamLabel: body?.selectedTeamLabel,
+      activeAudience: body?.activeAudience ?? undefined,
       source: body?.source,
       workspaceState:
         body?.workspaceState &&
@@ -217,13 +232,23 @@ export async function PATCH(
           ? body.workspaceState
           : undefined,
       messages: Array.isArray(body?.messages) ? (body.messages as ChatMessage[]) : undefined
-    });
+      }
+    );
 
     return NextResponse.json({
       ok: true,
       string: record
     });
   } catch (error) {
+    if (error instanceof Error && error.message === "String not found.") {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: error.message
+        },
+        { status: 404 }
+      );
+    }
     console.error("[api/strings/[stringId]][PATCH] unexpected error", error);
     return NextResponse.json(
       {
@@ -275,7 +300,14 @@ export async function POST(
   }
 
   try {
-    const record = await getString(orgId, access.actor.userId, stringId);
+    const record = await getString(
+      orgId,
+      {
+        userId: access.actor.userId,
+        role: access.actor.role ?? null
+      },
+      stringId
+    );
     if (!record) {
       return NextResponse.json(
         {
@@ -460,7 +492,14 @@ export async function DELETE(
   }
 
   try {
-    const record = await getString(orgId, access.actor.userId, stringId);
+    const record = await getString(
+      orgId,
+      {
+        userId: access.actor.userId,
+        role: access.actor.role ?? null
+      },
+      stringId
+    );
     if (!record) {
       return NextResponse.json(
         {

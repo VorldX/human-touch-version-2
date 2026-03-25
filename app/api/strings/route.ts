@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 
-import type { ChatMessage } from "@/components/chat-ui/types";
+import type { ChatAudience, ChatMessage } from "@/components/chat-ui/types";
 import { listStrings, saveString } from "@/lib/strings/store";
 import { requireOrgAccess } from "@/lib/security/org-access";
 
@@ -28,7 +28,10 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const strings = await listStrings(orgId, access.actor.userId);
+    const strings = await listStrings(orgId, {
+      userId: access.actor.userId,
+      role: access.actor.role ?? null
+    });
     return NextResponse.json({
       ok: true,
       strings
@@ -58,6 +61,7 @@ export async function POST(request: NextRequest) {
         planId?: string | null;
         selectedTeamId?: string | null;
         selectedTeamLabel?: string | null;
+        activeAudience?: ChatAudience | null;
         source?: "workspace" | "direction" | "plan";
         workspaceState?: Record<string, unknown> | null;
         messages?: unknown;
@@ -81,7 +85,10 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const record = await saveString(orgId, access.actor.userId, {
+    const record = await saveString(orgId, {
+      userId: access.actor.userId,
+      role: access.actor.role ?? null
+    }, {
       id: body?.id,
       title: body?.title,
       mode: body?.mode,
@@ -91,6 +98,7 @@ export async function POST(request: NextRequest) {
       planId: body?.planId,
       selectedTeamId: body?.selectedTeamId,
       selectedTeamLabel: body?.selectedTeamLabel,
+      activeAudience: body?.activeAudience ?? undefined,
       source: body?.source,
       workspaceState:
         body?.workspaceState &&
@@ -106,6 +114,15 @@ export async function POST(request: NextRequest) {
       string: record
     });
   } catch (error) {
+    if (error instanceof Error && error.message === "String not found.") {
+      return NextResponse.json(
+        {
+          ok: false,
+          message: error.message
+        },
+        { status: 404 }
+      );
+    }
     console.error("[api/strings][POST] unexpected error", error);
     return NextResponse.json(
       {

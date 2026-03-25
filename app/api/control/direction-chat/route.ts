@@ -1,6 +1,6 @@
 export const dynamic = "force-dynamic";
 
-import { randomInt, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 
@@ -83,21 +83,19 @@ interface DirectionDraftSession {
 
 const directionDraftSessions = new Map<string, DirectionDraftSession>();
 
-const GREETING_RESPONSES = [
-  "Hello. I am the Organization for VorldX.io, an advanced technology platform building intelligent digital ecosystems. How may I assist you?",
-  "Hello. Welcome to VorldX.io, an advanced technology platform building intelligent digital ecosystems. How may I assist you today?",
-  "Greetings. I am the Organization for VorldX.io, here to help you explore our intelligent digital ecosystem. How may I assist you?",
-  "Hello. You are connected with VorldX.io, an advanced platform for intelligent digital ecosystems. How may I assist you?",
-  "Welcome to VorldX.io. I am the Organization for our intelligent digital ecosystem platform. How may I assist you today?",
-  "Hello. This is VorldX.io, an advanced technology platform focused on building intelligent digital ecosystems. How may I assist you?",
-  "Greetings from VorldX.io. I am the Organization for our advanced intelligent digital ecosystem platform. How may I assist you today?",
-  "Hello and welcome to VorldX.io. I am the Organization for our platform building intelligent digital ecosystems. How may I assist you?",
-  "Hello. You have reached VorldX.io, an advanced technology platform creating intelligent digital ecosystems. How may I assist you today?",
-  "Welcome. I am the Organization for VorldX.io, where we build intelligent digital ecosystems through advanced technology. How may I assist you?"
-] as const;
-
 function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function safeStringList(value: unknown, limit: number, maxChars: number) {
+  if (!Array.isArray(value)) {
+    return [] as string[];
+  }
+
+  return value
+    .map((item) => clampText(cleanText(item), maxChars))
+    .filter(Boolean)
+    .slice(0, limit);
 }
 
 function clampText(value: string, maxChars: number) {
@@ -252,8 +250,9 @@ function summarizeGmailToolResponse(input: {
   return `${header}\n${preview.join("\n")}`;
 }
 
-function pickGreetingResponse() {
-  return GREETING_RESPONSES[randomInt(0, GREETING_RESPONSES.length)];
+function buildGreetingResponse(orgName: string) {
+  const workspaceName = cleanText(orgName) || "this workspace";
+  return `Hello. You're connected to ${workspaceName}. How can I help today?`;
 }
 
 function toolkitLabel(slug: string) {
@@ -673,6 +672,9 @@ export async function POST(request: NextRequest) {
           orgId?: string;
           message?: string;
           history?: unknown;
+          teamLabel?: string;
+          audienceLabel?: string;
+          mentionLabels?: unknown;
           provider?: string;
           model?: string;
         }
@@ -680,6 +682,9 @@ export async function POST(request: NextRequest) {
 
     const orgId = cleanText(body?.orgId);
     const message = clampText(cleanText(body?.message), MAX_OWNER_MESSAGE_CHARS);
+    const teamLabel = clampText(cleanText(body?.teamLabel), 120);
+    const audienceLabel = clampText(cleanText(body?.audienceLabel), 120);
+    const mentionLabels = safeStringList(body?.mentionLabels, 8, 80);
     const provider = cleanText(body?.provider);
     const model = cleanText(body?.model);
     const history = safeHistory(body?.history);
@@ -730,7 +735,7 @@ export async function POST(request: NextRequest) {
     if (history.length === 0 && isSimpleGreeting(message)) {
       return NextResponse.json({
         ok: true,
-        reply: pickGreetingResponse(),
+        reply: buildGreetingResponse(org.name),
         directionCandidate: "",
         intentRouting: {
           route: "CHAT_RESPONSE",
@@ -1174,6 +1179,12 @@ export async function POST(request: NextRequest) {
         (entry) => `${entry.role === "owner" ? "Owner" : "Organization"}: ${entry.content}`
       ),
       `Owner: ${message}`,
+      "",
+      audienceLabel ? `Current audience: ${audienceLabel}` : "Current audience: everyone",
+      teamLabel ? `Current routed team: ${teamLabel}` : "Current routed team: none",
+      mentionLabels.length > 0
+        ? `Mentioned teammates or teams: ${mentionLabels.join(", ")}`
+        : "Mentioned teammates or teams: none",
       "",
       companyContext ? `Company context excerpt:\n${companyContext}` : "Company context: unavailable.",
       dnaContext ? `DNA context excerpt:\n${dnaContext}` : "DNA context: unavailable.",

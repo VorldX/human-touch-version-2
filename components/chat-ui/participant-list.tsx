@@ -4,6 +4,7 @@ import type { Collaborator } from "@/components/chat-ui/types";
 
 interface ParticipantListProps {
   participants: Collaborator[];
+  onRemoveParticipant?: (participantId: string) => void;
 }
 
 function initials(name: string) {
@@ -14,7 +15,7 @@ function initials(name: string) {
     .join("");
 }
 
-export function ParticipantList({ participants }: ParticipantListProps) {
+export function ParticipantList({ participants, onRemoveParticipant }: ParticipantListProps) {
   if (participants.length === 0) {
     return (
       <div className="rounded-2xl border border-dashed border-white/10 bg-black/15 px-4 py-6 text-sm leading-6 text-slate-500">
@@ -45,7 +46,28 @@ export function ParticipantList({ participants }: ParticipantListProps) {
             <p className="truncate text-xs text-slate-400">
               {participant.role || "Contributor"} | {participant.kind === "AI" ? "AI" : "Human"}
             </p>
+            {participant.teamNames && participant.teamNames.length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {participant.teamNames.map((teamName) => (
+                  <span
+                    key={`${participant.id}-${teamName}`}
+                    className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5 text-[10px] text-cyan-100"
+                  >
+                    {teamName}
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </div>
+          {onRemoveParticipant ? (
+            <button
+              type="button"
+              onClick={() => onRemoveParticipant(participant.id)}
+              className="shrink-0 rounded-full border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-[10px] font-semibold text-rose-100 transition duration-200 hover:bg-rose-500/15"
+            >
+              Remove
+            </button>
+          ) : null}
         </div>
       ))}
     </div>

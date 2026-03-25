@@ -4,12 +4,13 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Plus, Search, X } from "lucide-react";
 
 import { ChatHistoryItem } from "@/components/chat-ui/chat-history-item";
-import type { ChatString } from "@/components/chat-ui/types";
+import type { ChatString, Team } from "@/components/chat-ui/types";
 
 interface SidebarProps {
   open: boolean;
   searchQuery: string;
   chats: ChatString[];
+  teams: Team[];
   activeChatId: string | null;
   onSearchQueryChange: (value: string) => void;
   onSelectChat: (chatId: string) => void;
@@ -21,6 +22,7 @@ export function Sidebar({
   open,
   searchQuery,
   chats,
+  teams,
   activeChatId,
   onSearchQueryChange,
   onSelectChat,
@@ -31,11 +33,8 @@ export function Sidebar({
     <div className="flex h-full min-h-0 flex-col rounded-[22px] border border-white/[0.06] bg-[#0f172a] p-3.5 shadow-[0_14px_36px_rgba(2,6,23,0.3)]">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-slate-500">
-            History
-          </p>
           <h2 className="mt-1 text-lg font-semibold tracking-[-0.02em] text-slate-100">
-            Strings
+            Organizational Strings
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -62,7 +61,7 @@ export function Sidebar({
         <input
           value={searchQuery}
           onChange={(event) => onSearchQueryChange(event.target.value)}
-          placeholder="Search strings..."
+          placeholder="Search organizational strings..."
           className="w-full bg-transparent text-sm text-slate-200 outline-none placeholder:text-slate-500"
         />
       </label>
@@ -77,6 +76,7 @@ export function Sidebar({
             <ChatHistoryItem
               key={chat.id}
               chat={chat}
+              teams={teams}
               active={chat.id === activeChatId}
               onSelect={onSelectChat}
             />

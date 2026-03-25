@@ -9,9 +9,12 @@ import { CollaborationPanel } from "@/components/chat-ui/collaboration-panel";
 import { Sidebar } from "@/components/chat-ui/sidebar";
 import { StringPanel } from "@/components/chat-ui/string-panel";
 import type {
+  ChatAudience,
   ChatMessage,
+  ChatMention,
   ChatString,
   Collaborator,
+  CollaboratorKind,
   DirectionPayload,
   MessageRouting,
   StringMode,
@@ -20,9 +23,24 @@ import type {
 
 const DEFAULT_CHAT_TITLE = "New string";
 const HISTORY_LIMIT = 10;
-const COFOUNDER_MANAGER_NAME = "Co-Founder Manager";
-const COFOUNDER_MANAGER_ROLE = "Organization lead";
+const COFOUNDER_MANAGER_NAME = "Main Agent";
+const COFOUNDER_MANAGER_ROLE = "Organization interface";
 const STRINGS_UPDATED_EVENT = "vx:strings-updated";
+const DEFAULT_CHAT_AUDIENCE: ChatAudience = { kind: "everyone" };
+
+interface MentionableEntity {
+  id: string;
+  label: string;
+  handle: string;
+  kind: "team" | "person";
+  collaboratorKind?: CollaboratorKind;
+}
+
+interface AudienceOption {
+  value: string;
+  label: string;
+  group: "General" | "Teams" | "People";
+}
 
 interface JsonEnvelope {
   ok?: boolean;
@@ -100,10 +118,13 @@ interface HubPersonnelRecord {
   status: string;
 }
 
+type OrgActorRole = "FOUNDER" | "ADMIN" | "EMPLOYEE" | "INTERNAL";
+
 interface HubOrganizationResponse extends JsonEnvelope {
   actor?: {
     userId?: string;
     activeTeamId?: string | null;
+    role?: OrgActorRole | null;
   };
   members?: HubMemberRecord[];
   personnel?: HubPersonnelRecord[];
@@ -166,6 +187,10 @@ interface DirectionPlanApiResponse extends JsonEnvelope {
   } | null;
 }
 
+interface ParticipantRepliesApiResponse extends JsonEnvelope {
+  replies?: ChatMessage[];
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -176,6 +201,41 @@ function createId(prefix: string) {
   }
 
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36)}`;
+}
+
+function modeLabel(mode: StringMode) {
+  return mode === "direction" ? "Direction" : "Discussion";
+}
+
+function createTimelineEventMessage(input: {
+  title: string;
+  message: string;
+  content?: string;
+  eventName: string;
+  scope: "MODE" | "MEMBERSHIP" | "PLANNING" | "EXECUTION" | "COLLABORATION";
+  status?: string;
+  createdAt?: string;
+}): ChatMessage {
+  const createdAt = input.createdAt ?? nowIso();
+  const timestamp = new Date(createdAt).getTime();
+
+  return {
+    id: createId("timeline"),
+    role: "system",
+    content: input.content?.trim() || input.title,
+    createdAt,
+    authorName: "System",
+    authorRole: "Timeline update",
+    meta: {
+      kind: "thread_event",
+      title: input.title,
+      message: input.message,
+      eventName: input.eventName,
+      scope: input.scope,
+      ...(input.status ? { status: input.status } : {}),
+      ...(Number.isFinite(timestamp) && timestamp > 0 ? { timestamp } : {})
+    }
+  };
 }
 
 function memberKey(userId: string) {
@@ -230,10 +290,189 @@ function createEmptyChat(team: Team | null): ChatString {
     createdAt: timestamp,
     selectedTeamId: team?.id ?? null,
     selectedTeamLabel: team?.name ?? null,
+    activeAudience: DEFAULT_CHAT_AUDIENCE,
     source: "workspace",
     persisted: false,
     messages: []
   };
+}
+
+function normalizeAudience(
+  audience: ChatAudience | null | undefined,
+  teams: Team[],
+  collaborators: Collaborator[]
+): ChatAudience {
+  if (!audience || audience.kind === "everyone") {
+    return DEFAULT_CHAT_AUDIENCE;
+  }
+
+  if (audience.kind === "team") {
+    const team = teams.find((item) => item.id === audience.id) ?? null;
+    return team
+      ? {
+          kind: "team",
+          id: team.id,
+          label: team.name
+        }
+      : DEFAULT_CHAT_AUDIENCE;
+  }
+
+  const collaborator = collaborators.find((item) => item.id === audience.id) ?? null;
+  return collaborator
+    ? {
+        kind: "person",
+        id: collaborator.id,
+        label: collaborator.name
+      }
+    : DEFAULT_CHAT_AUDIENCE;
+}
+
+function audienceToValue(audience: ChatAudience | null | undefined) {
+  if (audience?.kind === "team" && audience.id) {
+    return `team:${audience.id}`;
+  }
+  if (audience?.kind === "person" && audience.id) {
+    return `person:${audience.id}`;
+  }
+  return "everyone";
+}
+
+function buildAudienceOptions(input: {
+  teams: Team[];
+  collaborators: Collaborator[];
+  actorMemberId: string | null;
+}): AudienceOption[] {
+  const options: AudienceOption[] = [
+    {
+      value: "everyone",
+      label: "Everyone",
+      group: "General"
+    }
+  ];
+
+  options.push(
+    ...input.teams.map((team) => ({
+      value: `team:${team.id}`,
+      label: team.name,
+      group: "Teams" as const
+    }))
+  );
+
+  options.push(
+    ...input.collaborators
+      .filter((collaborator) => collaborator.id !== input.actorMemberId)
+      .map((collaborator) => ({
+        value: `person:${collaborator.id}`,
+        label: collaborator.name,
+        group: "People" as const
+      }))
+  );
+
+  return options;
+}
+
+function slugifyHandle(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+}
+
+function uniqueHandle(baseLabel: string, used: Set<string>, fallbackPrefix: string) {
+  const base = slugifyHandle(baseLabel) || fallbackPrefix;
+  let candidate = base;
+  let counter = 2;
+  while (used.has(candidate)) {
+    candidate = `${base}-${counter}`;
+    counter += 1;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function buildMentionables(input: {
+  teams: Team[];
+  collaborators: Collaborator[];
+}): MentionableEntity[] {
+  const usedHandles = new Set<string>();
+  const teamMentionables = input.teams.map((team) => ({
+    id: team.id,
+    label: team.name,
+    handle: uniqueHandle(team.name, usedHandles, "team"),
+    kind: "team" as const
+  }));
+  const collaboratorMentionables = input.collaborators.map((collaborator) => ({
+    id: collaborator.id,
+    label: collaborator.name,
+    handle: uniqueHandle(collaborator.name, usedHandles, collaborator.kind === "AI" ? "agent" : "person"),
+    kind: "person" as const,
+    ...(collaborator.kind ? { collaboratorKind: collaborator.kind } : {})
+  }));
+
+  return [...teamMentionables, ...collaboratorMentionables];
+}
+
+function currentMentionQuery(value: string) {
+  const match = value.match(/(?:^|\s)@([a-z0-9._-]*)$/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function resolveMentions(value: string, mentionables: MentionableEntity[]): ChatMention[] {
+  const matches = [...value.matchAll(/(?:^|\s)@([a-z0-9][a-z0-9._-]*)/gi)];
+  const byHandle = new Map(mentionables.map((item) => [item.handle.toLowerCase(), item] as const));
+  const seen = new Set<string>();
+
+  return matches
+    .map((match) => match[1]?.toLowerCase() ?? "")
+    .filter((handle) => {
+      if (!handle || seen.has(handle)) {
+        return false;
+      }
+      seen.add(handle);
+      return true;
+    })
+    .map((handle) => {
+      const entity = byHandle.get(handle);
+      if (!entity) {
+        return null;
+      }
+      return {
+        id: entity.id,
+        label: entity.label,
+        handle: entity.handle,
+        kind: entity.kind,
+        ...(entity.collaboratorKind ? { collaboratorKind: entity.collaboratorKind } : {})
+      } satisfies ChatMention;
+    })
+    .filter((item): item is ChatMention => Boolean(item));
+}
+
+function insertMention(value: string, handle: string) {
+  const nextToken = `@${handle} `;
+  if (!value.trim()) {
+    return nextToken;
+  }
+  if (/(?:^|\s)@([a-z0-9._-]*)$/i.test(value)) {
+    return value.replace(/(?:^|\s)@([a-z0-9._-]*)$/i, (match) => {
+      const prefix = match.startsWith(" ") ? " " : "";
+      return `${prefix}${nextToken}`;
+    });
+  }
+  return `${value}${value.endsWith(" ") ? "" : " "}${nextToken}`;
+}
+
+function buildParticipantHistory(messages: ChatMessage[]) {
+  return messages
+    .filter((message) => message.meta?.kind !== "thread_event" && message.meta?.kind !== "workflow_event")
+    .slice(-HISTORY_LIMIT)
+    .map((message) => ({
+      role: message.role,
+      content: message.content.slice(0, 1200),
+      ...(message.authorName ? { authorName: message.authorName } : {}),
+      ...(message.authorRole ? { authorRole: message.authorRole } : {}),
+      ...(message.teamLabel ? { teamLabel: message.teamLabel } : {})
+    }));
 }
 
 function toDirectionPayload(
@@ -296,10 +535,13 @@ function toDirectionPayload(
 }
 
 function toHistory(messages: ChatMessage[]) {
-  return messages.slice(-HISTORY_LIMIT).map((message) => ({
-    role: message.role === "user" ? "owner" : "organization",
-    content: message.content.slice(0, 1200)
-  }));
+  return messages
+    .filter((message) => message.meta?.kind !== "thread_event" && message.meta?.kind !== "workflow_event")
+    .slice(-HISTORY_LIMIT)
+    .map((message) => ({
+      role: message.role === "user" ? "owner" : "organization",
+      content: message.content.slice(0, 1200)
+    }));
 }
 
 async function parseResponse<T>(response: Response) {
@@ -336,6 +578,21 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
   const members = Array.isArray(payload.members) ? payload.members : [];
   const personnel = Array.isArray(payload.personnel) ? payload.personnel : [];
   const teamRows = Array.isArray(payload.collaboration?.teams) ? payload.collaboration?.teams : [];
+  const teamNamesByMemberId = new Map<string, string[]>();
+
+  for (const team of teamRows) {
+    const memberIds = [
+      ...(team.memberUserIds ?? []).map((userId) => memberKey(userId)),
+      ...(team.personnelIds ?? [])
+    ];
+
+    for (const memberId of memberIds) {
+      const current = teamNamesByMemberId.get(memberId) ?? [];
+      if (!current.includes(team.name)) {
+        teamNamesByMemberId.set(memberId, [...current, team.name]);
+      }
+    }
+  }
 
   const collaborators: Collaborator[] = [
     ...members.map((member) => ({
@@ -345,7 +602,10 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
       role: member.roleLabel || "Member",
       kind: "HUMAN" as const,
       online: member.isActiveOrganization ?? true,
-      source: "presence" as const
+      source: "presence" as const,
+      ...(teamNamesByMemberId.get(memberKey(member.userId))?.length
+        ? { teamNames: teamNamesByMemberId.get(memberKey(member.userId)) }
+        : {})
     })),
     ...personnel.map((person) => ({
       id: person.id,
@@ -354,7 +614,10 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
       role: person.role,
       kind: person.type === "AI" ? ("AI" as const) : ("HUMAN" as const),
       online: person.status !== "DISABLED",
-      source: "squad" as const
+      source: "squad" as const,
+      ...(teamNamesByMemberId.get(person.id)?.length
+        ? { teamNames: teamNamesByMemberId.get(person.id) }
+        : {})
     }))
   ];
 
@@ -368,7 +631,7 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
     ],
     createdAt: team.createdAt,
     updatedAt: team.updatedAt,
-    focus: team.description || "Collaboration routing"
+    focus: team.description || "Workforce collaboration"
   }));
 
   return {
@@ -376,6 +639,7 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
     teams,
     actorUserId: payload.actor?.userId?.trim() || null,
     actorMemberId: payload.actor?.userId ? memberKey(payload.actor.userId) : null,
+    actorRole: payload.actor?.role ?? null,
     activeTeamId: payload.actor?.activeTeamId ?? null
   };
 }
@@ -383,8 +647,15 @@ function mapCollaborationWorkspace(payload: HubOrganizationResponse) {
 function buildDerivedStrings(
   strings: ChatString[],
   directions: DirectionRecord[],
-  plans: PlanRecord[]
+  plans: PlanRecord[],
+  options?: {
+    includeStandaloneDerived?: boolean;
+  }
 ) {
+  if (!options?.includeStandaloneDerived) {
+    return sortChats(strings);
+  }
+
   const knownDirectionIds = new Set(
     strings
       .flatMap((item) => [
@@ -496,6 +767,7 @@ function normalizeChatString(value: ChatString): ChatString {
     createdAt: value.createdAt || value.updatedAt || nowIso(),
     selectedTeamId: value.selectedTeamId ?? null,
     selectedTeamLabel: value.selectedTeamLabel ?? null,
+    activeAudience: value.activeAudience ?? DEFAULT_CHAT_AUDIENCE,
     source: value.source ?? "workspace",
     persisted: value.persisted ?? true,
     messages: Array.isArray(value.messages) ? value.messages : []
@@ -504,6 +776,65 @@ function normalizeChatString(value: ChatString): ChatString {
 
 function normalizeText(value: string | null | undefined) {
   return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function normalizeIdList(values: Array<string | null | undefined>) {
+  const seen = new Set<string>();
+  const next: string[] = [];
+
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    next.push(normalized);
+  }
+
+  return next;
+}
+
+function readStringMembership(chat: ChatString | null) {
+  const state = chat?.workspaceState;
+
+  return {
+    linkedTeamIds: Array.isArray(state?.linkedTeamIds)
+      ? normalizeIdList(state.linkedTeamIds)
+      : [],
+    linkedParticipantIds: Array.isArray(state?.linkedParticipantIds)
+      ? normalizeIdList(state.linkedParticipantIds)
+      : [],
+    excludedParticipantIds: Array.isArray(state?.excludedParticipantIds)
+      ? normalizeIdList(state.excludedParticipantIds)
+      : []
+  };
+}
+
+function buildWorkspaceStateWithMembership(
+  chat: ChatString,
+  membership: {
+    linkedTeamIds: string[];
+    linkedParticipantIds: string[];
+    excludedParticipantIds: string[];
+  }
+) {
+  const current = chat.workspaceState;
+  const nextState: NonNullable<ChatString["workspaceState"]> = {
+    ...(current?.editableDraft ? { editableDraft: current.editableDraft } : {}),
+    ...(current?.scoreRecords?.length ? { scoreRecords: current.scoreRecords } : {}),
+    ...(current?.steerDecisions && Object.keys(current.steerDecisions).length > 0
+      ? { steerDecisions: current.steerDecisions }
+      : {}),
+    ...(membership.linkedTeamIds.length > 0 ? { linkedTeamIds: membership.linkedTeamIds } : {}),
+    ...(membership.linkedParticipantIds.length > 0
+      ? { linkedParticipantIds: membership.linkedParticipantIds }
+      : {}),
+    ...(membership.excludedParticipantIds.length > 0
+      ? { excludedParticipantIds: membership.excludedParticipantIds }
+      : {})
+  };
+
+  return Object.keys(nextState).length > 0 ? nextState : undefined;
 }
 
 function buildStringDescription(chat: ChatString | null) {
@@ -521,6 +852,7 @@ function buildStringDescription(chat: ChatString | null) {
     .find(Boolean);
   const latestOrganizationTurn = [...chat.messages]
     .reverse()
+    .filter((message) => message.meta?.kind !== "thread_event" && message.meta?.kind !== "workflow_event")
     .map((message) => normalizeText(message.content))
     .find(Boolean);
   const firstOwnerTurn = chat.messages
@@ -533,8 +865,6 @@ function buildStringDescription(chat: ChatString | null) {
 export function StringChatShell({
   embedded = false,
   orgId = null,
-  onOpenAddMember,
-  onOpenCreateTeam,
   stringPanelOpen,
   onStringPanelOpenChange,
   collaborationPanelOpen,
@@ -542,8 +872,6 @@ export function StringChatShell({
 }: {
   embedded?: boolean;
   orgId?: string | null;
-  onOpenAddMember?: () => void;
-  onOpenCreateTeam?: () => void;
   stringPanelOpen?: boolean;
   onStringPanelOpenChange?: (open: boolean) => void;
   collaborationPanelOpen?: boolean;
@@ -555,6 +883,7 @@ export function StringChatShell({
   const [draft, setDraft] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
+  const [activeAudience, setActiveAudience] = useState<ChatAudience>(DEFAULT_CHAT_AUDIENCE);
   const [teams, setTeams] = useState<Team[]>([]);
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
   const [currentActorUserId, setCurrentActorUserId] = useState<string | null>(null);
@@ -571,6 +900,10 @@ export function StringChatShell({
   const loadVersionRef = useRef(0);
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0] ?? null;
   const selectedTeam = teams.find((team) => team.id === selectedTeamId) ?? null;
+  const resolvedAudience = useMemo(
+    () => normalizeAudience(activeAudience, teams, collaborators),
+    [activeAudience, collaborators, teams]
+  );
   const isStringPanelControlled = typeof stringPanelOpen === "boolean";
   const resolvedStringPanelOpen = isStringPanelControlled
     ? Boolean(stringPanelOpen)
@@ -595,6 +928,42 @@ export function StringChatShell({
     () => buildStringDescription(activeChat),
     [activeChat]
   );
+  const mentionables = useMemo(
+    () =>
+      buildMentionables({
+        teams,
+        collaborators
+      }),
+    [collaborators, teams]
+  );
+  const mentionQuery = useMemo(() => currentMentionQuery(draft), [draft]);
+  const mentionSuggestions = useMemo(() => {
+    if (mentionQuery === null) {
+      return [];
+    }
+
+    return mentionables
+      .filter(
+        (item) =>
+          mentionQuery.length === 0 ||
+          item.handle.toLowerCase().includes(mentionQuery) ||
+          item.label.toLowerCase().includes(mentionQuery)
+      )
+      .slice(0, 6);
+  }, [mentionQuery, mentionables]);
+  const audienceOptions = useMemo(
+    () =>
+      buildAudienceOptions({
+        teams,
+        collaborators,
+        actorMemberId
+      }),
+    [actorMemberId, collaborators, teams]
+  );
+  const actorCollaborator = useMemo(
+    () => collaborators.find((participant) => participant.id === actorMemberId) ?? null,
+    [actorMemberId, collaborators]
+  );
   const canManageActiveString = Boolean(
     activeChat?.persisted &&
       currentActorUserId &&
@@ -604,8 +973,13 @@ export function StringChatShell({
   const canKillActiveStringProcess = Boolean(
     canManageActiveString && (activeChat?.directionId || activeChat?.planId)
   );
+  const stringMembership = useMemo(() => readStringMembership(activeChat), [activeChat]);
+  const linkedStringTeamIds = stringMembership.linkedTeamIds;
+  const linkedStringParticipantIds = stringMembership.linkedParticipantIds;
+  const excludedStringParticipantIds = stringMembership.excludedParticipantIds;
   const stringParticipants = useMemo(() => {
     const byParticipant = new Map<string, Collaborator>();
+    const excludedParticipantIds = new Set(excludedStringParticipantIds);
     const addParticipant = (participant: Collaborator | null | undefined) => {
       if (!participant) {
         return;
@@ -614,16 +988,26 @@ export function StringChatShell({
         participant.id ||
         participant.email.trim().toLowerCase() ||
         participant.name.trim().toLowerCase();
-      if (!key || byParticipant.has(key)) {
+      if (!key || excludedParticipantIds.has(key) || byParticipant.has(key)) {
         return;
       }
       byParticipant.set(key, participant);
     };
-    const routedTeam =
-      teams.find((team) => team.id === activeChat?.selectedTeamId) ?? selectedTeam ?? null;
+    const routedTeam = teams.find((team) => team.id === activeChat?.selectedTeamId) ?? null;
+    const linkedTeams = linkedStringTeamIds
+      .map((teamId) => teams.find((team) => team.id === teamId) ?? null)
+      .filter((team): team is Team => Boolean(team));
 
     routedTeam?.memberIds.forEach((memberId) => {
       addParticipant(collaborators.find((participant) => participant.id === memberId));
+    });
+    linkedTeams.forEach((team) => {
+      team.memberIds.forEach((memberId) => {
+        addParticipant(collaborators.find((participant) => participant.id === memberId));
+      });
+    });
+    linkedStringParticipantIds.forEach((participantId) => {
+      addParticipant(collaborators.find((participant) => participant.id === participantId));
     });
     addParticipant(
       actorMemberId ? collaborators.find((participant) => participant.id === actorMemberId) : null
@@ -645,12 +1029,19 @@ export function StringChatShell({
         return;
       }
 
+      if (message.meta?.kind === "thread_event" || message.meta?.kind === "workflow_event") {
+        return;
+      }
+
       const authorName = normalizeText(message.authorName);
       if (!authorName) {
         return;
       }
 
       const matchedCollaborator =
+        (message.authorId
+          ? collaborators.find((participant) => participant.id === message.authorId)
+          : null) ??
         collaborators.find(
           (participant) => participant.name.trim().toLowerCase() === authorName.toLowerCase()
         ) ??
@@ -676,10 +1067,30 @@ export function StringChatShell({
       });
     });
 
+    activeChat?.messages.forEach((message) => {
+      if (message.audience?.kind === "person" && message.audience.id) {
+        addParticipant(collaborators.find((participant) => participant.id === message.audience?.id));
+      }
+
+      message.mentions?.forEach((mention) => {
+        if (mention.kind === "person") {
+          addParticipant(collaborators.find((participant) => participant.id === mention.id));
+        }
+      });
+    });
+
     return [...byParticipant.values()].sort((left, right) =>
       left.name.localeCompare(right.name)
     );
-  }, [activeChat, actorMemberId, collaborators, selectedTeam, teams]);
+  }, [
+    activeChat,
+    actorMemberId,
+    collaborators,
+    excludedStringParticipantIds,
+    linkedStringParticipantIds,
+    linkedStringTeamIds,
+    teams
+  ]);
 
   const handleStringPanelOpenChange = useCallback(
     (nextOpen: boolean) => {
@@ -729,6 +1140,7 @@ export function StringChatShell({
     }
 
     setMode(activeChat.mode);
+    setActiveAudience(normalizeAudience(activeChat.activeAudience, teams, collaborators));
 
     if (activeChat.selectedTeamId && activeChat.selectedTeamId !== selectedTeamId) {
       setSelectedTeamId(activeChat.selectedTeamId);
@@ -738,7 +1150,7 @@ export function StringChatShell({
     if (!activeChat.selectedTeamId && !selectedTeamId && teams.length > 0) {
       setSelectedTeamId(teams[0]?.id ?? null);
     }
-  }, [activeChat, selectedTeamId, teams]);
+  }, [activeChat, collaborators, selectedTeamId, teams]);
 
   useEffect(() => {
     if (activeChatId || chats.length === 0) {
@@ -868,7 +1280,9 @@ export function StringChatShell({
         : [];
       const plans = Array.isArray(plansPayload.plans) ? plansPayload.plans : [];
       const collaborationWorkspace = mapCollaborationWorkspace(hubPayload);
-      const hydratedStrings = buildDerivedStrings(persistedStrings, directions, plans);
+      const hydratedStrings = buildDerivedStrings(persistedStrings, directions, plans, {
+        includeStandaloneDerived: collaborationWorkspace.actorRole === "FOUNDER"
+      });
       const initialTeam =
         collaborationWorkspace.teams.find(
           (team) => team.id === collaborationWorkspace.activeTeamId
@@ -942,7 +1356,9 @@ export function StringChatShell({
         planId: chat.planId ?? null,
         selectedTeamId: chat.selectedTeamId ?? null,
         selectedTeamLabel: chat.selectedTeamLabel ?? null,
+        activeAudience: chat.activeAudience ?? DEFAULT_CHAT_AUDIENCE,
         source: chat.source ?? "workspace",
+        workspaceState: chat.workspaceState ?? null,
         messages: chat.messages
       })
     });
@@ -1006,6 +1422,154 @@ export function StringChatShell({
     );
   }
 
+  function updateStringMembership(
+    updater: (current: {
+      linkedTeamIds: string[];
+      linkedParticipantIds: string[];
+      excludedParticipantIds: string[];
+    }) => {
+      linkedTeamIds: string[];
+      linkedParticipantIds: string[];
+      excludedParticipantIds: string[];
+      selectedTeamId?: string | null;
+      selectedTeamLabel?: string | null;
+      activeAudience?: ChatAudience;
+    },
+    timelineEvent?: {
+      title: string;
+      message: string;
+      content?: string;
+      eventName: string;
+    }
+  ) {
+    if (!activeChat) {
+      return;
+    }
+
+    const currentMembership = readStringMembership(activeChat);
+    const nextMembership = updater(currentMembership);
+    const updatedAt = nowIso();
+    const timelineMessage = timelineEvent
+      ? createTimelineEventMessage({
+          ...timelineEvent,
+          scope: "MEMBERSHIP",
+          createdAt: updatedAt
+        })
+      : null;
+    const nextChat: ChatString = {
+      ...activeChat,
+      ...(nextMembership.selectedTeamId !== undefined
+        ? { selectedTeamId: nextMembership.selectedTeamId }
+        : {}),
+      ...(nextMembership.selectedTeamLabel !== undefined
+        ? { selectedTeamLabel: nextMembership.selectedTeamLabel }
+        : {}),
+      ...(nextMembership.activeAudience !== undefined
+        ? { activeAudience: nextMembership.activeAudience }
+        : {}),
+      workspaceState: buildWorkspaceStateWithMembership(activeChat, {
+        linkedTeamIds: normalizeIdList(nextMembership.linkedTeamIds),
+        linkedParticipantIds: normalizeIdList(nextMembership.linkedParticipantIds),
+        excludedParticipantIds: normalizeIdList(nextMembership.excludedParticipantIds)
+      }),
+      updatedAt,
+      messages: timelineMessage ? [...activeChat.messages, timelineMessage] : activeChat.messages
+    };
+
+    if (nextMembership.selectedTeamId !== undefined) {
+      setSelectedTeamId(nextMembership.selectedTeamId ?? null);
+    }
+    if (nextMembership.activeAudience !== undefined) {
+      setActiveAudience(nextMembership.activeAudience);
+    }
+
+    replaceChat(nextChat);
+    void persistChat(nextChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to update string membership.");
+    });
+  }
+
+  function updateActiveAudience(nextAudience: ChatAudience, options?: { syncTeam?: boolean }) {
+    const normalized = normalizeAudience(nextAudience, teams, collaborators);
+    setActiveAudience(normalized);
+
+    if (!activeChat) {
+      return normalized;
+    }
+
+    const routedTeam =
+      normalized.kind === "team"
+        ? teams.find((team) => team.id === normalized.id) ?? null
+        : null;
+    const nextChat: ChatString = {
+      ...activeChat,
+      activeAudience: normalized,
+      ...(options?.syncTeam
+        ? {
+            selectedTeamId: routedTeam?.id ?? activeChat.selectedTeamId ?? null,
+            selectedTeamLabel: routedTeam?.name ?? activeChat.selectedTeamLabel ?? null
+          }
+        : {}),
+      updatedAt: nowIso()
+    };
+
+    replaceChat(nextChat);
+    void persistChat(nextChat).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : "Failed to save chat audience.");
+    });
+
+    return normalized;
+  }
+
+  async function fetchParticipantReplies(input: {
+    message: string;
+    history: ChatMessage[];
+    audience: ChatAudience;
+    mentions: ChatMention[];
+    teamLabel?: string | null;
+    threadId: string;
+  }) {
+    if (!orgId) {
+      return [] as ChatMessage[];
+    }
+
+    const response = await fetch("/api/strings/participant-replies", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        orgId,
+        threadId: input.threadId,
+        message: input.message,
+        history: buildParticipantHistory(input.history),
+        audience: input.audience,
+        mentions: input.mentions,
+        teamLabel: input.teamLabel ?? ""
+      })
+    });
+    const { payload, rawText } = await parseResponse<ParticipantRepliesApiResponse>(response);
+
+    if (!response.ok || !payload?.ok) {
+      throw new Error(
+        failMsg(
+          response.status,
+          "AI teammate replies failed",
+          payload?.message,
+          rawText
+        )
+      );
+    }
+
+    return Array.isArray(payload.replies)
+      ? payload.replies.map((reply) => ({
+          ...reply,
+          authorKind: "AI" as const
+        }))
+      : [];
+  }
+
   function handleSelectChat(chatId: string) {
     setActiveChatId(chatId);
     setSidebarOpen(false);
@@ -1019,6 +1583,7 @@ export function StringChatShell({
     setChats((current) => sortChats([nextChat, ...current]));
     setActiveChatId(nextChat.id);
     setMode("discussion");
+    setActiveAudience(DEFAULT_CHAT_AUDIENCE);
     setDraft("");
     setSidebarOpen(false);
     handleStringPanelOpenChange(false);
@@ -1069,43 +1634,186 @@ export function StringChatShell({
       return;
     }
 
+    if (activeChat.mode === nextMode) {
+      return;
+    }
+
+    const updatedAt = nowIso();
+    const timelineMessage = createTimelineEventMessage({
+      title: `Moved To ${modeLabel(nextMode)}`,
+      message: `String mode changed from ${modeLabel(activeChat.mode).toLowerCase()} to ${modeLabel(nextMode).toLowerCase()}.`,
+      content: `Moved to ${modeLabel(nextMode).toLowerCase()}.`,
+      eventName: nextMode === "direction" ? "thread.mode.direction" : "thread.mode.discussion",
+      scope: "MODE",
+      createdAt: updatedAt
+    });
+
     const nextChat = {
       ...activeChat,
       mode: nextMode,
-      updatedAt: nowIso()
+      updatedAt,
+      messages: [...activeChat.messages, timelineMessage]
     };
     replaceChat(nextChat);
+    setStatusText(`Moved to ${modeLabel(nextMode).toLowerCase()}.`);
     void persistChat(nextChat).catch((nextError) => {
       setError(nextError instanceof Error ? nextError.message : "Failed to save string mode.");
     });
   }
 
-  function handleSelectTeam(teamId: string) {
+  function handleAddTeamToString(teamId: string) {
     const nextTeam = teams.find((team) => team.id === teamId) ?? null;
-
-    setSelectedTeamId(teamId);
-
-    if (activeChat) {
-      const nextChat = {
-        ...activeChat,
-        selectedTeamId: nextTeam?.id ?? null,
-        selectedTeamLabel: nextTeam?.name ?? null,
-        updatedAt: nowIso()
-      };
-      replaceChat(nextChat);
-      void persistChat(nextChat).catch((nextError) => {
-        setError(nextError instanceof Error ? nextError.message : "Failed to save team routing.");
-      });
+    if (!nextTeam || !activeChat) {
+      return;
+    }
+    const current = readStringMembership(activeChat);
+    if (current.linkedTeamIds.includes(nextTeam.id)) {
+      return;
     }
 
-    if (!actorMemberId || nextTeam?.memberIds.includes(actorMemberId)) {
-      void persistActiveTeam(teamId).catch((nextError) => {
-        setError(nextError instanceof Error ? nextError.message : "Failed to update active team.");
-      });
+    updateStringMembership((current) => ({
+      linkedTeamIds: normalizeIdList([...current.linkedTeamIds, nextTeam.id]),
+      linkedParticipantIds: current.linkedParticipantIds,
+      excludedParticipantIds: current.excludedParticipantIds
+    }), {
+      title: "Team Added",
+      message: `${nextTeam.name} was added to this string.`,
+      content: `${nextTeam.name} added to this string.`,
+      eventName: "thread.team.added"
+    });
+    setStatusText(`${nextTeam.name} added to this string.`);
+  }
+
+  function handleRemoveTeamFromString(teamId: string) {
+    const team = teams.find((item) => item.id === teamId) ?? null;
+    if (!activeChat) {
+      return;
+    }
+    const current = readStringMembership(activeChat);
+    if (!current.linkedTeamIds.includes(teamId)) {
+      return;
+    }
+    const shouldClearSelectedTeam = activeChat?.selectedTeamId === teamId;
+    const shouldClearAudience =
+      activeChat?.activeAudience?.kind === "team" && activeChat.activeAudience.id === teamId;
+
+    updateStringMembership((current) => ({
+      linkedTeamIds: current.linkedTeamIds.filter((id) => id !== teamId),
+      linkedParticipantIds: current.linkedParticipantIds,
+      excludedParticipantIds: current.excludedParticipantIds,
+      ...(shouldClearSelectedTeam ? { selectedTeamId: null, selectedTeamLabel: null } : {}),
+      ...(shouldClearAudience ? { activeAudience: DEFAULT_CHAT_AUDIENCE } : {})
+    }), {
+      title: "Team Removed",
+      message: `${team?.name ?? "Team"} was removed from this string.`,
+      content: `${team?.name ?? "Team"} removed from this string.`,
+      eventName: "thread.team.removed"
+    });
+    setStatusText(`${team?.name ?? "Team"} removed from this string.`);
+  }
+
+  function handleAddParticipantToString(participantId: string) {
+    const participant = collaborators.find((item) => item.id === participantId) ?? null;
+    if (!participant || !activeChat) {
+      return;
+    }
+    const current = readStringMembership(activeChat);
+    if (current.linkedParticipantIds.includes(participant.id)) {
+      return;
+    }
+
+    updateStringMembership((current) => ({
+      linkedTeamIds: current.linkedTeamIds,
+      linkedParticipantIds: normalizeIdList([...current.linkedParticipantIds, participant.id]),
+      excludedParticipantIds: current.excludedParticipantIds.filter((id) => id !== participant.id)
+    }), {
+      title: "Participant Added",
+      message: `${participant.name} was added to this string.`,
+      content: `${participant.name} added to this string.`,
+      eventName: "thread.participant.added"
+    });
+    setStatusText(`${participant.name} added to this string.`);
+  }
+
+  function handleRemoveParticipantFromString(participantId: string) {
+    if (!activeChat) {
+      return;
+    }
+    const current = readStringMembership(activeChat);
+    if (!current.linkedParticipantIds.includes(participantId)) {
+      return;
+    }
+    const participant =
+      stringParticipants.find((item) => item.id === participantId) ??
+      collaborators.find((item) => item.id === participantId) ??
+      null;
+    const shouldClearAudience =
+      activeChat?.activeAudience?.kind === "person" && activeChat.activeAudience.id === participantId;
+
+    updateStringMembership((current) => ({
+      linkedTeamIds: current.linkedTeamIds,
+      linkedParticipantIds: current.linkedParticipantIds.filter((id) => id !== participantId),
+      excludedParticipantIds: normalizeIdList([...current.excludedParticipantIds, participantId]),
+      ...(shouldClearAudience ? { activeAudience: DEFAULT_CHAT_AUDIENCE } : {})
+    }), {
+      title: "Participant Removed",
+      message: `${participant?.name ?? "Participant"} was removed from this string.`,
+      content: `${participant?.name ?? "Participant"} removed from this string.`,
+      eventName: "thread.participant.removed"
+    });
+    setStatusText(`${participant?.name ?? "Participant"} removed from this string.`);
+  }
+
+  function handleAudienceChange(value: string) {
+    if (value === "everyone") {
+      updateActiveAudience(DEFAULT_CHAT_AUDIENCE);
+      return;
+    }
+
+    if (value.startsWith("team:")) {
+      const teamId = value.slice("team:".length);
+      const team = teams.find((item) => item.id === teamId) ?? null;
+      if (!team) {
+        updateActiveAudience(DEFAULT_CHAT_AUDIENCE);
+        return;
+      }
+      setSelectedTeamId(team.id);
+      updateActiveAudience(
+        {
+          kind: "team",
+          id: team.id,
+          label: team.name
+        },
+        { syncTeam: true }
+      );
+      if (!actorMemberId || team.memberIds.includes(actorMemberId)) {
+        void persistActiveTeam(team.id).catch((nextError) => {
+          setError(nextError instanceof Error ? nextError.message : "Failed to update active team.");
+        });
+      }
+      return;
+    }
+
+    if (value.startsWith("person:")) {
+      const collaboratorId = value.slice("person:".length);
+      const collaborator = collaborators.find((item) => item.id === collaboratorId) ?? null;
+      updateActiveAudience(
+        collaborator
+          ? {
+              kind: "person",
+              id: collaborator.id,
+              label: collaborator.name
+            }
+          : DEFAULT_CHAT_AUDIENCE
+      );
     }
   }
 
-  async function sendMessage(teamId = selectedTeamId) {
+  function handleInsertMention(handle: string) {
+    setDraft((current) => insertMention(current, handle));
+  }
+
+  async function sendMessage(teamId = selectedTeamId, audienceOverride = resolvedAudience) {
     const targetChat = activeChat;
     const content = draft.trim();
 
@@ -1113,16 +1821,43 @@ export function StringChatShell({
       return;
     }
 
-    const targetTeam = teams.find((team) => team.id === teamId) ?? null;
-    const timestamp = nowIso();
     const selectedMode = mode;
+    const messageAudience = normalizeAudience(audienceOverride, teams, collaborators);
+    const selectedRoutingTeam = teams.find((team) => team.id === teamId) ?? null;
+    const audienceTeam =
+      messageAudience.kind === "team"
+        ? teams.find((team) => team.id === messageAudience.id) ?? selectedRoutingTeam
+        : null;
+    const resolvedMentions = resolveMentions(content, mentionables);
+    const directAudienceCollaborator =
+      messageAudience.kind === "person"
+        ? collaborators.find((collaborator) => collaborator.id === messageAudience.id) ?? null
+        : null;
+    const hasDirectAiPersonMention = resolvedMentions.some(
+      (mention) => mention.kind === "person" && mention.collaboratorKind === "AI"
+    );
+    const shouldRequestParticipantReplies =
+      messageAudience.kind === "team" ||
+      resolvedMentions.some(
+        (mention) => mention.kind === "team" || mention.collaboratorKind === "AI"
+      ) || directAudienceCollaborator?.kind === "AI";
+    const shouldUseOrganizationReply =
+      selectedMode === "direction" ||
+      (messageAudience.kind === "everyone" && !hasDirectAiPersonMention);
+    const timestamp = nowIso();
     const userMessage: ChatMessage = {
       id: createId("message"),
       role: "user",
       content,
       createdAt: timestamp,
-      teamId: targetTeam?.id ?? null,
-      teamLabel: targetTeam?.name ?? null
+      ...(actorCollaborator?.id ? { authorId: actorCollaborator.id } : {}),
+      ...(actorCollaborator?.name ? { authorName: actorCollaborator.name } : {}),
+      ...(actorCollaborator?.role ? { authorRole: actorCollaborator.role } : {}),
+      authorKind: actorCollaborator?.kind ?? "HUMAN",
+      teamId: audienceTeam?.id ?? null,
+      teamLabel: audienceTeam?.name ?? null,
+      audience: messageAudience,
+      ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {})
     };
 
     const optimisticChat: ChatString = {
@@ -1130,13 +1865,15 @@ export function StringChatShell({
       title: targetChat.title === DEFAULT_CHAT_TITLE ? titleFromMessage(content) : targetChat.title,
       mode: selectedMode,
       updatedAt: timestamp,
-      selectedTeamId: targetTeam?.id ?? targetChat.selectedTeamId ?? null,
-      selectedTeamLabel: targetTeam?.name ?? targetChat.selectedTeamLabel ?? null,
+      activeAudience: messageAudience,
+      selectedTeamId: selectedRoutingTeam?.id ?? targetChat.selectedTeamId ?? null,
+      selectedTeamLabel: selectedRoutingTeam?.name ?? targetChat.selectedTeamLabel ?? null,
       messages: [...targetChat.messages, userMessage]
     };
 
     replaceChat(optimisticChat);
     setDraft("");
+    setActiveAudience(messageAudience);
     setSending(true);
     handleStringPanelOpenChange(false);
     handleCollaborationPanelOpenChange(false);
@@ -1148,52 +1885,67 @@ export function StringChatShell({
     });
 
     try {
-      const chatStartedAt = performance.now();
-      const chatResponse = await fetch("/api/control/direction-chat", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          orgId,
-          message: content,
-          history: toHistory(optimisticChat.messages)
-        })
-      });
-      const chatLatency = Math.round(performance.now() - chatStartedAt);
-      const { payload: chatPayload, rawText: chatRaw } =
-        await parseResponse<DirectionChatApiResponse>(chatResponse);
+      const followUps: ChatMessage[] = [];
+      let organizationRouting: MessageRouting | undefined;
+      let directionId = optimisticChat.directionId ?? null;
+      let planId = optimisticChat.planId ?? null;
+      let directionText = "";
 
-      if (!chatResponse.ok || !chatPayload?.ok || !chatPayload.reply) {
-        throw new Error(
-          failMsg(chatResponse.status, "Discussion request failed", chatPayload?.message, chatRaw)
-        );
-      }
+      if (shouldUseOrganizationReply) {
+        const chatStartedAt = performance.now();
+        const chatResponse = await fetch("/api/control/direction-chat", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            orgId,
+            message: content,
+            history: toHistory(optimisticChat.messages),
+            teamLabel: audienceTeam?.name ?? "",
+            audienceLabel:
+              messageAudience.kind === "everyone" ? "" : messageAudience.label ?? messageAudience.kind,
+            mentionLabels: resolvedMentions.map((mention) => mention.label)
+          })
+        });
+        const chatLatency = Math.round(performance.now() - chatStartedAt);
+        const { payload: chatPayload, rawText: chatRaw } =
+          await parseResponse<DirectionChatApiResponse>(chatResponse);
 
-      const routing: MessageRouting | undefined = chatPayload.intentRouting
-        ? {
-            route: chatPayload.intentRouting.route,
-            ...(chatPayload.intentRouting.reason
-              ? { reason: chatPayload.intentRouting.reason }
-              : {}),
-            ...(Array.isArray(chatPayload.intentRouting.toolkitHints)
-              ? { toolkitHints: chatPayload.intentRouting.toolkitHints }
-              : {})
-          }
-        : undefined;
+        if (!chatResponse.ok || !chatPayload?.ok || !chatPayload.reply) {
+          throw new Error(
+            failMsg(chatResponse.status, "Discussion request failed", chatPayload?.message, chatRaw)
+          );
+        }
 
-      const followUps: ChatMessage[] = [
-        {
+        organizationRouting = chatPayload.intentRouting
+          ? {
+              route: chatPayload.intentRouting.route,
+              ...(chatPayload.intentRouting.reason
+                ? { reason: chatPayload.intentRouting.reason }
+                : {}),
+              ...(Array.isArray(chatPayload.intentRouting.toolkitHints)
+                ? { toolkitHints: chatPayload.intentRouting.toolkitHints }
+                : {})
+            }
+          : undefined;
+        directionText = (chatPayload.directionCandidate || content).trim();
+
+        followUps.push({
           id: createId("message"),
           role: "system",
           content: chatPayload.reply,
           createdAt: nowIso(),
+          authorId: "main-agent",
           authorName: COFOUNDER_MANAGER_NAME,
           authorRole: COFOUNDER_MANAGER_ROLE,
-          teamId: targetTeam?.id ?? null,
-          teamLabel: targetTeam?.name ?? null,
-          ...(routing ? { routing } : {}),
+          authorKind: "AI",
+          teamId: audienceTeam?.id ?? null,
+          teamLabel: audienceTeam?.name ?? null,
+          audience: messageAudience,
+          ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {}),
+          ...(organizationRouting ? { routing: organizationRouting } : {}),
           metrics: {
             latencyMs: Math.max(0, chatLatency),
             ...(typeof chatPayload.tokenUsage?.promptTokens === "number"
@@ -1209,14 +1961,31 @@ export function StringChatShell({
             ...(chatPayload.model?.name ? { model: chatPayload.model.name } : {}),
             ...(chatPayload.model?.source ? { source: chatPayload.model.source } : {})
           }
-        }
-      ];
+        });
+      }
 
-      let directionId = optimisticChat.directionId ?? null;
-      let planId = optimisticChat.planId ?? null;
+      const participantReplies = shouldRequestParticipantReplies
+        ? await fetchParticipantReplies({
+            message: content,
+            history: [...optimisticChat.messages, ...followUps],
+            audience: messageAudience,
+            mentions: resolvedMentions,
+            teamLabel: audienceTeam?.name ?? null,
+            threadId: targetChat.id
+          }).catch((nextError) => {
+            setStatusText(
+              nextError instanceof Error
+                ? nextError.message
+                : "AI teammate replies are unavailable right now."
+            );
+            return [] as ChatMessage[];
+          })
+        : [];
+      followUps.push(...participantReplies);
+
       const shouldPlan =
-        selectedMode === "direction" || chatPayload.intentRouting?.route === "PLAN_REQUIRED";
-      const directionText = (chatPayload.directionCandidate || content).trim();
+        shouldUseOrganizationReply &&
+        (selectedMode === "direction" || organizationRouting?.route === "PLAN_REQUIRED");
 
       if (shouldPlan && directionText) {
         const planStartedAt = performance.now();
@@ -1247,16 +2016,20 @@ export function StringChatShell({
             role: "system",
             content: planPayload.analysis || "Execution plan generated and linked.",
             createdAt: nowIso(),
+            authorId: "main-agent",
             authorName: COFOUNDER_MANAGER_NAME,
             authorRole: "Direction lead",
-            teamId: targetTeam?.id ?? null,
-            teamLabel: targetTeam?.name ?? null,
+            authorKind: "AI",
+            teamId: audienceTeam?.id ?? null,
+            teamLabel: audienceTeam?.name ?? null,
+            audience: messageAudience,
+            ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {}),
             direction: toDirectionPayload(
               planPayload.directionGiven || directionText,
               planPayload.primaryPlan,
               planPayload.requiredToolkits,
               planPayload.requestCount,
-              targetTeam?.name ?? null
+              audienceTeam?.name ?? null
             ),
             routing: {
               route: "PLAN_REQUIRED",
@@ -1292,8 +2065,10 @@ export function StringChatShell({
             createdAt: nowIso(),
             authorName: "System",
             authorRole: "Workspace notice",
-            teamId: targetTeam?.id ?? null,
-            teamLabel: targetTeam?.name ?? null,
+            teamId: audienceTeam?.id ?? null,
+            teamLabel: audienceTeam?.name ?? null,
+            audience: messageAudience,
+            ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {}),
             error: true
           });
         }
@@ -1303,7 +2078,7 @@ export function StringChatShell({
 
       const finalChat: ChatString = {
         ...optimisticChat,
-        updatedAt: followUps[followUps.length - 1]?.createdAt ?? nowIso(),
+        updatedAt: followUps[followUps.length - 1]?.createdAt ?? optimisticChat.updatedAt,
         directionId,
         planId,
         messages: [...optimisticChat.messages, ...followUps]
@@ -1327,8 +2102,10 @@ export function StringChatShell({
             createdAt: nowIso(),
             authorName: "System",
             authorRole: "Workspace notice",
-            teamId: targetTeam?.id ?? null,
-            teamLabel: targetTeam?.name ?? null,
+            teamId: audienceTeam?.id ?? null,
+            teamLabel: audienceTeam?.name ?? null,
+            audience: messageAudience,
+            ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {}),
             error: true
           }
         ]
@@ -1345,8 +2122,19 @@ export function StringChatShell({
     handleStringPanelOpenChange(false);
     handleCollaborationPanelOpenChange(false);
 
+    if (selectedTeam) {
+      updateActiveAudience(
+        {
+          kind: "team",
+          id: selectedTeam.id,
+          label: selectedTeam.name
+        },
+        { syncTeam: true }
+      );
+    }
+
     if (!draft.trim() && selectedTeam) {
-      setDraft(`Discuss with ${selectedTeam.name}: `);
+      setDraft(`Discuss with @${mentionables.find((item) => item.kind === "team" && item.id === selectedTeam.id)?.handle ?? selectedTeam.name}: `);
     }
   }
 
@@ -1355,21 +2143,20 @@ export function StringChatShell({
     handleStringPanelOpenChange(false);
     handleCollaborationPanelOpenChange(false);
 
-    if (!draft.trim() && selectedTeam) {
-      setDraft(`Direction for ${selectedTeam.name}: `);
+    if (selectedTeam) {
+      updateActiveAudience(
+        {
+          kind: "team",
+          id: selectedTeam.id,
+          label: selectedTeam.name
+        },
+        { syncTeam: true }
+      );
     }
-  }
 
-  function handleOpenAddMember() {
-    handleStringPanelOpenChange(false);
-    handleCollaborationPanelOpenChange(false);
-    onOpenAddMember?.();
-  }
-
-  function handleOpenCreateTeam() {
-    handleStringPanelOpenChange(false);
-    handleCollaborationPanelOpenChange(false);
-    onOpenCreateTeam?.();
+    if (!draft.trim() && selectedTeam) {
+      setDraft(`Direction for @${mentionables.find((item) => item.kind === "team" && item.id === selectedTeam.id)?.handle ?? selectedTeam.name}: `);
+    }
   }
 
   async function handleDeleteString() {
@@ -1463,6 +2250,8 @@ export function StringChatShell({
       : statusText?.startsWith("Synced ")
         ? null
         : statusText;
+  const activeAudienceLabel =
+    resolvedAudience.kind !== "everyone" ? resolvedAudience.label ?? resolvedAudience.kind : null;
 
   if (!orgId) {
     return (
@@ -1499,6 +2288,7 @@ export function StringChatShell({
           open={sidebarOpen}
           searchQuery={searchQuery}
           chats={filteredChats}
+          teams={teams}
           activeChatId={activeChat?.id ?? null}
           onSearchQueryChange={setSearchQuery}
           onSelectChat={handleSelectChat}
@@ -1526,6 +2316,8 @@ export function StringChatShell({
               stringPanelOpen={resolvedStringPanelOpen}
               stringPanelPinned={dockStringPanel}
               selectedTeamLabel={selectedTeam?.name ?? activeChat?.selectedTeamLabel ?? null}
+              audienceLabel={activeAudienceLabel}
+              audienceKind={resolvedAudience.kind}
               statusText={headerStatusText}
               statusTone={error ? "error" : "neutral"}
               onTitleChange={handleTitleChange}
@@ -1544,9 +2336,15 @@ export function StringChatShell({
             <ChatInput
               mode={mode}
               value={draft}
+              audienceValue={audienceToValue(resolvedAudience)}
+              audienceOptions={audienceOptions}
+              audienceLabel={activeAudienceLabel}
+              mentionSuggestions={mentionSuggestions}
               disabled={!activeChat || sending || loading}
               sending={sending}
               onValueChange={setDraft}
+              onAudienceChange={handleAudienceChange}
+              onInsertMention={handleInsertMention}
               onSend={() => void sendMessage()}
             />
           </div>
@@ -1563,20 +2361,18 @@ export function StringChatShell({
               collaborators={collaborators}
               teams={teams}
               selectedTeamId={selectedTeamId}
-              onSelectTeam={handleSelectTeam}
+              linkedTeamIds={linkedStringTeamIds}
+              linkedParticipantIds={linkedStringParticipantIds}
+              onAddTeam={handleAddTeamToString}
+              onRemoveTeam={handleRemoveTeamFromString}
+              onAddParticipant={handleAddParticipantToString}
+              onRemoveParticipant={handleRemoveParticipantFromString}
               onClose={() => handleStringPanelOpenChange(false)}
               canManageString={canManageActiveString}
               canKillProcess={canKillActiveStringProcess}
               actionInFlight={stringActionInFlight}
               onDeleteString={() => void handleDeleteString()}
               onKillProcess={() => void handleKillStringProcess()}
-              onSendToTeam={() => void sendMessage(selectedTeamId)}
-              onDiscussWithTeam={handleDiscussWithTeam}
-              onSetDirection={handleSetDirection}
-              onOpenAddMember={handleOpenAddMember}
-              onOpenCreateTeam={handleOpenCreateTeam}
-              canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
-              sending={sending}
             />
           ) : null}
         </main>
@@ -1590,35 +2386,23 @@ export function StringChatShell({
           collaborators={collaborators}
           teams={teams}
           selectedTeamId={selectedTeamId}
-          onSelectTeam={handleSelectTeam}
+          linkedTeamIds={linkedStringTeamIds}
+          linkedParticipantIds={linkedStringParticipantIds}
+          onAddTeam={handleAddTeamToString}
+          onRemoveTeam={handleRemoveTeamFromString}
+          onAddParticipant={handleAddParticipantToString}
+          onRemoveParticipant={handleRemoveParticipantFromString}
           onClose={() => handleStringPanelOpenChange(false)}
           canManageString={canManageActiveString}
           canKillProcess={canKillActiveStringProcess}
           actionInFlight={stringActionInFlight}
           onDeleteString={() => void handleDeleteString()}
           onKillProcess={() => void handleKillStringProcess()}
-          onSendToTeam={() => void sendMessage(selectedTeamId)}
-          onDiscussWithTeam={handleDiscussWithTeam}
-          onSetDirection={handleSetDirection}
-          onOpenAddMember={handleOpenAddMember}
-          onOpenCreateTeam={handleOpenCreateTeam}
-          canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
-          sending={sending}
         />
         <CollaborationPanel
           open={resolvedCollaborationPanelOpen}
-          collaborators={collaborators}
-          teams={teams}
-          selectedTeamId={selectedTeamId}
-          onSelectTeam={handleSelectTeam}
+          participants={stringParticipants}
           onClose={() => handleCollaborationPanelOpenChange(false)}
-          onSendToTeam={() => void sendMessage(selectedTeamId)}
-          onDiscussWithTeam={handleDiscussWithTeam}
-          onSetDirection={handleSetDirection}
-          onOpenAddMember={handleOpenAddMember}
-          onOpenCreateTeam={handleOpenCreateTeam}
-          canSendToTeam={Boolean(draft.trim()) && Boolean(selectedTeamId)}
-          sending={sending}
         />
       </div>
     </div>

@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 
 import { DirectionBlock } from "@/components/chat-ui/direction-block";
 import { MessageBubble } from "@/components/chat-ui/message-bubble";
+import { TimelineEvent } from "@/components/system/timeline-event";
 import type { ChatMessage, StringMode } from "@/components/chat-ui/types";
 
 interface ChatWindowProps {
@@ -53,7 +54,13 @@ export function ChatWindow({ mode, messages, isResponding = false }: ChatWindowP
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.2 }}
             >
-              {mode === "direction" && message.role !== "user" ? (
+              {message.meta?.kind === "thread_event" || message.meta?.kind === "workflow_event" ? (
+                <TimelineEvent
+                  meta={message.meta}
+                  fallbackText={message.content}
+                  timestampLabel={new Date(message.createdAt).toLocaleString()}
+                />
+              ) : mode === "direction" && message.role !== "user" ? (
                 <div className="flex justify-start">
                   <DirectionBlock message={message} />
                 </div>

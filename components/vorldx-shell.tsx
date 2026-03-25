@@ -142,6 +142,7 @@ import {
   buildEditableStringDraft,
   buildLocalMonthGrid,
   buildPlanCardMeta,
+  buildThreadEventMeta,
   buildStringDiscussionTurns,
   buildThreadDeliverableCards,
   buildThreadScanRows,
@@ -165,6 +166,7 @@ import {
   initials,
   isApprovalReply,
   isGmailDirectionPrompt,
+  isTimelineEventMeta,
   isRecurringTaskPrompt,
   isRejectReply,
   makeDirectionTurnId,
@@ -270,7 +272,8 @@ function mapChatMessageToDirectionTurn(
     return {
       id: buildWorkspaceTurnId("owner", message.createdAt, index),
       role: "owner",
-      content
+      content,
+      ...(message.meta ? { meta: message.meta } : {})
     };
   }
 
@@ -283,7 +286,8 @@ function mapChatMessageToDirectionTurn(
     id: buildWorkspaceTurnId("organization", message.createdAt, index),
     role: "organization",
     content,
-    ...(modelLabel ? { modelLabel } : {})
+    ...(modelLabel ? { modelLabel } : {}),
+    ...(message.meta ? { meta: message.meta } : {})
   };
 }
 
@@ -303,7 +307,10 @@ function deriveWorkspaceDirectionGiven(input: {
     .find((message) => message.role === "user" && trimWorkspaceText(message.content));
   const latestMessage = [...input.messages]
     .reverse()
-    .find((message) => trimWorkspaceText(message.content));
+    .find(
+      (message) =>
+        !isTimelineEventMeta(message.meta) && trimWorkspaceText(message.content)
+    );
 
   return (
     trimWorkspaceText(input.linkedDirection?.direction) ||
@@ -688,20 +695,22 @@ function buildWorkspaceChatMessagesFromTurns(
   const fallbackBaseTs = Math.max(1, item.updatedAt - item.turns.length - 1);
   return item.turns.map((turn, index) => {
     const timestamp = inferTurnTimestamp(turn, index, fallbackBaseTs);
+    const isTimelineEvent = isTimelineEventMeta(turn.meta);
     return {
       id: turn.id,
-      role: turn.role === "owner" ? "user" : "assistant",
+      role: turn.role === "owner" ? "user" : isTimelineEvent ? "system" : "assistant",
       content: turn.content,
       createdAt: new Date(timestamp).toISOString(),
       ...(turn.role === "organization"
         ? {
-            authorName: turn.modelLabel || "Organization",
-            authorRole: "Organization"
+            authorName: isTimelineEvent ? "System" : turn.modelLabel || "Organization",
+            authorRole: isTimelineEvent ? "Timeline Update" : "Organization"
           }
         : {
             authorName: "Owner",
             authorRole: "Owner"
-          })
+          }),
+      ...(turn.meta ? { meta: turn.meta } : {})
     } satisfies ChatMessage;
   });
 }
@@ -1037,6 +1046,27 @@ export function VorldXShell() {
     ]);
   }, []);
 
+  const appendThreadEventTurn = useCallback((input: {
+    content: string;
+    title: string;
+    message: string;
+    eventName: string;
+    scope: "MODE" | "MEMBERSHIP" | "PLANNING" | "EXECUTION" | "COLLABORATION";
+    status?: string;
+  }) => {
+    appendStructuredOrganizationTurn({
+      content: input.content,
+      meta: buildThreadEventMeta({
+        title: input.title,
+        message: input.message,
+        eventName: input.eventName,
+        scope: input.scope,
+        ...(input.status ? { status: input.status } : {}),
+        timestamp: Date.now()
+      })
+    });
+  }, [appendStructuredOrganizationTurn]);
+
   const shouldEmitWorkflowEvent = useCallback((key: string, minIntervalMs = 1200) => {
     const now = Date.now();
     const last = workflowEventThrottleRef.current.get(key) ?? 0;
@@ -1224,17 +1254,6 @@ export function VorldXShell() {
   const handleOperationTabChange = useCallback(
     (tab: OperationTabId) => {
       handleTabChange(tab);
-    },
-    [handleTabChange]
-  );
-
-  const handleOpenSquadIntent = useCallback(
-    (action: "ADD_MEMBER" | "CREATE_TEAM") => {
-      setSquadLaunchIntent({
-        action,
-        nonce: Date.now()
-      });
-      handleTabChange("squad");
     },
     [handleTabChange]
   );
@@ -3679,7 +3698,7 @@ export function VorldXShell() {
         body: JSON.stringify({
           orgId: resolvedOrg.id,
           message: intentEnrichment.message,
-          history: directionTurns.slice(-10).map((turn) => ({
+          history: directionTurns.filter((turn) => !isTimelineEventMeta(turn.meta)).slice(-10).map((turn) => ({
             role: turn.role,
             content: turn.content
           })),
@@ -3738,13 +3757,23 @@ export function VorldXShell() {
       if (payload.intentRouting?.route === "PLAN_REQUIRED") {
         const routedPrompt = message;
         const cadenceHint = payload.intentRouting.cadenceHint;
+        const routeReason =
+          payload.intentRouting.reason ||
+          "Intent requires planning before workflow launch.";
         setPendingChatPlanRoute({
           prompt: routedPrompt,
-          reason:
-            payload.intentRouting.reason ||
-            "Intent requires planning before workflow launch.",
+          reason: routeReason,
           toolkitHints: payload.intentRouting.toolkitHints ?? []
         });
+        if (sourceMode !== "DIRECTION") {
+          appendThreadEventTurn({
+            content: "Moved to direction.",
+            title: "Moved To Direction",
+            message: routeReason,
+            eventName: "thread.mode.direction",
+            scope: "MODE"
+          });
+        }
         setControlMode("DIRECTION");
         setControlConversationDetail("DIRECTION_GIVEN");
         setControlMessage({
@@ -3778,6 +3807,7 @@ export function VorldXShell() {
       setDirectionChatInFlight(false);
     }
   }, [
+    appendThreadEventTurn,
     directionModelId,
     directionPrompt,
     directionTurns,
@@ -3836,7 +3866,7 @@ export function VorldXShell() {
           body: JSON.stringify({
             orgId: resolvedOrg.id,
             direction,
-            history: directionTurns.slice(-10).map((turn) => ({
+            history: directionTurns.filter((turn) => !isTimelineEventMeta(turn.meta)).slice(-10).map((turn) => ({
               role: turn.role,
               content: turn.content
             })),
@@ -4027,6 +4057,7 @@ export function VorldXShell() {
       }
     },
     [
+      appendThreadEventTurn,
       appendStructuredOrganizationTurn,
       directionModelId,
       directionTurns,
@@ -4420,6 +4451,16 @@ export function VorldXShell() {
     if (strictPlanFirst && !directionPlanningResult?.planRecord?.id) {
       const toolkitHints = inferToolkitsFromDirectionPrompt(prompt);
       setIntent(prompt);
+      if (controlMode !== "DIRECTION") {
+        appendThreadEventTurn({
+          content: "Moved to direction.",
+          title: "Moved To Direction",
+          message:
+            "Plan-first policy is active, so this thread moved into direction before execution launch.",
+          eventName: "thread.mode.direction",
+          scope: "MODE"
+        });
+      }
       setControlMode("DIRECTION");
       setControlConversationDetail("DIRECTION_GIVEN");
       setPendingChatPlanRoute(null);
@@ -4751,6 +4792,17 @@ export function VorldXShell() {
           launchedFlowId,
           ...previous.filter((item) => item !== launchedFlowId)
         ].slice(0, 40));
+        appendThreadEventTurn({
+          content: "Moved to flow.",
+          title: "Moved To Flow",
+          message:
+            flowStatus === "DRAFT"
+              ? `Approved work moved from planning into FLOW and is waiting on signatures for ${launchedFlowId.slice(0, 8)}.`
+              : `Approved work moved from planning into FLOW for workflow ${launchedFlowId.slice(0, 8)}.`,
+          eventName: "thread.mode.flow",
+          scope: "EXECUTION",
+          status: payload.flow?.status ?? "QUEUED"
+        });
         appendStructuredOrganizationTurn({
           content:
             flowStatus === "DRAFT"
@@ -4783,6 +4835,7 @@ export function VorldXShell() {
       setLaunchInFlight(false);
     }
   }, [
+    appendThreadEventTurn,
     appendStructuredOrganizationTurn,
     intent,
     launchInFlight,
@@ -4802,6 +4855,7 @@ export function VorldXShell() {
     rejectedLaunchPermissionRequestCount,
     requiredSignatures,
     resolvedOrg?.id,
+    controlMode,
     queueWorkflowSnapshotTurn,
     launchPermissionRequestIds,
     loadApprovalCheckpoints,
@@ -5507,7 +5561,7 @@ export function VorldXShell() {
                   }`}
                 >
                   <Users size={14} />
-                  <span className="hidden sm:inline">Collaborators</span>
+                  <span className="hidden sm:inline">Participants</span>
                 </button>
               ) : null}
 
@@ -5714,8 +5768,6 @@ export function VorldXShell() {
                 key={`string-shell:${resolvedOrg?.id ?? "none"}`}
                 embedded
                 orgId={resolvedOrg?.id ?? null}
-                onOpenAddMember={() => handleOpenSquadIntent("ADD_MEMBER")}
-                onOpenCreateTeam={() => handleOpenSquadIntent("CREATE_TEAM")}
                 stringPanelOpen={showCompassStringPanel}
                 onStringPanelOpenChange={setShowCompassStringPanel}
                 collaborationPanelOpen={showCompassCollaborationPanel}
@@ -5917,14 +5969,23 @@ export function VorldXShell() {
                         initialDetailsTab={flowExecutionTab === "STEER" ? "SCORING" : undefined}
                       />
                     ) : primaryWorkspaceTab === "EXECUTION" && flowExecutionTab === "BLUEPRINT" ? (
-                      <BlueprintConsole
+                      <StringBlueprintCanvasSurface
                         key={`blueprint-${flowCalendarSelectedDate ?? "all"}-${flowSelectedStringId ?? "all"}`}
-                        orgId={resolvedOrg.id}
                         themeStyle={{
                           accent: themeStyle.accent,
                           accentSoft: themeStyle.accentSoft,
                           border: themeStyle.border
                         }}
+                        calendarDate={flowCalendarSelectedDate}
+                        stringItem={flowSelectedString}
+                        allStringItems={flowVisibleStringItems}
+                        permissionRequests={flowScopedPermissionRequests}
+                        approvalCheckpoints={flowScopedApprovalCheckpoints}
+                        draftsByString={editableDraftsByString}
+                        scoreByString={scoreByString}
+                        steerDecisions={steerDecisions}
+                        selectedStringId={flowSelectedStringId}
+                        onSelectedStringChange={setFlowSelectedStringId}
                       />
                     ) : primaryWorkspaceTab === "EXECUTION" && flowExecutionTab === "CALENDAR" ? (
                       <CalendarConsole

@@ -1,5 +1,9 @@
 import type { AppTheme } from "@/lib/store/vorldx-store";
-import type { AssistantMessageMeta, WorkflowTaskStatus } from "@/src/types/chat";
+import type {
+  AssistantMessageMeta,
+  AssistantThreadEventMeta,
+  WorkflowTaskStatus
+} from "@/src/types/chat";
 import {
   CalendarDays,
   ClipboardList,
@@ -655,15 +659,23 @@ export function buildThreadScanRows(input: {
   });
 
   item.turns.forEach((turn, index) => {
+    const isSystemEvent = isSystemTimelineTurn(turn);
+    const eventTitle = isSystemEvent ? turn.meta.title : "";
+    const eventMessage = isSystemEvent ? turn.meta.message : "";
     push({
       timestamp: threadTimestamp,
-      actorType: turn.role === "owner" ? "HUMAN" : "AI",
+      actorType:
+        turn.role === "owner" ? "HUMAN" : isSystemEvent ? "SYSTEM" : "AI",
       actor:
         turn.role === "owner"
           ? "Human"
-          : turn.modelLabel?.trim() || "AI Assistant",
-      category: "CHAT_TURN",
-      detail: `Turn ${index + 1}: ${compactTaskTitle(turn.content, "No content")}`,
+          : isSystemEvent
+            ? eventTitle || "System"
+            : turn.modelLabel?.trim() || "AI Assistant",
+      category: isSystemEvent ? "THREAD_EVENT" : "CHAT_TURN",
+      detail: isSystemEvent
+        ? `${eventTitle || `Event ${index + 1}`} | ${compactTaskTitle(eventMessage || turn.content, "Thread update")}`
+        : `Turn ${index + 1}: ${compactTaskTitle(turn.content, "No content")}`,
       raw: JSON.stringify(turn)
     });
   });
@@ -793,6 +805,15 @@ export function formatRelativeTimeShort(timestamp: number) {
 }
 
 export function inferTurnTimestamp(turn: DirectionTurn, index: number, fallback: number) {
+  if (
+    turn.meta &&
+    isTimelineEventMeta(turn.meta) &&
+    typeof turn.meta.timestamp === "number" &&
+    Number.isFinite(turn.meta.timestamp) &&
+    turn.meta.timestamp > 0
+  ) {
+    return Math.round(turn.meta.timestamp);
+  }
   const idMatch = turn.id.match(/-(\d{10,13})(?:-|$)/);
   if (idMatch) {
     const parsed = Number.parseInt(idMatch[1], 10);
@@ -830,8 +851,14 @@ export function buildStringDiscussionTurns(stringItem: ControlThreadHistoryItem 
     .map((turn, index) => ({
       ...turn,
       timestamp: inferTurnTimestamp(turn, index, fallbackBaseTs),
-      actorType: turn.role === "owner" ? "HUMAN" : "AI",
-      actorLabel: turn.role === "owner" ? "Owner" : turn.modelLabel || "Organization"
+      actorType:
+        turn.role === "owner" ? "HUMAN" : isSystemTimelineTurn(turn) ? "SYSTEM" : "AI",
+      actorLabel:
+        turn.role === "owner"
+          ? "Owner"
+          : isSystemTimelineTurn(turn)
+            ? turn.meta?.title || "System"
+            : turn.modelLabel || "Organization"
     }))
     .sort((left, right) => left.timestamp - right.timestamp);
 }
@@ -891,13 +918,16 @@ export function buildEditableStringDraft(input: {
 }): EditableStringDraft {
   const { stringItem, permissionRequests, approvalCheckpoints } = input;
   const plan = stringItem.planningResult?.primaryPlan ?? null;
+  const discussionTurns = buildStringDiscussionTurns(stringItem).filter(
+    (turn) => !isSystemTimelineTurn(turn)
+  );
   const detailScore =
     typeof plan?.detailScore === "number" && Number.isFinite(plan.detailScore)
       ? Math.max(0, Math.min(100, Math.floor(plan.detailScore)))
       : null;
 
   return {
-    discussion: buildStringDiscussionTurns(stringItem).map((turn) => ({
+    discussion: discussionTurns.map((turn) => ({
       id: turn.id,
       actorType: turn.actorType as ActorType,
       actorLabel: turn.actorLabel,
@@ -1521,6 +1551,44 @@ export function buildPlanCardMeta(input: {
       }))
     }))
   };
+}
+
+export function buildThreadEventMeta(input: {
+  title: string;
+  message: string;
+  eventName?: string;
+  scope?: AssistantThreadEventMeta["scope"];
+  status?: string;
+  timestamp?: number;
+}): AssistantMessageMeta {
+  return {
+    kind: "thread_event",
+    title: input.title,
+    message: input.message,
+    ...(input.eventName ? { eventName: input.eventName } : {}),
+    ...(input.scope ? { scope: input.scope } : {}),
+    ...(input.status ? { status: input.status } : {}),
+    ...(typeof input.timestamp === "number" && Number.isFinite(input.timestamp)
+      ? { timestamp: Math.round(input.timestamp) }
+      : {})
+  };
+}
+
+export function isTimelineEventMeta(
+  meta: AssistantMessageMeta | null | undefined
+): meta is Extract<
+  AssistantMessageMeta,
+  { kind: "thread_event" | "workflow_event" }
+> {
+  return meta?.kind === "thread_event" || meta?.kind === "workflow_event";
+}
+
+export function isSystemTimelineTurn(
+  turn: DirectionTurn | null | undefined
+): turn is DirectionTurn & {
+  meta: Extract<AssistantMessageMeta, { kind: "thread_event" | "workflow_event" }>;
+} {
+  return Boolean(turn?.meta && isTimelineEventMeta(turn.meta));
 }
 
 export type ControlMode = "MINDSTORM" | "DIRECTION";
