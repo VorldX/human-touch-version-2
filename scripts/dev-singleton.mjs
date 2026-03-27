@@ -21,7 +21,9 @@ const cleanScriptPath = resolve(process.cwd(), "scripts/clean-next.mjs");
 const prismaGenerateScriptPath = resolve(process.cwd(), "scripts/prisma-generate-safe.mjs");
 const fsRetryHookPath = resolve(process.cwd(), "scripts/fs-ebusy-retry.cjs");
 const nextBin = require.resolve("next/dist/bin/next");
+const nextPackage = require("next/package.json");
 const isOneDriveWorkspace = /(^|[\\/])onedrive([\\/]|$)/i.test(process.cwd());
+const nextMajorVersion = Number.parseInt(String(nextPackage.version || "0").split(".")[0] || "0", 10);
 
 function normalizePathForCompare(value) {
   return value.replace(/^\\\\\?\\/, "").toLowerCase();
@@ -258,7 +260,18 @@ if (typeof prismaGenerateResult.status === "number" && prismaGenerateResult.stat
   process.exit(prismaGenerateResult.status);
 }
 
-const child = spawn(process.execPath, [nextBin, "dev", ...process.argv.slice(2)], {
+const requestedArgs = process.argv.slice(2);
+const hasBundlerOverride = requestedArgs.some(
+  (arg) => arg === "--webpack" || arg === "--turbopack" || arg === "--turbo"
+);
+const nextArgs = [
+  nextBin,
+  "dev",
+  ...(nextMajorVersion >= 16 && !hasBundlerOverride ? ["--webpack"] : []),
+  ...requestedArgs
+];
+
+const child = spawn(process.execPath, nextArgs, {
   stdio: "inherit",
   env: devEnv
 });

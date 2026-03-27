@@ -2,7 +2,12 @@ import "server-only";
 
 import { AgentMemoryType, AgentMemoryVisibility, MemoryTier, Prisma } from "@prisma/client";
 
-import { persistMemoryCandidate, searchAgentMemory } from "@/lib/agent/memory";
+import {
+  markAgentMemoriesRetrieved,
+  markAgentMemoriesUsed,
+  persistMemoryCandidate,
+  searchAgentMemory
+} from "@/lib/agent/memory";
 import { prisma } from "@/lib/db/prisma";
 import type { MemoryContextQuery, MemoryRelevantItem, MemoryService } from "@/lib/memory/memory-service";
 
@@ -74,6 +79,7 @@ class LegacyMemoryService implements MemoryService {
       score: Number(item.score.toFixed(4)),
       source: `agent_memory:${item.memory.source}`
     }));
+    const semanticIds = semanticRows.map((item) => item.id);
 
     const structured = input.includeStructured
       ? await prisma.memoryEntry.findMany({
@@ -103,7 +109,11 @@ class LegacyMemoryService implements MemoryService {
     const deduped = merged.filter(
       (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index
     );
-    return deduped.slice(0, Math.max(1, input.topK));
+    const selected = deduped.slice(0, Math.max(1, input.topK));
+    await markAgentMemoriesRetrieved(
+      selected.filter((item) => semanticIds.includes(item.id)).map((item) => item.id)
+    ).catch(() => undefined);
+    return selected;
   }
 
   async getContext(input: MemoryContextQuery) {
@@ -120,6 +130,11 @@ class LegacyMemoryService implements MemoryService {
       maxTokens: input.maxTokens,
       reserveTokens: 300
     });
+    await markAgentMemoriesUsed(
+      selected
+        .filter((item) => item.source.startsWith("agent_memory:"))
+        .map((item) => item.id)
+    ).catch(() => undefined);
 
     return {
       snippets: selected.map((item) => ({

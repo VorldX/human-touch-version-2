@@ -58,6 +58,13 @@ export interface ChatMention {
   collaboratorKind?: CollaboratorKind;
 }
 
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  url: string;
+  sizeLabel?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
@@ -72,6 +79,7 @@ export interface ChatMessage {
   teamLabel?: string | null;
   audience?: ChatAudience;
   mentions?: ChatMention[];
+  attachments?: ChatAttachment[];
   error?: boolean;
   metrics?: MessageMetrics;
   routing?: MessageRouting;

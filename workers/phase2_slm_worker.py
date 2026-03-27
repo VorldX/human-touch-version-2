@@ -90,6 +90,7 @@ class MemoryRow:
     summary: str
     importance: float
     timestamp: datetime
+    pinned: bool
 
 
 def now_utc() -> datetime:
@@ -239,12 +240,14 @@ async def fetch_session_memories(
           COALESCE(content, '') AS content,
           COALESCE(summary, '') AS summary,
           COALESCE(importance, 0.5) AS importance,
-          timestamp
+          timestamp,
+          COALESCE("pinned", FALSE) AS pinned
         FROM "AgentMemory"
         WHERE "orgId" = $1
           AND COALESCE("userId", '') = COALESCE($2, '')
           AND "sessionId" = $3
           AND "archivedAt" IS NULL
+          AND "lifecycleState" IN ('SHORT_TERM', 'LONG_TERM')
         ORDER BY timestamp DESC
         LIMIT 140
         """,
@@ -260,6 +263,7 @@ async def fetch_session_memories(
             summary=str(row["summary"]),
             importance=float(row["importance"]),
             timestamp=row["timestamp"],
+            pinned=bool(row["pinned"]),
         )
         for row in rows
     ]
@@ -268,6 +272,8 @@ async def fetch_session_memories(
 async def archive_low_scoring_memories(conn: asyncpg.Connection, rows: list[MemoryRow]) -> tuple[int, set[str]]:
     low_ids: list[str] = []
     for row in rows:
+        if row.pinned:
+            continue
         semantic = max(0.0, min(1.0, row.importance))
         decay = time_decay_score(row.timestamp)
         score = hybrid_score(semantic, decay)
@@ -281,9 +287,12 @@ async def archive_low_scoring_memories(conn: asyncpg.Connection, rows: list[Memo
         """
         UPDATE "AgentMemory"
         SET "archivedAt" = NOW(),
+            "lifecycleState" = 'ARCHIVE'::"AgentMemoryLifecycleState",
+            "lifecycleUpdatedAt" = NOW(),
             "updatedAt" = NOW()
         WHERE id = ANY($1::text[])
           AND "archivedAt" IS NULL
+          AND COALESCE("pinned", FALSE) = FALSE
         """,
         low_ids,
     )

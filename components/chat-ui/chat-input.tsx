@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUp, Check, ChevronDown, Loader2, UserRound, Users2 } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, Loader2, Paperclip, UserRound, Users2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { StringMode } from "@/components/chat-ui/types";
@@ -16,6 +16,19 @@ interface MentionSuggestion {
   handle: string;
   label: string;
   kind: "team" | "person";
+}
+
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
 function optionTone(value: string) {
@@ -50,6 +63,7 @@ function optionIcon(value: string) {
 interface ChatInputProps {
   mode: StringMode;
   value: string;
+  files: File[];
   audienceValue: string;
   audienceOptions: AudienceOption[];
   audienceLabel?: string | null;
@@ -57,6 +71,8 @@ interface ChatInputProps {
   disabled?: boolean;
   sending?: boolean;
   onValueChange: (value: string) => void;
+  onFilesAdd: (files: File[]) => void;
+  onFileRemove: (index: number) => void;
   onAudienceChange: (value: string) => void;
   onInsertMention: (handle: string) => void;
   onSend: () => void;
@@ -65,6 +81,7 @@ interface ChatInputProps {
 export function ChatInput({
   mode,
   value,
+  files,
   audienceValue,
   audienceOptions,
   audienceLabel,
@@ -72,12 +89,15 @@ export function ChatInput({
   disabled,
   sending,
   onValueChange,
+  onFilesAdd,
+  onFileRemove,
   onAudienceChange,
   onInsertMention,
   onSend
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const pickerRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const selectedAudienceOption =
     audienceOptions.find((option) => option.value === audienceValue) ?? audienceOptions[0] ?? null;
@@ -259,6 +279,29 @@ export function ChatInput({
         ) : null}
 
         <div className="flex items-end gap-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={(event) => {
+              const selected = Array.from(event.target.files ?? []);
+              if (selected.length > 0) {
+                onFilesAdd(selected);
+              }
+              event.currentTarget.value = "";
+            }}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={disabled}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/[0.08] bg-white/[0.04] text-slate-300 transition duration-200 hover:bg-white/[0.08] hover:text-slate-100 disabled:opacity-50"
+            aria-label="Attach files"
+            title="Attach files"
+          >
+            <Paperclip size={15} />
+          </button>
           <textarea
             ref={textareaRef}
             value={value}
@@ -276,7 +319,7 @@ export function ChatInput({
           />
           <button
             type="button"
-            disabled={disabled || !value.trim()}
+            disabled={disabled || (!value.trim() && files.length === 0)}
             onClick={onSend}
             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-slate-950 transition duration-200 hover:bg-slate-100 disabled:opacity-50"
             aria-label="Send message"
@@ -284,6 +327,29 @@ export function ChatInput({
             {sending ? <Loader2 size={15} className="animate-spin" /> : <ArrowUp size={15} />}
           </button>
         </div>
+        {files.length > 0 ? (
+          <div className="mt-2 flex flex-wrap gap-1.5 px-3">
+            {files.map((file, index) => (
+              <span
+                key={`${file.name}-${file.size}-${index}`}
+                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-white/[0.08] bg-white/[0.05] px-2.5 py-1 text-[11px] text-slate-200"
+              >
+                <Paperclip size={11} className="text-slate-400" />
+                <span className="max-w-[11rem] truncate">{file.name}</span>
+                <span className="text-slate-500">{formatFileSize(file.size)}</span>
+                <button
+                  type="button"
+                  onClick={() => onFileRemove(index)}
+                  disabled={disabled}
+                  className="rounded-full p-0.5 text-slate-400 transition duration-200 hover:bg-white/[0.08] hover:text-slate-100 disabled:opacity-50"
+                  aria-label={`Remove ${file.name}`}
+                >
+                  <X size={11} />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <p className="px-3 pt-1.5 text-[10px] text-slate-500">
           Press Enter to send, Shift + Enter for a new line.
         </p>

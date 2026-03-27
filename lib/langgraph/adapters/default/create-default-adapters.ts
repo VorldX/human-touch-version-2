@@ -27,7 +27,7 @@ import type {
   SharedKnowledgeRef,
   SquadWriteResult
 } from "../../state.ts";
-import { searchAgentMemory } from "@/lib/agent/memory";
+import { markAgentMemoriesRetrieved, searchAgentMemory } from "@/lib/agent/memory";
 import { executeAgentTool } from "@/lib/agent/tools/execute";
 import { prisma } from "@/lib/db/prisma";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
@@ -519,6 +519,7 @@ async function searchSharedKnowledge(input: {
       includePrivate: false
     }
   }).catch(() => []);
+  await markAgentMemoriesRetrieved(hits.map((item) => item.memory.id)).catch(() => undefined);
 
   return hits.map((item) => ({
     id: item.memory.id,

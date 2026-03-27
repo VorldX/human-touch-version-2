@@ -5635,6 +5635,7 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
     if (knowledgeChunks.length > 0) {
       const fileTag = `file:${file.id}`;
       try {
+        const archivedAt = new Date();
         await prisma.agentMemory.updateMany({
           where: {
             orgId,
@@ -5643,7 +5644,9 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
             tags: { has: fileTag }
           },
           data: {
-            archivedAt: new Date()
+            lifecycleState: "ARCHIVE",
+            lifecycleUpdatedAt: archivedAt,
+            archivedAt
           }
         });
       } catch {
@@ -5656,6 +5659,7 @@ async function handleEvent(event: InboundEvent, origin?: string): Promise<EventH
         // eslint-disable-next-line no-await-in-loop
         await upsertAgentMemory({
           orgId,
+          fileId: file.id,
           content: chunk,
           summary: truncateText(
             `DNA ${file.name} chunk ${index + 1}/${knowledgeChunks.length}`,

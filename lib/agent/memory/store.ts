@@ -2,7 +2,12 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 
-import { AgentMemoryType, AgentMemoryVisibility, Prisma } from "@prisma/client";
+import {
+  AgentMemoryLifecycleState,
+  AgentMemoryType,
+  AgentMemoryVisibility,
+  Prisma
+} from "@prisma/client";
 
 import { toPgVectorLiteral } from "@/lib/ai/embeddings";
 import { agentMemoryConfig } from "@/lib/agent/memory/config";
@@ -14,6 +19,12 @@ import {
   dedupeMemoryResults
 } from "@/lib/agent/memory/ranking";
 import { rerankMemoryResults } from "@/lib/agent/memory/reranker";
+import {
+  buildActiveAgentMemoryWhere,
+  buildShortTermAgentMemoryWhere,
+  includesArchivedAgentMemoryLifecycle,
+  resolveAgentMemorySearchLifecycleStates
+} from "@/lib/agent/memory/types";
 import {
   summarizeMemoryContent,
   toPersistableMemory
@@ -39,12 +50,21 @@ const memorySelect = {
   orgId: true,
   userId: true,
   agentId: true,
+  fileId: true,
   sessionId: true,
   projectId: true,
   content: true,
   summary: true,
   memoryType: true,
   visibility: true,
+  lifecycleState: true,
+  lifecycleUpdatedAt: true,
+  pinned: true,
+  retrievalCount: true,
+  lastRetrievedAt: true,
+  lastUsedAt: true,
+  quarantineReason: true,
+  quarantineSource: true,
   tags: true,
   source: true,
   timestamp: true,
@@ -99,6 +119,7 @@ function toMemoryRecord(row: MemoryRow): AgentMemoryRecord {
     orgId: row.orgId,
     userId: row.userId,
     agentId: row.agentId,
+    fileId: row.fileId,
     sessionId: row.sessionId,
     projectId: row.projectId,
     content: row.content,
@@ -106,6 +127,14 @@ function toMemoryRecord(row: MemoryRow): AgentMemoryRecord {
     embedding: null,
     memoryType: row.memoryType,
     visibility: row.visibility,
+    lifecycleState: row.lifecycleState,
+    lifecycleUpdatedAt: row.lifecycleUpdatedAt,
+    pinned: row.pinned,
+    retrievalCount: row.retrievalCount,
+    lastRetrievedAt: row.lastRetrievedAt,
+    lastUsedAt: row.lastUsedAt,
+    quarantineReason: row.quarantineReason,
+    quarantineSource: row.quarantineSource,
     tags: row.tags,
     source: row.source,
     timestamp: row.timestamp,
@@ -126,6 +155,17 @@ function normalizeTags(tags: string[] | undefined) {
   );
 }
 
+function resolveMemoryFileId(input: Pick<AgentMemoryUpsertInput, "fileId" | "metadata">) {
+  const direct = compact(input.fileId ?? "");
+  if (direct) return direct;
+  if (!input.metadata || typeof input.metadata !== "object" || Array.isArray(input.metadata)) {
+    return null;
+  }
+  const metadataFileId = (input.metadata as Record<string, unknown>).fileId;
+  const fromMetadata = typeof metadataFileId === "string" ? compact(metadataFileId) : "";
+  return fromMetadata || null;
+}
+
 function normalizeType(memoryType: AgentMemoryTypeValue) {
   if (memoryType === AgentMemoryType.WORKING) return AgentMemoryType.WORKING;
   if (memoryType === AgentMemoryType.SEMANTIC) return AgentMemoryType.SEMANTIC;
@@ -136,6 +176,27 @@ function normalizeType(memoryType: AgentMemoryTypeValue) {
 function normalizeVisibility(value: AgentMemoryUpsertInput["visibility"]) {
   if (value === AgentMemoryVisibility.SHARED) return AgentMemoryVisibility.SHARED;
   return AgentMemoryVisibility.PRIVATE;
+}
+
+function normalizeLifecycleState(
+  value: AgentMemoryUpsertInput["lifecycleState"] | AgentMemoryRecord["lifecycleState"] | undefined
+) {
+  if (value === AgentMemoryLifecycleState.LONG_TERM) return AgentMemoryLifecycleState.LONG_TERM;
+  if (value === AgentMemoryLifecycleState.QUARANTINE) return AgentMemoryLifecycleState.QUARANTINE;
+  if (value === AgentMemoryLifecycleState.ARCHIVE) return AgentMemoryLifecycleState.ARCHIVE;
+  return AgentMemoryLifecycleState.SHORT_TERM;
+}
+
+function buildArchiveMemoryUpdate(now: Date) {
+  return {
+    lifecycleState: AgentMemoryLifecycleState.ARCHIVE,
+    lifecycleUpdatedAt: now,
+    archivedAt: now
+  } satisfies Prisma.AgentMemoryUpdateManyMutationInput;
+}
+
+function normalizeUniqueMemoryIds(memoryIds: string[]) {
+  return [...new Set(memoryIds.map((id) => id.trim()).filter(Boolean))];
 }
 
 function cleanSummary(value: string | undefined, fallback: string) {
@@ -286,6 +347,8 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
 
     const importance = clamp(prepared.importance ?? 0.5, 0, 1);
     const recency = clamp(prepared.recency ?? 1, 0, 2);
+    const now = prepared.timestamp ?? new Date();
+    const nextFileId = resolveMemoryFileId(prepared);
 
     try {
       const existing = prepared.id
@@ -302,7 +365,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
               sessionId: prepared.sessionId ?? null,
               userId: prepared.userId ?? null,
               agentId: prepared.agentId ?? null,
-              archivedAt: null
+              ...buildActiveAgentMemoryWhere()
             },
             orderBy: { updatedAt: "desc" },
             select: memorySelect
@@ -312,6 +375,27 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         prepared.metadata === undefined || prepared.metadata === null
           ? Prisma.JsonNull
           : (prepared.metadata as Prisma.InputJsonValue);
+      const nextLifecycleState = normalizeLifecycleState(
+        prepared.lifecycleState ?? existing?.lifecycleState
+      );
+      const lifecycleStateChanged = existing
+        ? existing.lifecycleState !== nextLifecycleState
+        : true;
+      const nextPinned = prepared.pinned ?? existing?.pinned ?? false;
+      const nextQuarantineReason =
+        nextLifecycleState === AgentMemoryLifecycleState.QUARANTINE
+          ? compact(prepared.quarantineReason ?? existing?.quarantineReason ?? "").slice(0, 500) ||
+            null
+          : null;
+      const nextQuarantineSource =
+        nextLifecycleState === AgentMemoryLifecycleState.QUARANTINE
+          ? compact(prepared.quarantineSource ?? existing?.quarantineSource ?? "").slice(0, 80) ||
+            null
+          : null;
+      const nextArchivedAt =
+        nextLifecycleState === AgentMemoryLifecycleState.ARCHIVE
+          ? existing?.archivedAt ?? now
+          : null;
 
       const row = existing
         ? await prisma.agentMemory.update({
@@ -319,6 +403,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
             data: {
               userId: prepared.userId ?? null,
               agentId: prepared.agentId ?? null,
+              fileId: nextFileId,
               sessionId: prepared.sessionId ?? null,
               projectId: prepared.projectId ?? null,
               content,
@@ -327,12 +412,17 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
               visibility: normalizeVisibility(prepared.visibility),
               tags: normalizeTags(prepared.tags),
               source,
-              timestamp: prepared.timestamp ?? new Date(),
+              timestamp: now,
               importance: Math.max(existing.importance, importance),
               recency,
               metadata: nextMetadata,
               contentHash,
-              archivedAt: null
+              lifecycleState: nextLifecycleState,
+              lifecycleUpdatedAt: lifecycleStateChanged ? now : existing.lifecycleUpdatedAt,
+              pinned: nextPinned,
+              quarantineReason: nextQuarantineReason,
+              quarantineSource: nextQuarantineSource,
+              archivedAt: nextArchivedAt
             },
             select: memorySelect
           })
@@ -341,6 +431,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
               orgId: prepared.orgId,
               userId: prepared.userId ?? null,
               agentId: prepared.agentId ?? null,
+              fileId: nextFileId,
               sessionId: prepared.sessionId ?? null,
               projectId: prepared.projectId ?? null,
               content,
@@ -349,11 +440,17 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
               visibility: normalizeVisibility(prepared.visibility),
               tags: normalizeTags(prepared.tags),
               source,
-              timestamp: prepared.timestamp ?? new Date(),
+              timestamp: now,
               importance,
               recency,
               metadata: nextMetadata,
-              contentHash
+              contentHash,
+              lifecycleState: nextLifecycleState,
+              lifecycleUpdatedAt: now,
+              pinned: nextPinned,
+              quarantineReason: nextQuarantineReason,
+              quarantineSource: nextQuarantineSource,
+              archivedAt: nextArchivedAt
             },
             select: memorySelect
           });
@@ -387,6 +484,8 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
     if (!normalizedQuery) {
       return [];
     }
+    const lifecycleStates = resolveAgentMemorySearchLifecycleStates(filters);
+    const includeArchivedLifecycle = includesArchivedAgentMemoryLifecycle(lifecycleStates);
 
     const limit = Math.max(1, topK ?? agentMemoryConfig.retrieval.defaultTopK);
     const requestedTopK = Math.max(
@@ -419,7 +518,8 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         const lexicalRows = await prisma.agentMemory.findMany({
           where: {
             orgId: filters.orgId,
-            archivedAt: filters.includeArchived ? undefined : null,
+            lifecycleState: { in: lifecycleStates },
+            archivedAt: includeArchivedLifecycle ? undefined : null,
             ...(filters.sessionId ? { sessionId: filters.sessionId } : {}),
             ...(filters.projectId ? { projectId: filters.projectId } : {}),
             ...(filters.userId ? { userId: filters.userId } : {}),
@@ -528,7 +628,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         where: {
           orgId: filters.orgId,
           sessionId,
-          archivedAt: null,
+          ...buildActiveAgentMemoryWhere(),
           OR: includePrivate
             ? undefined
             : [
@@ -571,7 +671,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         where: {
           orgId: scope.orgId,
           sessionId,
-          archivedAt: null
+          ...buildActiveAgentMemoryWhere()
         },
         orderBy: [{ timestamp: "desc" }, { updatedAt: "desc" }],
         take: agentMemoryConfig.summarization.maxSourceEntries,
@@ -601,23 +701,24 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         });
         return {
           id: row.id,
-          hybrid
+          hybrid,
+          pinned: row.pinned
         };
       })
-      .filter((item) => item.hybrid < gcThreshold)
+      .filter((item) => !item.pinned && item.hybrid < gcThreshold)
       .map((item) => item.id);
 
     if (lowScoreMemoryIds.length > 0) {
+      const archiveAt = new Date();
       try {
         await prisma.agentMemory.updateMany({
           where: {
             id: { in: lowScoreMemoryIds },
             orgId: scope.orgId,
-            archivedAt: null
+            pinned: false,
+            ...buildActiveAgentMemoryWhere()
           },
-          data: {
-            archivedAt: new Date()
-          }
+          data: buildArchiveMemoryUpdate(archiveAt)
         });
 
         rows = rows.filter((row) => !lowScoreMemoryIds.includes(row.id));
@@ -672,16 +773,16 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
     const toArchive = rows.slice(keep).map((row) => row.id).filter((id) => id !== summary.id);
 
     if (toArchive.length > 0) {
+      const archiveAt = new Date();
       try {
         await prisma.agentMemory.updateMany({
           where: {
             id: { in: toArchive },
             orgId: scope.orgId,
-            archivedAt: null
+            pinned: false,
+            ...buildActiveAgentMemoryWhere()
           },
-          data: {
-            archivedAt: new Date()
-          }
+          data: buildArchiveMemoryUpdate(archiveAt)
         });
       } catch (error) {
         if (isAgentMemoryTableMissingError(error)) {
@@ -693,6 +794,123 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
     }
 
     return summary;
+  }
+
+  async markMemoriesRetrieved(memoryIds: string[]) {
+    if (!agentMemoryConfig.enabled) {
+      return;
+    }
+    if (!(await ensureAgentMemoryTableAvailable())) {
+      return;
+    }
+
+    const ids = normalizeUniqueMemoryIds(memoryIds);
+    if (ids.length === 0) {
+      return;
+    }
+
+    const accessedAt = new Date();
+    try {
+      await prisma.agentMemory.updateMany({
+        where: {
+          id: { in: ids },
+          ...buildActiveAgentMemoryWhere()
+        },
+        data: {
+          retrievalCount: {
+            increment: 1
+          },
+          lastRetrievedAt: accessedAt
+        }
+      });
+    } catch (error) {
+      if (isAgentMemoryTableMissingError(error)) {
+        markAgentMemoryTableMissing();
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async markMemoriesUsed(memoryIds: string[]) {
+    if (!agentMemoryConfig.enabled) {
+      return;
+    }
+    if (!(await ensureAgentMemoryTableAvailable())) {
+      return;
+    }
+
+    const ids = normalizeUniqueMemoryIds(memoryIds);
+    if (ids.length === 0) {
+      return;
+    }
+
+    try {
+      await prisma.agentMemory.updateMany({
+        where: {
+          id: { in: ids },
+          ...buildActiveAgentMemoryWhere()
+        },
+        data: {
+          lastUsedAt: new Date()
+        }
+      });
+    } catch (error) {
+      if (isAgentMemoryTableMissingError(error)) {
+        markAgentMemoryTableMissing();
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async listPromotionCandidates(input: {
+    orgId: string;
+    threshold?: number;
+    limit?: number;
+  }) {
+    if (!agentMemoryConfig.enabled) {
+      return [];
+    }
+    if (!(await ensureAgentMemoryTableAvailable())) {
+      return [];
+    }
+
+    const threshold = Math.max(1, Math.trunc(input.threshold ?? 3));
+    const limit = Math.max(1, Math.min(200, Math.trunc(input.limit ?? 50)));
+
+    try {
+      const rows = await prisma.agentMemory.findMany({
+        where: {
+          orgId: input.orgId,
+          ...buildShortTermAgentMemoryWhere(),
+          OR: [
+            { pinned: true },
+            {
+              pinned: false,
+              lastUsedAt: { not: null },
+              retrievalCount: { gte: threshold }
+            }
+          ]
+        },
+        orderBy: [
+          { pinned: "desc" },
+          { lastUsedAt: "desc" },
+          { retrievalCount: "desc" },
+          { updatedAt: "desc" }
+        ],
+        take: limit,
+        select: memorySelect
+      });
+
+      return rows.map(toMemoryRecord);
+    } catch (error) {
+      if (isAgentMemoryTableMissingError(error)) {
+        markAgentMemoryTableMissing();
+        return [];
+      }
+      throw error;
+    }
   }
 
   async deleteMemory(memoryId: string) {
@@ -759,6 +977,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
                 FROM "AgentMemory"
                 WHERE "orgId" = $1
                   AND "archivedAt" IS NULL
+                  AND "lifecycleState" IN ('SHORT_TERM', 'LONG_TERM')
                   AND "sessionId" IS NOT NULL
                 GROUP BY "sessionId"
                 HAVING COUNT(*) >= $2
@@ -790,7 +1009,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         where: {
           orgId: scope.orgId,
           sessionId: row.sessionId,
-          archivedAt: null
+          ...buildActiveAgentMemoryWhere()
         }
       });
 
@@ -806,7 +1025,7 @@ class PrismaAgentMemoryStore implements AgentMemoryStore {
         where: {
           orgId: scope.orgId,
           sessionId: row.sessionId,
-          archivedAt: null
+          ...buildActiveAgentMemoryWhere()
         }
       });
 

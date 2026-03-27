@@ -9,6 +9,7 @@ import { CollaborationPanel } from "@/components/chat-ui/collaboration-panel";
 import { Sidebar } from "@/components/chat-ui/sidebar";
 import { StringPanel } from "@/components/chat-ui/string-panel";
 import type {
+  ChatAttachment,
   ChatAudience,
   ChatMessage,
   ChatMention,
@@ -45,6 +46,20 @@ interface AudienceOption {
 interface JsonEnvelope {
   ok?: boolean;
   message?: string;
+}
+
+interface HubFileUploadResponse extends JsonEnvelope {
+  file?: {
+    id: string;
+    name: string;
+    url: string;
+    size: string;
+  };
+}
+
+interface PreparedAttachment {
+  file: File;
+  preview: string;
 }
 
 interface StringApiResponse extends JsonEnvelope {
@@ -271,6 +286,104 @@ function truncateText(value: string, max: number, fallback = DEFAULT_CHAT_TITLE)
   return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 3))}...` : normalized;
 }
 
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function clipAttachmentText(value: string, max: number) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.length > max
+    ? `${normalized.slice(0, Math.max(0, max - 3)).trimEnd()}...`
+    : normalized;
+}
+
+function hasPreviewableText(file: File) {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+  return (
+    type.startsWith("text/") ||
+    type.includes("json") ||
+    type.includes("xml") ||
+    name.endsWith(".md") ||
+    name.endsWith(".txt") ||
+    name.endsWith(".csv") ||
+    name.endsWith(".ts") ||
+    name.endsWith(".tsx") ||
+    name.endsWith(".js") ||
+    name.endsWith(".jsx")
+  );
+}
+
+async function prepareAttachment(file: File): Promise<PreparedAttachment> {
+  if (!hasPreviewableText(file)) {
+    return {
+      file,
+      preview: ""
+    };
+  }
+
+  try {
+    const preview = clipAttachmentText(await file.text(), 480);
+    return {
+      file,
+      preview
+    };
+  } catch {
+    return {
+      file,
+      preview: ""
+    };
+  }
+}
+
+function attachmentContextLine(attachment: ChatAttachment, preview = "") {
+  const header = `- ${attachment.name}${attachment.sizeLabel ? ` (${attachment.sizeLabel})` : ""}`;
+  const ref = `  Hub ref: ${attachment.url}`;
+  const body = preview ? `  Preview: ${preview}` : "";
+  return [header, ref, body].filter(Boolean).join("\n");
+}
+
+function buildAttachmentRequestContent(
+  content: string,
+  attachments: ChatAttachment[],
+  prepared: PreparedAttachment[]
+) {
+  if (attachments.length === 0) {
+    return content;
+  }
+
+  const baseContent =
+    content.trim() || `Please review the attached file${attachments.length === 1 ? "" : "s"}.`;
+  const lines = attachments.map((attachment, index) =>
+    attachmentContextLine(attachment, prepared[index]?.preview ?? "")
+  );
+  return `${baseContent}\n\nAttached files:\n${lines.join("\n")}`.trim();
+}
+
+function summarizeMessageForHistory(message: ChatMessage) {
+  const base = message.content.trim();
+  if (!message.attachments?.length) {
+    return base;
+  }
+
+  const attachmentSummary = `Attached files: ${message.attachments
+    .map((attachment) => attachment.name)
+    .join(", ")}`;
+  return [base, attachmentSummary].filter(Boolean).join("\n");
+}
+
 function fallbackEmail(name: string, id: string) {
   const slug = name
     .toLowerCase()
@@ -468,7 +581,7 @@ function buildParticipantHistory(messages: ChatMessage[]) {
     .slice(-HISTORY_LIMIT)
     .map((message) => ({
       role: message.role,
-      content: message.content.slice(0, 1200),
+      content: summarizeMessageForHistory(message).slice(0, 1200),
       ...(message.authorName ? { authorName: message.authorName } : {}),
       ...(message.authorRole ? { authorRole: message.authorRole } : {}),
       ...(message.teamLabel ? { teamLabel: message.teamLabel } : {})
@@ -540,7 +653,7 @@ function toHistory(messages: ChatMessage[]) {
     .slice(-HISTORY_LIMIT)
     .map((message) => ({
       role: message.role === "user" ? "owner" : "organization",
-      content: message.content.slice(0, 1200)
+      content: summarizeMessageForHistory(message).slice(0, 1200)
     }));
 }
 
@@ -881,6 +994,7 @@ export function StringChatShell({
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [mode, setMode] = useState<StringMode>("discussion");
   const [draft, setDraft] = useState("");
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
   const [activeAudience, setActiveAudience] = useState<ChatAudience>(DEFAULT_CHAT_AUDIENCE);
@@ -1202,6 +1316,7 @@ export function StringChatShell({
     setSelectedTeamId(null);
     setMode("discussion");
     setDraft("");
+    setSelectedFiles([]);
     setSearchQuery("");
     setSidebarOpen(false);
     handleStringPanelOpenChange(false);
@@ -1572,6 +1687,7 @@ export function StringChatShell({
 
   function handleSelectChat(chatId: string) {
     setActiveChatId(chatId);
+    setSelectedFiles([]);
     setSidebarOpen(false);
     handleStringPanelOpenChange(false);
     handleCollaborationPanelOpenChange(false);
@@ -1585,6 +1701,7 @@ export function StringChatShell({
     setMode("discussion");
     setActiveAudience(DEFAULT_CHAT_AUDIENCE);
     setDraft("");
+    setSelectedFiles([]);
     setSidebarOpen(false);
     handleStringPanelOpenChange(false);
     handleCollaborationPanelOpenChange(false);
@@ -1813,11 +1930,48 @@ export function StringChatShell({
     setDraft((current) => insertMention(current, handle));
   }
 
+  async function uploadSelectedChatFiles(files: File[]) {
+    if (!orgId || files.length === 0) {
+      return [] as ChatAttachment[];
+    }
+
+    const uploaded: ChatAttachment[] = [];
+    for (const file of files) {
+      const formData = new FormData();
+      formData.set("orgId", orgId);
+      formData.set("type", "INPUT");
+      formData.set("name", file.name);
+      formData.set("isAmnesiaProtected", "false");
+      formData.set("file", file);
+
+      const response = await fetch("/api/hub/files", {
+        method: "POST",
+        credentials: "include",
+        body: formData
+      });
+      const { payload, rawText } = await parseResponse<HubFileUploadResponse>(response);
+      if (!response.ok || !payload?.ok || !payload.file) {
+        throw new Error(
+          failMsg(response.status, `Failed to upload ${file.name}`, payload?.message, rawText)
+        );
+      }
+
+      uploaded.push({
+        id: payload.file.id,
+        name: payload.file.name,
+        url: payload.file.url,
+        sizeLabel: formatFileSize(Number(payload.file.size))
+      });
+    }
+
+    return uploaded;
+  }
+
   async function sendMessage(teamId = selectedTeamId, audienceOverride = resolvedAudience) {
     const targetChat = activeChat;
     const content = draft.trim();
 
-    if (!orgId || !targetChat || !content || sending) {
+    if (!orgId || !targetChat || (!content && selectedFiles.length === 0) || sending) {
       return;
     }
 
@@ -1844,11 +1998,28 @@ export function StringChatShell({
     const shouldUseOrganizationReply =
       selectedMode === "direction" ||
       (messageAudience.kind === "everyone" && !hasDirectAiPersonMention);
-    const timestamp = nowIso();
-    const userMessage: ChatMessage = {
+    const visibleContent =
+      content || `Shared ${selectedFiles.length} file${selectedFiles.length === 1 ? "" : "s"}.`;
+    let optimisticChat: ChatString | null = null;
+
+    setSending(true);
+    handleStringPanelOpenChange(false);
+    handleCollaborationPanelOpenChange(false);
+    setError(null);
+
+    try {
+      const preparedAttachments = await Promise.all(selectedFiles.map((file) => prepareAttachment(file)));
+      const uploadedAttachments = await uploadSelectedChatFiles(selectedFiles);
+      const requestContent = buildAttachmentRequestContent(
+        content,
+        uploadedAttachments,
+        preparedAttachments
+      );
+      const timestamp = nowIso();
+      const userMessage: ChatMessage = {
       id: createId("message"),
       role: "user",
-      content,
+      content: visibleContent,
       createdAt: timestamp,
       ...(actorCollaborator?.id ? { authorId: actorCollaborator.id } : {}),
       ...(actorCollaborator?.name ? { authorName: actorCollaborator.name } : {}),
@@ -1857,34 +2028,34 @@ export function StringChatShell({
       teamId: audienceTeam?.id ?? null,
       teamLabel: audienceTeam?.name ?? null,
       audience: messageAudience,
-      ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {})
+      ...(resolvedMentions.length > 0 ? { mentions: resolvedMentions } : {}),
+      ...(uploadedAttachments.length > 0 ? { attachments: uploadedAttachments } : {})
     };
 
-    const optimisticChat: ChatString = {
+      optimisticChat = {
       ...targetChat,
-      title: targetChat.title === DEFAULT_CHAT_TITLE ? titleFromMessage(content) : targetChat.title,
+      title:
+        targetChat.title === DEFAULT_CHAT_TITLE
+          ? titleFromMessage(content || uploadedAttachments[0]?.name || "Shared files")
+          : targetChat.title,
       mode: selectedMode,
       updatedAt: timestamp,
       activeAudience: messageAudience,
       selectedTeamId: selectedRoutingTeam?.id ?? targetChat.selectedTeamId ?? null,
       selectedTeamLabel: selectedRoutingTeam?.name ?? targetChat.selectedTeamLabel ?? null,
       messages: [...targetChat.messages, userMessage]
-    };
+      };
 
-    replaceChat(optimisticChat);
-    setDraft("");
-    setActiveAudience(messageAudience);
-    setSending(true);
-    handleStringPanelOpenChange(false);
-    handleCollaborationPanelOpenChange(false);
-    setError(null);
+      replaceChat(optimisticChat);
+      setDraft("");
+      setSelectedFiles([]);
+      setActiveAudience(messageAudience);
 
-    const userPersistPromise = persistChat(optimisticChat).catch((nextError) => {
+      const userPersistPromise = persistChat(optimisticChat).catch((nextError) => {
       setError(nextError instanceof Error ? nextError.message : "Failed to save string.");
       return optimisticChat;
-    });
+      });
 
-    try {
       const followUps: ChatMessage[] = [];
       let organizationRouting: MessageRouting | undefined;
       let directionId = optimisticChat.directionId ?? null;
@@ -1901,7 +2072,7 @@ export function StringChatShell({
           },
           body: JSON.stringify({
             orgId,
-            message: content,
+            message: requestContent,
             history: toHistory(optimisticChat.messages),
             teamLabel: audienceTeam?.name ?? "",
             audienceLabel:
@@ -1930,7 +2101,7 @@ export function StringChatShell({
                 : {})
             }
           : undefined;
-        directionText = (chatPayload.directionCandidate || content).trim();
+        directionText = (chatPayload.directionCandidate || requestContent).trim();
 
         followUps.push({
           id: createId("message"),
@@ -1966,7 +2137,7 @@ export function StringChatShell({
 
       const participantReplies = shouldRequestParticipantReplies
         ? await fetchParticipantReplies({
-            message: content,
+            message: requestContent,
             history: [...optimisticChat.messages, ...followUps],
             audience: messageAudience,
             mentions: resolvedMentions,
@@ -1975,7 +2146,7 @@ export function StringChatShell({
           }).catch((nextError) => {
             setStatusText(
               nextError instanceof Error
-                ? nextError.message
+              ? nextError.message
                 : "AI teammate replies are unavailable right now."
             );
             return [] as ChatMessage[];
@@ -2089,6 +2260,10 @@ export function StringChatShell({
       const message =
         nextError instanceof Error ? nextError.message : "Failed to send message.";
       setError(message);
+
+      if (!optimisticChat) {
+        return;
+      }
 
       const failedChat: ChatString = {
         ...optimisticChat,
@@ -2336,6 +2511,7 @@ export function StringChatShell({
             <ChatInput
               mode={mode}
               value={draft}
+              files={selectedFiles}
               audienceValue={audienceToValue(resolvedAudience)}
               audienceOptions={audienceOptions}
               audienceLabel={activeAudienceLabel}
@@ -2343,6 +2519,10 @@ export function StringChatShell({
               disabled={!activeChat || sending || loading}
               sending={sending}
               onValueChange={setDraft}
+              onFilesAdd={(files) => setSelectedFiles((current) => [...current, ...files])}
+              onFileRemove={(index) =>
+                setSelectedFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))
+              }
               onAudienceChange={handleAudienceChange}
               onInsertMention={handleInsertMention}
               onSend={() => void sendMessage()}

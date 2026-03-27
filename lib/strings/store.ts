@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { HubFileType, MemoryTier, OrgRole, Prisma } from "@prisma/client";
 
 import type {
+  ChatAttachment,
   ChatAudience,
   ChatMessage,
   ChatMention,
@@ -165,6 +166,38 @@ function normalizeMentions(value: unknown): ChatMention[] | undefined {
     .slice(0, 24);
 
   return mentions.length > 0 ? mentions : undefined;
+}
+
+function normalizeAttachment(value: unknown): ChatAttachment | null {
+  const record = asRecord(value);
+  const id = asText(record.id);
+  const name = asText(record.name);
+  const url = asText(record.url);
+  const sizeLabel = asText(record.sizeLabel);
+
+  if (!id || !name || !url) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    url,
+    ...(sizeLabel ? { sizeLabel } : {})
+  };
+}
+
+function normalizeAttachments(value: unknown): ChatAttachment[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const attachments = value
+    .map((item) => normalizeAttachment(item))
+    .filter((item): item is ChatAttachment => Boolean(item))
+    .slice(0, 8);
+
+  return attachments.length > 0 ? attachments : undefined;
 }
 
 function normalizeMetrics(value: unknown): MessageMetrics | undefined {
@@ -462,6 +495,7 @@ function normalizeMessage(value: unknown, fallbackId: string, fallbackCreatedAt:
   const direction = normalizeDirection(record.direction);
   const audience = normalizeAudience(record.audience);
   const mentions = normalizeMentions(record.mentions);
+  const attachments = normalizeAttachments(record.attachments);
   const authorKind = normalizeCollaboratorKind(record.authorKind);
   const meta = normalizeMessageMeta(record.meta);
   const authorId = asText(record.authorId);
@@ -489,6 +523,7 @@ function normalizeMessage(value: unknown, fallbackId: string, fallbackCreatedAt:
     ...(teamLabel !== null ? { teamLabel } : {}),
     ...(audience ? { audience } : {}),
     ...(mentions ? { mentions } : {}),
+    ...(attachments ? { attachments } : {}),
     ...(record.error === true ? { error: true } : {}),
     ...(metrics ? { metrics } : {}),
     ...(routing ? { routing } : {}),
@@ -506,7 +541,7 @@ function normalizeMessages(value: unknown, fallbackCreatedAt: string) {
     .map((item, index) =>
       normalizeMessage(item, `message-${index + 1}`, fallbackCreatedAt)
     )
-    .filter((item) => item.content.length > 0 || item.direction || item.meta);
+    .filter((item) => item.content.length > 0 || item.attachments?.length || item.direction || item.meta);
 }
 
 function memberKey(userId: string) {

@@ -2,8 +2,13 @@ import "server-only";
 
 import { toPgVectorLiteral } from "@/lib/ai/embeddings";
 import { agentMemoryConfig } from "@/lib/agent/memory/config";
+import {
+  includesArchivedAgentMemoryLifecycle,
+  resolveAgentMemorySearchLifecycleStates
+} from "@/lib/agent/memory/types";
 import type {
   AgentMemoryRecord,
+  AgentMemoryLifecycleStateValue,
   AgentMemorySearchFilters,
   AgentMemoryTypeValue,
   AgentMemoryVisibilityValue
@@ -34,6 +39,13 @@ function asMemoryType(value: unknown): AgentMemoryTypeValue {
 function asVisibility(value: unknown): AgentMemoryVisibilityValue {
   if (value === "SHARED") return "SHARED";
   return "PRIVATE";
+}
+
+function asLifecycleState(value: unknown): AgentMemoryLifecycleStateValue {
+  if (value === "LONG_TERM") return "LONG_TERM";
+  if (value === "QUARANTINE") return "QUARANTINE";
+  if (value === "ARCHIVE") return "ARCHIVE";
+  return "SHORT_TERM";
 }
 
 function asDate(value: unknown) {
@@ -68,9 +80,9 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
     topK: number;
   }): Promise<MemoryVectorCandidate[]> {
     const vectorLiteral = toPgVectorLiteral(input.queryEmbedding);
+    const lifecycleStates = resolveAgentMemorySearchLifecycleStates(input.filters);
     const where: string[] = [
       '"orgId" = $2',
-      input.filters.includeArchived ? "1=1" : '"archivedAt" IS NULL',
       'embedding IS NOT NULL'
     ];
     const params: unknown[] = [vectorLiteral, input.filters.orgId];
@@ -87,6 +99,16 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
     addEquals("projectId", input.filters.projectId);
     addEquals("userId", input.filters.userId);
     addEquals("agentId", input.filters.agentId);
+
+    if (lifecycleStates.length > 0) {
+      const placeholders = lifecycleStates.map(() => `$${index++}`);
+      params.push(...lifecycleStates);
+      where.push(`"lifecycleState" IN (${placeholders.join(", ")})`);
+    }
+
+    if (!includesArchivedAgentMemoryLifecycle(lifecycleStates)) {
+      where.push('"archivedAt" IS NULL');
+    }
 
     if (input.filters.memoryTypes && input.filters.memoryTypes.length > 0) {
       const placeholders = input.filters.memoryTypes
@@ -148,12 +170,21 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
       orgId: string;
       userId: string | null;
       agentId: string | null;
+      fileId: string | null;
       sessionId: string | null;
       projectId: string | null;
       content: string;
       summary: string | null;
       memoryType: string;
       visibility: string;
+      lifecycleState: string;
+      lifecycleUpdatedAt: Date;
+      pinned: boolean;
+      retrievalCount: number;
+      lastRetrievedAt: Date | null;
+      lastUsedAt: Date | null;
+      quarantineReason: string | null;
+      quarantineSource: string | null;
       tags: string[];
       source: string;
       timestamp: Date;
@@ -173,12 +204,21 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
         "orgId",
         "userId",
         "agentId",
+        "fileId",
         "sessionId",
         "projectId",
         content,
         summary,
         "memoryType",
         visibility,
+        "lifecycleState",
+        "lifecycleUpdatedAt",
+        pinned,
+        "retrievalCount",
+        "lastRetrievedAt",
+        "lastUsedAt",
+        "quarantineReason",
+        "quarantineSource",
         tags,
         source,
         timestamp,
@@ -204,6 +244,7 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
         orgId: row.orgId,
         userId: row.userId,
         agentId: row.agentId,
+        fileId: row.fileId,
         sessionId: row.sessionId,
         projectId: row.projectId,
         content: row.content,
@@ -211,6 +252,19 @@ class PgVectorMemoryBackend implements MemoryVectorBackend {
         embedding: null,
         memoryType: asMemoryType(row.memoryType),
         visibility: asVisibility(row.visibility),
+        lifecycleState: asLifecycleState(row.lifecycleState),
+        lifecycleUpdatedAt: asDate(row.lifecycleUpdatedAt),
+        pinned: Boolean(row.pinned),
+        retrievalCount:
+          typeof row.retrievalCount === "number" && Number.isFinite(row.retrievalCount)
+            ? row.retrievalCount
+            : 0,
+        lastRetrievedAt: row.lastRetrievedAt ? asDate(row.lastRetrievedAt) : null,
+        lastUsedAt: row.lastUsedAt ? asDate(row.lastUsedAt) : null,
+        quarantineReason:
+          typeof row.quarantineReason === "string" ? row.quarantineReason : null,
+        quarantineSource:
+          typeof row.quarantineSource === "string" ? row.quarantineSource : null,
         tags: asStringArray(row.tags),
         source: row.source,
         timestamp: asDate(row.timestamp),

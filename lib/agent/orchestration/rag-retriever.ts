@@ -6,7 +6,7 @@ import {
   createDeterministicEmbedding,
   toPgVectorLiteral
 } from "@/lib/ai/embeddings";
-import { searchAgentMemory } from "@/lib/agent/memory";
+import { markAgentMemoriesRetrieved, searchAgentMemory } from "@/lib/agent/memory";
 import { featureFlags } from "@/lib/config/feature-flags";
 import { prisma } from "@/lib/db/prisma";
 import { listPeripheralFallbackLogs } from "@/lib/dna/phase3/fallback";
@@ -15,6 +15,7 @@ import { memoryService } from "@/lib/memory";
 
 export interface RetrievedMemoryEntry {
   id: string;
+  agentMemoryId?: string;
   key: string;
   tier: string;
   value: unknown;
@@ -76,6 +77,7 @@ export async function retrieveRelevantMemoryEntries(input: {
     if (unified.length > 0) {
       return unified.slice(0, Math.max(1, input.limit)).map((item) => ({
         id: item.id,
+        agentMemoryId: item.source.startsWith("agent_memory:") ? item.id : undefined,
         key: item.source,
         tier: "UNIFIED",
         value: item.content,
@@ -142,6 +144,7 @@ export async function retrieveRelevantMemoryEntries(input: {
 
   const semanticRows: RetrievedMemoryEntry[] = semantic.map((item) => ({
     id: item.memory.id,
+    agentMemoryId: item.memory.id,
     key: `${item.memory.memoryType.toLowerCase()}.${item.memory.source}`,
     tier: item.memory.memoryType,
     value: {
@@ -158,9 +161,12 @@ export async function retrieveRelevantMemoryEntries(input: {
     hybridScore: item.hybridScore,
     rerankScore: item.rerankScore
   }));
+  const semanticIds = new Set(semanticRows.map((row) => row.id));
 
   if (semanticRows.length >= absoluteTopK) {
-    return semanticRows.slice(0, absoluteTopK);
+    const selected = semanticRows.slice(0, absoluteTopK);
+    await markAgentMemoriesRetrieved(selected.map((row) => row.id)).catch(() => undefined);
+    return selected;
   }
 
   if (centralMemoryFailed) {
@@ -172,6 +178,7 @@ export async function retrieveRelevantMemoryEntries(input: {
     if (fallbackLogs.length > 0) {
       const fallbackRows: RetrievedMemoryEntry[] = fallbackLogs.map((entry) => ({
         ...entry,
+        agentMemoryId: undefined,
         similarity: undefined,
         timeDecayScore: undefined,
         hybridScore: undefined,
@@ -180,7 +187,11 @@ export async function retrieveRelevantMemoryEntries(input: {
       const mergedFallback: RetrievedMemoryEntry[] = [...semanticRows, ...fallbackRows].filter(
         (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index
       );
-      return mergedFallback.slice(0, Math.max(5, absoluteTopK));
+      const selected = mergedFallback.slice(0, Math.max(5, absoluteTopK));
+      await markAgentMemoriesRetrieved(
+        selected.filter((row) => semanticIds.has(row.id)).map((row) => row.id)
+      ).catch(() => undefined);
+      return selected;
     }
   }
 
@@ -227,6 +238,7 @@ export async function retrieveRelevantMemoryEntries(input: {
     }
     merged.push({
       id: candidate.id,
+      agentMemoryId: undefined,
       key: candidate.key,
       tier: String(candidate.tier),
       value: candidate.value,
@@ -237,7 +249,11 @@ export async function retrieveRelevantMemoryEntries(input: {
     }
   }
 
-  return merged.slice(0, absoluteTopK);
+  const selected = merged.slice(0, absoluteTopK);
+  await markAgentMemoriesRetrieved(
+    selected.filter((row) => semanticIds.has(row.id)).map((row) => row.id)
+  ).catch(() => undefined);
+  return selected;
 }
 
 export async function retrieveRelevantDnaFiles(input: {

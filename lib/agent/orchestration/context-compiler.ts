@@ -9,6 +9,7 @@ import {
 } from "@/lib/direction/directions";
 import { ensureCompanyDataFile } from "@/lib/hub/organization-hub";
 import { listDnaProfiles } from "@/lib/dna/profiles";
+import { markAgentMemoriesUsed } from "@/lib/agent/memory";
 import {
   selectContextBlocksByPriority
 } from "@/lib/agent/orchestration/context-budget";
@@ -393,6 +394,9 @@ export async function buildAgentContextPack(input: {
         )
       : Promise.resolve([])
   ]);
+  await markAgentMemoriesUsed(
+    memoryEntries.flatMap((entry) => (entry.agentMemoryId ? [entry.agentMemoryId] : []))
+  ).catch(() => undefined);
 
   const prompt = task?.prompt ?? input.prompt;
   const taskSection = buildTaskRequestSection({

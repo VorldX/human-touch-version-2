@@ -101,6 +101,22 @@ export async function deleteAgentMemory(memoryId: string) {
   return agentMemoryStore.deleteMemory(memoryId);
 }
 
+export async function markAgentMemoriesRetrieved(memoryIds: string[]) {
+  return agentMemoryStore.markMemoriesRetrieved(memoryIds);
+}
+
+export async function markAgentMemoriesUsed(memoryIds: string[]) {
+  return agentMemoryStore.markMemoriesUsed(memoryIds);
+}
+
+export async function listAgentMemoryPromotionCandidates(input: {
+  orgId: string;
+  threshold?: number;
+  limit?: number;
+}) {
+  return agentMemoryStore.listPromotionCandidates(input);
+}
+
 export async function persistMemoryCandidate(input: {
   orgId: string;
   userId?: string | null;

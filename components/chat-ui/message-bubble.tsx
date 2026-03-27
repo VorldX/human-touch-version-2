@@ -1,5 +1,7 @@
 "use client";
 
+import { Paperclip } from "lucide-react";
+
 import type { ChatMessage, StringMode } from "@/components/chat-ui/types";
 
 interface MessageBubbleProps {
@@ -68,9 +70,30 @@ export function MessageBubble({ message, mode }: MessageBubbleProps) {
             ))}
           </div>
         ) : null}
-        <p className="whitespace-pre-wrap text-sm leading-6 [overflow-wrap:anywhere]">
-          {message.content}
-        </p>
+        {message.content ? (
+          <p className="whitespace-pre-wrap text-sm leading-6 [overflow-wrap:anywhere]">
+            {message.content}
+          </p>
+        ) : null}
+        {message.attachments?.length ? (
+          <div className={`${message.content ? "mt-3" : ""} flex flex-wrap gap-2`}>
+            {message.attachments.map((attachment) => (
+              <a
+                key={`${message.id}:${attachment.id}`}
+                href={attachment.url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex max-w-full items-center gap-2 rounded-full border border-white/[0.08] bg-black/10 px-2.5 py-1 text-[11px] text-slate-200 transition hover:bg-white/[0.06]"
+              >
+                <Paperclip size={11} className="shrink-0 text-slate-400" />
+                <span className="max-w-[12rem] truncate">{attachment.name}</span>
+                {attachment.sizeLabel ? (
+                  <span className="shrink-0 text-slate-500">{attachment.sizeLabel}</span>
+                ) : null}
+              </a>
+            ))}
+          </div>
+        ) : null}
       </article>
     </div>
   );

@@ -114,6 +114,13 @@ enum AgentMemoryVisibility {
   SHARED
 }
 
+enum AgentMemoryLifecycleState {
+  SHORT_TERM
+  LONG_TERM
+  QUARANTINE
+  ARCHIVE
+}
+
 enum SpendEventType {
   PREDICTED_BURN
   ACTUAL_BURN
@@ -213,6 +220,7 @@ model Organization {
   personnel           Personnel[]
   flows               Flow[]
   files               File[]
+  folders             Folder[]
   logs                Log[]
   webhooks            Webhook[]
   sovereignRails      SovereignRailConfig[]
@@ -346,9 +354,24 @@ model Task {
   @@index([agentId])
 }
 
+model Folder {
+  id                 String        @id @default(cuid())
+  orgId              String
+  name               String
+  functionalityGroup String
+  org                Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  files              File[]
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  @@index([orgId, functionalityGroup])
+  @@index([orgId, createdAt])
+}
+
 model File {
   id                 String                       @id @default(cuid())
   orgId              String
+  folderId           String?
   name               String
   type               HubFileType
   size               BigInt
@@ -358,11 +381,14 @@ model File {
   embedding          Unsupported("vector(1536)")?
   metadata           Json?
   org                Organization                 @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  folder             Folder?                      @relation(fields: [folderId], references: [id], onDelete: SetNull)
   locks              HubFileLock[]
+  agentMemories      AgentMemory[]
   createdAt          DateTime                     @default(now())
   updatedAt          DateTime                     @updatedAt
 
   @@index([orgId, type])
+  @@index([orgId, folderId])
 }
 
 model HubFileLock {
@@ -480,30 +506,40 @@ model MemoryEntry {
 }
 
 model AgentMemory {
-  id          String                @id @default(cuid())
-  orgId       String
-  userId      String?
-  agentId     String?
-  sessionId   String?
-  projectId   String?
-  content     String
-  summary     String?
-  embedding   Unsupported("vector(1536)")?
-  memoryType  AgentMemoryType       @default(EPISODIC)
-  visibility  AgentMemoryVisibility @default(PRIVATE)
-  tags        String[]              @default([])
-  source      String
-  timestamp   DateTime              @default(now())
-  importance  Float                 @default(0.5)
-  recency     Float                 @default(1)
-  metadata    Json?
-  contentHash String
-  archivedAt  DateTime?
-  createdAt   DateTime              @default(now())
-  updatedAt   DateTime              @updatedAt
-  org         Organization          @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  user        User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
-  agent       Agent?                @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  id                String                     @id @default(cuid())
+  orgId             String
+  userId            String?
+  agentId           String?
+  fileId            String?
+  sessionId         String?
+  projectId         String?
+  content           String
+  summary           String?
+  embedding         Unsupported("vector(1536)")?
+  memoryType        AgentMemoryType            @default(EPISODIC)
+  visibility        AgentMemoryVisibility      @default(PRIVATE)
+  lifecycleState    AgentMemoryLifecycleState  @default(SHORT_TERM)
+  lifecycleUpdatedAt DateTime                  @default(now())
+  pinned            Boolean                    @default(false)
+  retrievalCount    Int                        @default(0)
+  lastRetrievedAt   DateTime?
+  lastUsedAt        DateTime?
+  quarantineReason  String?
+  quarantineSource  String?
+  tags              String[]                   @default([])
+  source            String
+  timestamp         DateTime                   @default(now())
+  importance        Float                      @default(0.5)
+  recency           Float                      @default(1)
+  metadata          Json?
+  contentHash       String
+  archivedAt        DateTime?
+  createdAt         DateTime                   @default(now())
+  updatedAt         DateTime                   @updatedAt
+  org               Organization               @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user              User?                      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  agent             Agent?                     @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  file              File?                      @relation(fields: [fileId], references: [id], onDelete: SetNull)
 
   @@index([orgId, timestamp(sort: Desc)])
   @@index([orgId, sessionId, timestamp(sort: Desc)])
@@ -512,8 +548,10 @@ model AgentMemory {
   @@index([orgId, projectId, timestamp(sort: Desc)])
   @@index([orgId, memoryType, timestamp(sort: Desc)])
   @@index([orgId, visibility, timestamp(sort: Desc)])
+  @@index([orgId, lifecycleState, archivedAt])
   @@index([orgId, archivedAt])
   @@index([orgId, contentHash])
+  @@index([fileId])
 }
 
 model SpendEvent {
